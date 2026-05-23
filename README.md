@@ -10,6 +10,8 @@ Named after Harold Wren - the alias of a genius who built a superintelligent AI 
 
 WrenCode is a lightweight alternative to Claude Code. It runs a tool-calling agent loop locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
 
+Where Claude Code is the batteries-included tool, WrenCode is the **"understand and own your agent" tool**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
+
 ## Backends
 
 On first run WrenCode asks you to pick a backend and saves the choice to
