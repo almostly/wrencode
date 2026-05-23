@@ -26,14 +26,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
+# flake8: noqa: E501, E203
+
 import contextlib
+import getpass
 import glob as globlib
 import json
 import os
 import pathlib
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -41,47 +46,118 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
 
-# Load .env from parent directory
-_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-if os.path.exists(_env_path):
-    with open(_env_path) as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
+# Load .env (next to this script, then the current directory); real env vars win.
+for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+    _env_path = os.path.join(_dir, ".env")
+    if os.path.exists(_env_path):
+        with open(_env_path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                if _line.startswith("export "):
+                    _line = _line[len("export "):]
                 _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip())
+                _v = _v.strip()
+                # Strip matching surrounding quotes, e.g. KEY="value" or KEY='value'.
+                if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in ("'", '"'):
+                    _v = _v[1:-1]
+                os.environ.setdefault(_k.strip(), _v)
 
 # -----------------------------------------------------------------------------------------------
 # Backend Configuration
 # -----------------------------------------------------------------------------------------------
-BACKEND = os.environ.get("BACKEND", "mlx")
+WRENCODE_VERSION = "0.1.4"
 
-if BACKEND == "openrouter":
-    MODEL = os.environ.get("MODEL", "anthropic/claude-3-haiku")
-    API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-    API_BASE = "https://openrouter.ai/api/v1/chat/completions"
-elif BACKEND == "openai":
-    MODEL = os.environ.get("MODEL", "gpt-4o-mini")
-    API_KEY = os.environ.get("OPENAI_API_KEY", "")
-    API_BASE = "https://api.openai.com/v1/chat/completions"
-elif BACKEND == "anthropic":
-    MODEL = os.environ.get("MODEL", "claude-haiku-4-5-20251001")
-    API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-    API_BASE = "https://api.anthropic.com/v1/messages"
-elif BACKEND == "local":
-    MODEL = os.environ.get("MODEL", "gpt-oss-20b")
-    API_KEY = os.environ.get("LOCAL_API_KEY", "local")
-    LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
-    API_BASE = f"http://localhost:{LOCAL_PORT}/v1/messages"
-elif BACKEND == "transformers":
-    MODEL = os.environ.get("MODEL", "deburky/gpt-oss-claude-code")
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-else:  # mlx
-    MODEL = os.environ.get("MODEL", "mlx-community/Qwen2.5-3B-Instruct-4bit")
-    from mlx_lm import load
-    from mlx_lm.generate import stream_generate
-    from mlx_lm.sample_utils import make_sampler
+# Per-backend defaults. "kind" controls how a backend is treated:
+#   api         - hosted HTTP API, needs an API key
+#   local-proxy - Anthropic-compatible server already running on localhost
+#   local-ml    - in-process model weights (mlx / transformers); source install only,
+#                 since the standalone binary can't bundle the ML stack
+BACKEND_SPECS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "kind": "api",
+        "model": "claude-haiku-4-5-20251001",
+        "key_env": "ANTHROPIC_API_KEY",
+        "api_base": "https://api.anthropic.com/v1/messages",
+        "label": "Anthropic Claude  (API key)",
+    },
+    "openai": {
+        "kind": "api",
+        "model": "gpt-4o-mini",
+        "key_env": "OPENAI_API_KEY",
+        "api_base": "https://api.openai.com/v1/chat/completions",
+        "label": "OpenAI GPT  (API key)",
+    },
+    "openrouter": {
+        "kind": "api",
+        "model": "anthropic/claude-3-haiku",
+        "key_env": "OPENROUTER_API_KEY",
+        "api_base": "https://openrouter.ai/api/v1/chat/completions",
+        "label": "OpenRouter — any model  (API key)",
+    },
+    "local": {
+        "kind": "local-proxy",
+        "model": "gpt-oss-20b",
+        "key_env": "LOCAL_API_KEY",
+        "label": "Local proxy  (Anthropic-compatible server on localhost)",
+    },
+    "transformers": {
+        "kind": "local-ml",
+        "model": "deburky/gpt-oss-claude-code",
+        "label": "HuggingFace Transformers  (CPU/GPU, source install)",
+    },
+    "mlx": {
+        "kind": "local-ml",
+        "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+        "label": "Apple Silicon via MLX  (source install)",
+    },
+}
+
+CONFIG_DIR = pathlib.Path(
+    os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
+).expanduser()
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# Populated by apply_backend() once configuration is resolved (see resolve_configuration).
+BACKEND = ""
+MODEL = ""
+API_KEY = ""
+API_BASE = ""
+LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
+
+# Backend libraries are imported lazily inside load_model(); the rest of the
+# module references them as globals. Declared here as Any so the module
+# type-checks even when the heavy optional deps aren't installed.
+load: Any = None  # mlx_lm.load
+stream_generate: Any = None  # mlx_lm.generate.stream_generate
+make_sampler: Any = None  # mlx_lm.sample_utils.make_sampler
+torch: Any = None  # torch
+AutoModelForCausalLM: Any = None  # transformers.AutoModelForCausalLM
+AutoTokenizer: Any = None  # transformers.AutoTokenizer
+
+
+def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
+    """Set the module-level backend globals from a backend name plus overrides.
+
+    Precedence for each value: explicit environment variable > saved/chosen
+    value > built-in default. Heavy backend imports are deferred to load_model().
+    """
+    global BACKEND, MODEL, API_KEY, API_BASE, LOCAL_PORT
+    spec = BACKEND_SPECS[backend]
+    BACKEND = backend
+    MODEL = os.environ.get("MODEL") or model or spec["model"]
+    if spec["kind"] == "api":
+        API_KEY = os.environ.get(spec["key_env"]) or api_key or ""
+        API_BASE = spec["api_base"]
+    elif backend == "local":
+        LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
+        API_KEY = os.environ.get("LOCAL_API_KEY") or api_key or "local"
+        API_BASE = f"http://localhost:{LOCAL_PORT}/v1/messages"
+    else:  # local-ml (mlx / transformers): no key, weights loaded in-process
+        API_KEY = ""
+        API_BASE = ""
+
 
 # -----------------------------------------------------------------------------------------------
 # Constants & Environment Variables
@@ -193,7 +269,8 @@ def read(args: dict[str, Any]) -> str:
     if path.is_dir():
         entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
         return (
-            "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
+            "\n".join(
+                f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
             or "(empty)"
         )
     if not path.is_file():
@@ -201,7 +278,8 @@ def read(args: dict[str, Any]) -> str:
     size = path.stat().st_size
     if size > MAX_READ_BYTES:
         return f"error: file too large ({size} bytes, max {MAX_READ_BYTES})"
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lines = path.read_text(
+        encoding="utf-8", errors="replace").splitlines(keepends=True)
     offset = _optional_int(args, "offset", 0) or 0
     if not (0 <= offset <= len(lines)):
         return f"error: offset {offset} out of range (file has {len(lines)} lines)"
@@ -214,7 +292,7 @@ def read(args: dict[str, Any]) -> str:
     )
     out = "".join(
         f"{offset + i + 1:4}| {line}"
-        for i, line in enumerate(lines[offset : offset + cap])
+        for i, line in enumerate(lines[offset: offset + cap])
     )
     if offset + cap < len(lines):
         out += f"\n... ({len(lines) - offset - cap} more lines; use offset/limit or raise MAX_READ_LINES)"
@@ -284,10 +362,12 @@ def grep(args: dict[str, Any]) -> str:
     grep_bin = shutil.which("grep")
     if not rg and not grep_bin:
         return "error: neither ripgrep (rg) nor grep is installed"
+    tool = rg or grep_bin
+    assert tool is not None  # guaranteed by the check above
     cmd = (
-        [rg, "-n", "--color", "never", "--no-heading", "-e", pat, "."]
+        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, "."]
         if rg
-        else [grep_bin, "-R", "-n", "-I", "--", pat, "."]
+        else [tool, "-R", "-n", "-I", "--", pat, "."]
     )
     try:
         proc = subprocess.run(
@@ -510,7 +590,8 @@ def _build_anthropic_tools() -> list[dict[str, Any]]:
         properties: dict[str, Any] = {}
         required: list[str] = []
         for param_name, param_type in params.items():
-            properties[param_name] = {"type": _TYPE_MAP.get(param_type, "string")}
+            properties[param_name] = {
+                "type": _TYPE_MAP.get(param_type, "string")}
             if not param_type.endswith("?"):
                 required.append(param_name)
         result.append(
@@ -555,7 +636,8 @@ def _build_openai_tools() -> list[dict[str, Any]]:
         properties: dict[str, Any] = {}
         required: list[str] = []
         for param_name, param_type in params.items():
-            properties[param_name] = {"type": _TYPE_MAP.get(param_type, "string")}
+            properties[param_name] = {
+                "type": _TYPE_MAP.get(param_type, "string")}
             if not param_type.endswith("?"):
                 required.append(param_name)
         result.append(
@@ -634,7 +716,8 @@ def get_response(
                 "tools": _build_openai_tools(),
                 "tool_choice": "auto",
             },
-            {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+            {"Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}"},
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
@@ -648,7 +731,8 @@ def get_response(
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
             },
-            {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+            {"Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}"},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -724,7 +808,8 @@ def get_response(
     prompt = tokenizer.apply_chat_template(
         chat, tokenize=False, add_generation_prompt=True
     )
-    sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
+    sampler = make_sampler(temp=0.3, top_p=0.95,
+                           min_p=0.0, min_tokens_to_keep=1)
     out = ""
     for chunk in stream_generate(
         model, tokenizer, prompt=prompt, max_tokens=MAX_TOKENS, sampler=sampler
@@ -735,7 +820,7 @@ def get_response(
             out = out[:end]
             break
     if out.startswith(prompt):
-        out = out[len(prompt) :].strip()
+        out = out[len(prompt):].strip()
     return truncate_at_turn_leak(strip_gptoss_tokens(out))
 
 
@@ -805,7 +890,8 @@ def _compact_via_api(history_text: str) -> str:
                 "max_tokens": 512,
                 "temperature": 0.3,
             },
-            {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+            {"Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}"},
         )
         return (data["choices"][0]["message"].get("content") or "").strip()
     return ""
@@ -838,7 +924,8 @@ def compact_messages(
             tokenize=False,
             add_generation_prompt=True,
         )
-        sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
+        sampler = make_sampler(temp=0.3, top_p=0.95,
+                               min_p=0.0, min_tokens_to_keep=1)
         summary = "".join(
             c.text
             for c in stream_generate(
@@ -846,7 +933,7 @@ def compact_messages(
             )
         )
         if summary.startswith(prompt):
-            summary = summary[len(prompt) :].strip()
+            summary = summary[len(prompt):].strip()
 
     return [
         {"role": "user", "content": f"[Conversation summary]\n{summary}"},
@@ -944,7 +1031,8 @@ def run_agent_turn(
             tool_results: list[dict[str, Any]] = []
             for tc in tool_calls:
                 arg_preview = (
-                    str(list(tc["input"].values())[0])[:50] if tc["input"] else ""
+                    str(list(tc["input"].values())[0])[
+                        :50] if tc["input"] else ""
                 )
                 print(
                     f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
@@ -967,7 +1055,8 @@ def run_agent_turn(
                     )
                 else:
                     tool_results.append(
-                        {"role": "tool", "tool_call_id": tc["id"], "content": result}
+                        {"role": "tool",
+                            "tool_call_id": tc["id"], "content": result}
                     )
             if BACKEND == "anthropic":
                 messages.append({"role": "user", "content": tool_results})
@@ -989,7 +1078,8 @@ def run_agent_turn(
         )
         xml_tool_results: list[dict[str, Any]] = []
         for tc in xml_tool_calls:
-            arg_preview = str(list(tc["input"].values())[0])[:50] if tc["input"] else ""
+            arg_preview = str(list(tc["input"].values())[0])[
+                :50] if tc["input"] else ""
             print(
                 f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
             )
@@ -1002,7 +1092,8 @@ def run_agent_turn(
             )
             print(f"{DIM}⎿ {preview}{RESET}")
             xml_tool_results.append(
-                {"type": "tool_result", "tool_use_id": tc["id"], "content": result}
+                {"type": "tool_result",
+                    "tool_use_id": tc["id"], "content": result}
             )
             content_blocks.append(tc)
 
@@ -1052,16 +1143,183 @@ def handle_slash_command(
 
 
 # -----------------------------------------------------------------------------------------------
+# Backend Selection & Config Persistence
+# -----------------------------------------------------------------------------------------------
+def is_frozen() -> bool:
+    """Set true when running as a PyInstaller standalone binary."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def load_config() -> dict[str, str]:
+    """Load saved backend config from CONFIG_FILE, or {} if absent/unreadable."""
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict[str, str]) -> None:
+    """Persist backend config to CONFIG_FILE with owner-only (0600) permissions."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(tmp, 0o600)
+        tmp.replace(CONFIG_FILE)
+    except OSError as err:
+        print(f"{YELLOW}Could not save config to {CONFIG_FILE}: {err}{RESET}")
+
+
+def available_backends() -> list[str]:
+    """Backends offerable in the current runtime.
+
+    The standalone binary can't bundle the ML stack, so local-ml backends
+    (mlx/transformers) are only offered from a source install. MLX is further
+    limited to Apple Silicon.
+    """
+    out: list[str] = []
+    for name, spec in BACKEND_SPECS.items():
+        if spec["kind"] == "local-ml":
+            if is_frozen():
+                continue
+            if name == "mlx" and not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                continue
+        out.append(name)
+    return out
+
+
+def choose_backend_interactive() -> None:
+    """Prompt the user to pick a backend, persist the choice, and apply it."""
+    names = available_backends()
+    print(f"{BOLD}Choose a backend:{RESET}\n")
+    for i, name in enumerate(names, 1):
+        spec = BACKEND_SPECS[name]
+        print(
+            f"  {BOLD}{i}{RESET}. {spec['label']}  {DIM}[{spec['model']}]{RESET}")
+    print()
+    if not is_frozen():
+        print(
+            f"{DIM}Local model backends need their deps installed "
+            f"(e.g. pip install mlx-lm, or transformers torch).{RESET}\n"
+        )
+
+    while True:
+        raw = input(f"{BLUE}❯{RESET} number [1]: ").strip() or "1"
+        if raw.isdigit() and 1 <= int(raw) <= len(names):
+            choice = names[int(raw) - 1]
+            break
+        print(f"{RED}Enter a number between 1 and {len(names)}.{RESET}")
+
+    spec = BACKEND_SPECS[choice]
+    cfg: dict[str, str] = {"backend": choice}
+
+    model = input(f"{BLUE}❯{RESET} model [{spec['model']}]: ").strip()
+    if model:
+        cfg["model"] = model
+
+    if spec["kind"] == "api":
+        key_env = spec["key_env"]
+        if os.environ.get(key_env):
+            print(f"{GREEN}✓ Using {key_env} from environment{RESET}")
+        else:
+            key = getpass.getpass(
+                f"{BLUE}❯{RESET} {key_env} (input hidden): ").strip()
+            if key:
+                cfg["api_key"] = key
+            else:
+                print(
+                    f"{YELLOW}No key entered — set {key_env} before running, "
+                    f"or re-run `wrencode --configure`.{RESET}"
+                )
+
+    save_config(cfg)
+    print(f"{GREEN}✓ Saved backend choice to {CONFIG_FILE}{RESET}\n")
+    apply_backend(choice, cfg.get("model", ""), cfg.get("api_key", ""))
+
+
+def resolve_configuration(force_chooser: bool = False) -> None:
+    """Decide which backend to use: env override > saved config > interactive > error."""
+    if force_chooser:
+        if not sys.stdin.isatty():
+            print(f"{RED}--configure needs an interactive terminal.{RESET}")
+            raise SystemExit(1)
+        choose_backend_interactive()
+        return
+
+    # 1. Explicit BACKEND env var — power users / CI. Unchanged from prior behaviour.
+    env_backend = os.environ.get("BACKEND")
+    if env_backend:
+        if env_backend not in BACKEND_SPECS:
+            valid = ", ".join(BACKEND_SPECS)
+            print(f"{RED}Unknown BACKEND '{env_backend}'.{RESET} Valid: {valid}")
+            raise SystemExit(1)
+        apply_backend(env_backend)
+        return
+
+    # 2. A choice saved from a previous run.
+    cfg = load_config()
+    if cfg.get("backend") in BACKEND_SPECS:
+        apply_backend(cfg["backend"], cfg.get(
+            "model", ""), cfg.get("api_key", ""))
+        return
+
+    # 3. First run with a real terminal — ask the user.
+    if sys.stdin.isatty():
+        choose_backend_interactive()
+        return
+
+    # 4. Non-interactive with nothing configured — fail with guidance.
+    print(f"{RED}No backend configured.{RESET}")
+    print(
+        "Set BACKEND=<name> (plus the matching API key), "
+        "or run `wrencode --configure` in a terminal."
+    )
+    raise SystemExit(1)
+
+
+# -----------------------------------------------------------------------------------------------
 # Model Loading
 # -----------------------------------------------------------------------------------------------
 def load_model() -> Optional[tuple[Any, Any]]:
     """Load model for the current backend and return mlx_state (or None for API backends)."""
     if BACKEND == "mlx":
+        try:
+            global load, stream_generate, make_sampler
+            from mlx_lm import load  # type: ignore[import-not-found]
+            from mlx_lm.generate import stream_generate  # type: ignore[import-not-found]
+            from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
+        except ImportError:
+            print(f"{RED}MLX backend needs mlx-lm:{RESET} pip install mlx-lm")
+            print(
+                f"{DIM}Or run `wrencode --configure` to pick a hosted backend.{RESET}"
+            )
+            raise SystemExit(1)
         print(f"{YELLOW}Loading model...{RESET}")
         model, tokenizer = load(MODEL)
         print(f"{GREEN}✓ Loaded: {getattr(model, 'name', MODEL)}{RESET}\n")
         return (model, tokenizer)
     if BACKEND == "transformers":
+        try:
+            global torch, AutoModelForCausalLM, AutoTokenizer
+            import torch  # type: ignore[import-not-found]
+            from transformers import (  # type: ignore[import-not-found]
+                AutoModelForCausalLM,
+                AutoTokenizer,
+            )
+        except ImportError:
+            print(
+                f"{RED}transformers backend needs:{RESET} "
+                "pip install transformers torch"
+            )
+            print(
+                f"{DIM}Or run `wrencode --configure` to pick a hosted backend.{RESET}"
+            )
+            raise SystemExit(1)
         print(f"{YELLOW}Loading model via transformers...{RESET}")
         _device = "mps" if torch.backends.mps.is_available() else "cpu"
         _tok = AutoTokenizer.from_pretrained(MODEL)
@@ -1072,30 +1330,51 @@ def load_model() -> Optional[tuple[Any, Any]]:
         return (_mdl, _tok)
     if BACKEND == "local":
         print(f"{DIM}Local proxy at {API_BASE}{RESET}\n")
-    elif BACKEND == "openai":
-        if not API_KEY:
-            print(f"{RED}OPENAI_API_KEY not set{RESET}")
-            raise SystemExit(1)
-        print(f"{DIM}OpenAI ({MODEL}){RESET}\n")
-    elif BACKEND == "anthropic":
-        if not API_KEY:
-            print(f"{RED}ANTHROPIC_API_KEY not set{RESET}")
-            raise SystemExit(1)
-        print(f"{DIM}Anthropic ({MODEL}){RESET}\n")
-    elif BACKEND == "openrouter":
-        if not API_KEY:
-            print(f"{RED}OPENROUTER_API_KEY not set{RESET}")
-            raise SystemExit(1)
-        print(f"{DIM}OpenRouter ({MODEL}){RESET}\n")
+        return None
+    # Hosted API backends — all require a key.
+    if not API_KEY:
+        key_env = BACKEND_SPECS[BACKEND]["key_env"]
+        print(f"{RED}{key_env} not set.{RESET}")
+        print(
+            f"{DIM}Set {key_env}, or run `wrencode --configure` to re-enter it.{RESET}"
+        )
+        raise SystemExit(1)
+    print(f"{DIM}{BACKEND} ({MODEL}){RESET}\n")
     return None
 
 
 # -----------------------------------------------------------------------------------------------
 # Entry Point
 # -----------------------------------------------------------------------------------------------
+def print_help() -> None:
+    """Print CLI usage."""
+    print("wrencode — a minimal agentic coding assistant\n")
+    print("Usage: wrencode [options]\n")
+    print("Options:")
+    print("  --configure     (re)choose and save the inference backend")
+    print("  --version, -V   print version and exit")
+    print("  --help, -h      show this help\n")
+    print(
+        "Environment overrides: BACKEND, MODEL, and the backend's API key "
+        "(e.g. ANTHROPIC_API_KEY) take precedence over saved config."
+    )
+
+
 def main() -> None:
     """Entry point — initialize the agent and run the interactive loop."""
-    os.environ.setdefault("WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve()))
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print_help()
+        return
+    if "--version" in args or "-V" in args:
+        print(f"wrencode {WRENCODE_VERSION}")
+        return
+    force = "--configure" in args or (bool(args) and args[0] == "configure")
+
+    os.environ.setdefault("WRENCODE_WORKSPACE",
+                          str(pathlib.Path.cwd().resolve()))
+    resolve_configuration(force_chooser=force)
+
     print(WREN_BANNER)
     print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}\n")
     mlx_state = load_model()

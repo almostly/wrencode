@@ -1,0 +1,28 @@
+# Secrets / local config — never commit these
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# WrenCode local state (when pointed at a repo-local config dir)
+.wrencode/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

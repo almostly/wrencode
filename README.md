@@ -12,14 +12,22 @@ WrenCode is a lightweight alternative to Claude Code. It runs a tool-calling age
 
 ## Backends
 
-|Backend       |Description                             |
-|--------------|----------------------------------------|
-|`mlx`         |Apple Silicon via MLX (default)         |
-|`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |
-|`anthropic`   |Claude via Anthropic API                |
-|`openai`      |GPT models via OpenAI API               |
-|`openrouter`  |Any model via OpenRouter                |
-|`local`       |Local proxy via Anthropic-compatible API|
+On first run WrenCode asks you to pick a backend and saves the choice to
+`~/.wrencode/config.json`. Run `wrencode --configure` any time to change it.
+Set `BACKEND` (and the matching API key) in the environment to override the
+saved choice, e.g. for CI.
+
+|Backend       |Description                             |Availability          |
+|--------------|----------------------------------------|----------------------|
+|`anthropic`   |Claude via Anthropic API                |binary + source       |
+|`openai`      |GPT models via OpenAI API               |binary + source       |
+|`openrouter`  |Any model via OpenRouter                |binary + source       |
+|`local`       |Local proxy via Anthropic-compatible API|binary + source       |
+|`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
+|`mlx`         |Apple Silicon via MLX                   |source install, macOS |
+
+The standalone binary can't bundle the heavy ML stack, so the local-weights
+backends (`mlx`, `transformers`) are only offered when running from source.
 
 ## Tools
 
@@ -41,7 +49,16 @@ All file operations are sandboxed to the workspace root by default.
 Run the guided installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh | sh
+```
+
+It detects your OS/arch, downloads the matching binary from the latest GitHub
+Release, and installs it to `~/.local/bin` (no sudo). Override the location with
+`WRENCODE_INSTALL_DIR`, or pin a release with `WRENCODE_VERSION`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh \
+  | WRENCODE_INSTALL_DIR=/usr/local/bin WRENCODE_VERSION=0.1.3 sh
 ```
 
 Or download and run it locally:
@@ -121,10 +138,13 @@ pip install transformers torch
 ## Usage
 
 ```bash
-# Standalone binary
+# Standalone binary — prompts for a backend on first run
 wrencode
 
-# Or from source: default MLX backend
+# Re-pick the backend at any time
+wrencode --configure
+
+# Or from source — also prompts on first run
 python3 wrencode.py
 
 # Anthropic Claude
@@ -170,8 +190,9 @@ This publishes release assets:
 
 |Variable                     |Default                |Description                       |
 |-----------------------------|-----------------------|----------------------------------|
-|`BACKEND`                    |`mlx`                  |Inference backend                 |
+|`BACKEND`                    |chooser/saved config   |Override the saved inference backend|
 |`MODEL`                      |backend-dependent      |Model path or ID                  |
+|`WRENCODE_CONFIG_DIR`        |`~/.wrencode`          |Dir for `config.json` (saved backend/key)|
 |`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
 |`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file path |
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
