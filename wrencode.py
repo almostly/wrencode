@@ -1486,6 +1486,29 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "local":
         print(f"{DIM}Local proxy at {API_BASE}{RESET}\n")
         return None
+    if BACKEND == "ollama":
+        base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        try:
+            with urllib.request.urlopen(f"{base}/api/tags", timeout=3) as r:
+                installed = {
+                    m.get("name", "")
+                    for m in json.loads(r.read().decode()).get("models", [])
+                }
+            want = MODEL if ":" in MODEL else f"{MODEL}:latest"
+            if not (
+                MODEL in installed
+                or want in installed
+                or any(n.split(":")[0] == MODEL for n in installed)
+            ):
+                have = ", ".join(sorted(installed)) or "none"
+                print(f"{YELLOW}⚠ Model '{MODEL}' isn't pulled into Ollama.{RESET}")
+                print(f"{DIM}  Run: ollama pull {MODEL}   (installed: {have}){RESET}")
+        except Exception:
+            print(
+                f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
+            )
+        print(f"{DIM}{BACKEND} ({MODEL}){RESET}\n")
+        return None
     # Hosted API backends — all require a key.
     if not API_KEY:
         key_env = BACKEND_SPECS[BACKEND]["key_env"]
@@ -1568,8 +1591,17 @@ def main() -> None:
         except EOFError:
             break
         except Exception as err:
-            print(f"{RED}Error: {err}{RESET}")
-            traceback.print_exc()
+            msg = str(err)
+            print(f"{RED}Error: {msg}{RESET}")
+            if BACKEND == "ollama" and ("not found" in msg.lower() or "404" in msg):
+                print(
+                    f"{YELLOW}Model '{MODEL}' isn't pulled. "
+                    f"Run: ollama pull {MODEL}  (or `ollama list`).{RESET}"
+                )
+            if os.environ.get("WRENCODE_DEBUG"):
+                traceback.print_exc()
+            else:
+                print(f"{DIM}(set WRENCODE_DEBUG=1 for the full traceback){RESET}")
 
 
 if __name__ == "__main__":
