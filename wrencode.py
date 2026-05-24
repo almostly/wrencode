@@ -1476,8 +1476,10 @@ def load_model() -> Optional[tuple[Any, Any]]:
         print(f"{YELLOW}Loading model via transformers...{RESET}")
         _device = "mps" if torch.backends.mps.is_available() else "cpu"
         _tok = AutoTokenizer.from_pretrained(MODEL)
-        _mdl = AutoModelForCausalLM.from_pretrained(
-            MODEL, torch_dtype=torch.bfloat16, device_map=_device
+        # Load then move to the device. device_map= is for multi-device sharding
+        # (needs accelerate, rejects a plain "mps"/"cpu" string in current transformers).
+        _mdl = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to(
+            _device
         )
         print(f"{GREEN}✓ Loaded on {_device}: {MODEL}{RESET}\n")
         return (_mdl, _tok)
