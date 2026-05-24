@@ -927,7 +927,7 @@ def _compact_via_api(history_text: str) -> str:
             for b in data.get("content", [])
             if b.get("type") == "text"
         ).strip()
-    if BACKEND in ("openai", "openrouter"):
+    if BACKEND in {"openai", "openrouter"}:
         data = _http_post(
             API_BASE,
             {
@@ -963,7 +963,7 @@ def compact_messages(
         f"{m['role']}: {flatten_content(m['content'])}\n" for m in messages
     )
 
-    if BACKEND in ("anthropic", "openai", "openrouter"):
+    if BACKEND in {"anthropic", "openai", "openrouter"}:
         summary = _compact_via_api(history_text)
     else:
         # MLX / Transformers path
@@ -1065,7 +1065,7 @@ def run_agent_turn(
         print(" " * 20, end="\r")
 
         # Anthropic & OpenAI native tool use path
-        if BACKEND in ("anthropic", "openai"):
+        if BACKEND in {"anthropic", "openai"}:
             data = json.loads(response_text)
             if BACKEND == "anthropic":
                 display_text, tool_calls = _parse_anthropic_response(data)
