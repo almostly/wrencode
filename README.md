@@ -24,6 +24,7 @@ saved choice, e.g. for CI.
 |`anthropic`   |Claude via Anthropic API                |binary + source       |
 |`openai`      |GPT models via OpenAI API               |binary + source       |
 |`openrouter`  |Any model via OpenRouter                |binary + source       |
+|`ollama`      |Local models via a running `ollama serve`|binary + source     |
 |`local`       |Local proxy via Anthropic-compatible API|binary + source       |
 |`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
 |`mlx`         |Apple Silicon via MLX                   |source install, macOS |
@@ -158,6 +159,9 @@ BACKEND=openai MODEL=gpt-4o python3 wrencode.py
 # OpenRouter
 BACKEND=openrouter MODEL=anthropic/claude-3-haiku python3 wrencode.py
 
+# Ollama (needs `ollama serve` running and the model pulled)
+BACKEND=ollama MODEL=llama3.2 python3 wrencode.py
+
 # HuggingFace model
 BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 wrencode.py
 
@@ -210,6 +214,7 @@ This publishes release assets:
 |`ANTHROPIC_API_KEY`          |-                      |Anthropic API key                 |
 |`LOCAL_API_KEY`              |`local`                |Local proxy API key               |
 |`LOCAL_PORT`                 |`8082`                 |Local proxy port                  |
+|`OLLAMA_HOST`                |`http://localhost:11434`|Ollama server base URL           |
 
 ## History
 

@@ -102,6 +102,11 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
         "key_env": "LOCAL_API_KEY",
         "label": "Local proxy  (Anthropic-compatible server on localhost)",
     },
+    "ollama": {
+        "kind": "local-proxy",
+        "model": "llama3.2",
+        "label": "Ollama  (local models via `ollama serve`)",
+    },
     "transformers": {
         "kind": "local-ml",
         "model": "deburky/gpt-oss-claude-code",
@@ -150,6 +155,10 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
     if spec["kind"] == "api":
         API_KEY = os.environ.get(spec["key_env"]) or api_key or ""
         API_BASE = spec["api_base"]
+    elif backend == "ollama":
+        base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        API_KEY = "ollama"  # Ollama ignores the key; kept non-empty for the loader
+        API_BASE = f"{base}/v1/chat/completions"
     elif backend == "local":
         LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
         API_KEY = os.environ.get("LOCAL_API_KEY") or api_key or "local"
@@ -749,8 +758,8 @@ def get_response(
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
-    # OpenRouter — OpenAI-compatible chat completions (no native tools)
-    if BACKEND == "openrouter":
+    # OpenRouter / Ollama — OpenAI-compatible chat completions (no native tools)
+    if BACKEND in {"openrouter", "ollama"}:
         data = _http_post(
             API_BASE,
             {
