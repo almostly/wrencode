@@ -119,6 +119,15 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
+# Backend capability groups, derived from the registry where possible.
+API_BACKENDS: frozenset[str] = frozenset(
+    name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "api"
+)
+LOCAL_ML_BACKENDS: frozenset[str] = frozenset(
+    name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "local-ml"
+)
+NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai"})
+
 CONFIG_DIR = pathlib.Path(
     os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
 ).expanduser()
@@ -963,7 +972,7 @@ def compact_messages(
         f"{m['role']}: {flatten_content(m['content'])}\n" for m in messages
     )
 
-    if BACKEND in {"anthropic", "openai", "openrouter"}:
+    if BACKEND in API_BACKENDS:
         summary = _compact_via_api(history_text)
     else:
         # MLX / Transformers path
@@ -1065,7 +1074,7 @@ def run_agent_turn(
         print(" " * 20, end="\r")
 
         # Anthropic & OpenAI native tool use path
-        if BACKEND in {"anthropic", "openai"}:
+        if BACKEND in NATIVE_TOOL_BACKENDS:
             data = json.loads(response_text)
             if BACKEND == "anthropic":
                 display_text, tool_calls = _parse_anthropic_response(data)
@@ -1184,9 +1193,7 @@ def handle_slash_command(
         print(f"{GREEN}Cleared{RESET}")
         return "handled"
     if cmd == "/compact":
-        if BACKEND in {"anthropic", "openai", "openrouter"} or (
-            BACKEND in {"mlx", "transformers"} and mlx_state
-        ):
+        if BACKEND in API_BACKENDS or (BACKEND in LOCAL_ML_BACKENDS and mlx_state):
             print(f"{DIM}Compacting history...{RESET}")
             model, tokenizer = mlx_state or (None, None)
             before = len(messages)
