@@ -56,7 +56,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                 if not _line or _line.startswith("#") or "=" not in _line:
                     continue
                 if _line.startswith("export "):
-                    _line = _line[len("export "):]
+                    _line = _line[len("export ") :]
                 _k, _v = _line.split("=", 1)
                 _v = _v.strip()
                 # Strip matching surrounding quotes, e.g. KEY="value" or KEY='value'.
@@ -269,8 +269,7 @@ def read(args: dict[str, Any]) -> str:
     if path.is_dir():
         entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
         return (
-            "\n".join(
-                f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
+            "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
             or "(empty)"
         )
     if not path.is_file():
@@ -278,11 +277,14 @@ def read(args: dict[str, Any]) -> str:
     size = path.stat().st_size
     if size > MAX_READ_BYTES:
         return f"error: file too large ({size} bytes, max {MAX_READ_BYTES})"
-    lines = path.read_text(
-        encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
     offset = _optional_int(args, "offset", 0) or 0
     if not (0 <= offset <= len(lines)):
-        return f"error: offset {offset} out of range (file has {len(lines)} lines)"
+        return (
+            f"error: offset {offset} out of range (file has {len(lines)} lines)"
+        )
     limit_val = _optional_int(args, "limit")
     cap = min(
         limit_val
@@ -292,7 +294,7 @@ def read(args: dict[str, Any]) -> str:
     )
     out = "".join(
         f"{offset + i + 1:4}| {line}"
-        for i, line in enumerate(lines[offset: offset + cap])
+        for i, line in enumerate(lines[offset : offset + cap])
     )
     if offset + cap < len(lines):
         out += f"\n... ({len(lines) - offset - cap} more lines; use offset/limit or raise MAX_READ_LINES)"
@@ -347,9 +349,12 @@ def glob(args: dict[str, Any]) -> str:
     files = [
         f
         for f in globlib.glob(str(base / pat), recursive=True)
-        if os.path.isfile(f) and all(p not in _GLOB_SKIP for p in pathlib.Path(f).parts)
+        if os.path.isfile(f)
+        and all(p not in _GLOB_SKIP for p in pathlib.Path(f).parts)
     ]
-    return "\n".join(sorted(files, key=os.path.getmtime, reverse=True)) or "none"
+    return (
+        "\n".join(sorted(files, key=os.path.getmtime, reverse=True)) or "none"
+    )
 
 
 def grep(args: dict[str, Any]) -> str:
@@ -391,7 +396,10 @@ def grep(args: dict[str, Any]) -> str:
 
 def confirm(prompt: str) -> bool:
     """Prompt the user for y/N confirmation and return True if confirmed."""
-    return input(f"\n{YELLOW}⚠ {prompt} [y/N]{RESET} ").strip().lower() in ("y", "yes")
+    return input(f"\n{YELLOW}⚠ {prompt} [y/N]{RESET} ").strip().lower() in (
+        "y",
+        "yes",
+    )
 
 
 def bash(args: dict[str, Any]) -> str:
@@ -444,7 +452,11 @@ TOOLS: dict[str, ToolEntry] = {
         {"path": "string", "offset": "number?", "limit": "number?"},
         read,
     ),
-    "write": ("Write content to file", {"path": "string", "content": "string"}, write),
+    "write": (
+        "Write content to file",
+        {"path": "string", "content": "string"},
+        write,
+    ),
     "edit": (
         "Replace old with new in file",
         {"path": "string", "old": "string", "new": "string", "all": "boolean?"},
@@ -522,7 +534,13 @@ def truncate_at_turn_leak(text: str) -> str:
     return next(
         (
             text.split(m)[0].strip()
-            for m in ("\nUser:", "\nSystem:", "\nHuman:", "\n\nUser:", "\n\nSystem:")
+            for m in (
+                "\nUser:",
+                "\nSystem:",
+                "\nHuman:",
+                "\n\nUser:",
+                "\n\nSystem:",
+            )
             if m in text
         ),
         text,
@@ -555,7 +573,9 @@ def _tool_call_complete(text: str) -> int:
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse all <tool_call> blocks from model output into structured dicts."""
     calls: list[dict[str, Any]] = []
-    for m in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL):
+    for m in re.finditer(
+        r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL
+    ):
         with contextlib.suppress(Exception):
             d = json.loads(m.group(1))
             if d.get("tool") in TOOLS:
@@ -591,7 +611,8 @@ def _build_anthropic_tools() -> list[dict[str, Any]]:
         required: list[str] = []
         for param_name, param_type in params.items():
             properties[param_name] = {
-                "type": _TYPE_MAP.get(param_type, "string")}
+                "type": _TYPE_MAP.get(param_type, "string")
+            }
             if not param_type.endswith("?"):
                 required.append(param_name)
         result.append(
@@ -637,7 +658,8 @@ def _build_openai_tools() -> list[dict[str, Any]]:
         required: list[str] = []
         for param_name, param_type in params.items():
             properties[param_name] = {
-                "type": _TYPE_MAP.get(param_type, "string")}
+                "type": _TYPE_MAP.get(param_type, "string")
+            }
             if not param_type.endswith("?"):
                 required.append(param_name)
         result.append(
@@ -680,7 +702,9 @@ def _parse_openai_response(
 # -----------------------------------------------------------------------------------------------
 # HTTP Helper
 # -----------------------------------------------------------------------------------------------
-def _http_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> Any:
+def _http_post(
+    url: str, payload: dict[str, Any], headers: dict[str, str]
+) -> Any:
     """POST a JSON payload to a URL and return the parsed response."""
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers)
@@ -701,7 +725,8 @@ def get_response(
 ) -> str:
     """Generate a response from the configured backend given the message history."""
     flat = [
-        {"role": m["role"], "content": flatten_content(m["content"])} for m in messages
+        {"role": m["role"], "content": flatten_content(m["content"])}
+        for m in messages
     ]
 
     # OpenAI — native function calling
@@ -710,14 +735,17 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}] + messages,
+                "messages": [{"role": "system", "content": system_prompt}]
+                + messages,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
                 "tools": _build_openai_tools(),
                 "tool_choice": "auto",
             },
-            {"Content-Type": "application/json",
-                "Authorization": f"Bearer {API_KEY}"},
+            {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}",
+            },
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
@@ -727,12 +755,15 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}] + flat,
+                "messages": [{"role": "system", "content": system_prompt}]
+                + flat,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
             },
-            {"Content-Type": "application/json",
-                "Authorization": f"Bearer {API_KEY}"},
+            {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}",
+            },
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -774,7 +805,9 @@ def get_response(
             headers,
         )
         text = "".join(
-            b["text"] for b in data.get("content", []) if b.get("type") == "text"
+            b["text"]
+            for b in data.get("content", [])
+            if b.get("type") == "text"
         )
         return strip_gptoss_tokens(text)
 
@@ -789,10 +822,14 @@ def get_response(
         ).to(model.device)
         with torch.no_grad():
             out_ids = model.generate(
-                **inputs, max_new_tokens=MAX_TOKENS, temperature=0.3, do_sample=True
+                **inputs,
+                max_new_tokens=MAX_TOKENS,
+                temperature=0.3,
+                do_sample=True,
             )
         raw = tokenizer.decode(
-            out_ids[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=False
+            out_ids[0][inputs["input_ids"].shape[-1] :],
+            skip_special_tokens=False,
         )
         end = _tool_call_complete(raw)
         if end != -1:
@@ -808,8 +845,9 @@ def get_response(
     prompt = tokenizer.apply_chat_template(
         chat, tokenize=False, add_generation_prompt=True
     )
-    sampler = make_sampler(temp=0.3, top_p=0.95,
-                           min_p=0.0, min_tokens_to_keep=1)
+    sampler = make_sampler(
+        temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1
+    )
     out = ""
     for chunk in stream_generate(
         model, tokenizer, prompt=prompt, max_tokens=MAX_TOKENS, sampler=sampler
@@ -820,7 +858,7 @@ def get_response(
             out = out[:end]
             break
     if out.startswith(prompt):
-        out = out[len(prompt):].strip()
+        out = out[len(prompt) :].strip()
     return truncate_at_turn_leak(strip_gptoss_tokens(out))
 
 
@@ -876,7 +914,9 @@ def _compact_via_api(history_text: str) -> str:
             },
         )
         return "\n".join(
-            b["text"] for b in data.get("content", []) if b.get("type") == "text"
+            b["text"]
+            for b in data.get("content", [])
+            if b.get("type") == "text"
         ).strip()
     if BACKEND in ("openai", "openrouter"):
         data = _http_post(
@@ -884,14 +924,19 @@ def _compact_via_api(history_text: str) -> str:
             {
                 "model": MODEL,
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant.",
+                    },
                     {"role": "user", "content": summarise_prompt},
                 ],
                 "max_tokens": 512,
                 "temperature": 0.3,
             },
-            {"Content-Type": "application/json",
-                "Authorization": f"Bearer {API_KEY}"},
+            {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}",
+            },
         )
         return (data["choices"][0]["message"].get("content") or "").strip()
     return ""
@@ -924,8 +969,9 @@ def compact_messages(
             tokenize=False,
             add_generation_prompt=True,
         )
-        sampler = make_sampler(temp=0.3, top_p=0.95,
-                               min_p=0.0, min_tokens_to_keep=1)
+        sampler = make_sampler(
+            temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1
+        )
         summary = "".join(
             c.text
             for c in stream_generate(
@@ -933,7 +979,7 @@ def compact_messages(
             )
         )
         if summary.startswith(prompt):
-            summary = summary[len(prompt):].strip()
+            summary = summary[len(prompt) :].strip()
 
     return [
         {"role": "user", "content": f"[Conversation summary]\n{summary}"},
@@ -1031,8 +1077,9 @@ def run_agent_turn(
             tool_results: list[dict[str, Any]] = []
             for tc in tool_calls:
                 arg_preview = (
-                    str(list(tc["input"].values())[0])[
-                        :50] if tc["input"] else ""
+                    str(list(tc["input"].values())[0])[:50]
+                    if tc["input"]
+                    else ""
                 )
                 print(
                     f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
@@ -1055,8 +1102,11 @@ def run_agent_turn(
                     )
                 else:
                     tool_results.append(
-                        {"role": "tool",
-                            "tool_call_id": tc["id"], "content": result}
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        }
                     )
             if BACKEND == "anthropic":
                 messages.append({"role": "user", "content": tool_results})
@@ -1078,8 +1128,9 @@ def run_agent_turn(
         )
         xml_tool_results: list[dict[str, Any]] = []
         for tc in xml_tool_calls:
-            arg_preview = str(list(tc["input"].values())[0])[
-                :50] if tc["input"] else ""
+            arg_preview = (
+                str(list(tc["input"].values())[0])[:50] if tc["input"] else ""
+            )
             print(
                 f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
             )
@@ -1092,8 +1143,11 @@ def run_agent_turn(
             )
             print(f"{DIM}⎿ {preview}{RESET}")
             xml_tool_results.append(
-                {"type": "tool_result",
-                    "tool_use_id": tc["id"], "content": result}
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tc["id"],
+                    "content": result,
+                }
             )
             content_blocks.append(tc)
 
@@ -1129,9 +1183,13 @@ def handle_slash_command(
             before = len(messages)
             messages[:] = compact_messages(messages, model, tokenizer)
             save_history(messages)
-            print(f"{GREEN}Compacted {before} → {len(messages)} messages{RESET}")
+            print(
+                f"{GREEN}Compacted {before} → {len(messages)} messages{RESET}"
+            )
         else:
-            print(f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}")
+            print(
+                f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}"
+            )
         return "handled"
     if cmd == "/help":
         print(
@@ -1200,7 +1258,8 @@ def choose_backend_interactive() -> None:
     for i, name in enumerate(names, 1):
         spec = BACKEND_SPECS[name]
         print(
-            f"  {BOLD}{i}{RESET}. {spec['label']}  {DIM}[{spec['model']}]{RESET}")
+            f"  {BOLD}{i}{RESET}. {spec['label']}  {DIM}[{spec['model']}]{RESET}"
+        )
     print()
     if not is_frozen():
         print(
@@ -1228,7 +1287,8 @@ def choose_backend_interactive() -> None:
             print(f"{GREEN}✓ Using {key_env} from environment{RESET}")
         else:
             key = getpass.getpass(
-                f"{BLUE}❯{RESET} {key_env} (input hidden): ").strip()
+                f"{BLUE}❯{RESET} {key_env} (input hidden): "
+            ).strip()
             if key:
                 cfg["api_key"] = key
             else:
@@ -1256,7 +1316,9 @@ def resolve_configuration(force_chooser: bool = False) -> None:
     if env_backend:
         if env_backend not in BACKEND_SPECS:
             valid = ", ".join(BACKEND_SPECS)
-            print(f"{RED}Unknown BACKEND '{env_backend}'.{RESET} Valid: {valid}")
+            print(
+                f"{RED}Unknown BACKEND '{env_backend}'.{RESET} Valid: {valid}"
+            )
             raise SystemExit(1)
         apply_backend(env_backend)
         return
@@ -1264,8 +1326,9 @@ def resolve_configuration(force_chooser: bool = False) -> None:
     # 2. A choice saved from a previous run.
     cfg = load_config()
     if cfg.get("backend") in BACKEND_SPECS:
-        apply_backend(cfg["backend"], cfg.get(
-            "model", ""), cfg.get("api_key", ""))
+        apply_backend(
+            cfg["backend"], cfg.get("model", ""), cfg.get("api_key", "")
+        )
         return
 
     # 3. First run with a real terminal — ask the user.
@@ -1371,8 +1434,9 @@ def main() -> None:
         return
     force = "--configure" in args or (bool(args) and args[0] == "configure")
 
-    os.environ.setdefault("WRENCODE_WORKSPACE",
-                          str(pathlib.Path.cwd().resolve()))
+    os.environ.setdefault(
+        "WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve())
+    )
     resolve_configuration(force_chooser=force)
 
     print(WREN_BANNER)
