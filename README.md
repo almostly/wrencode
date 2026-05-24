@@ -34,7 +34,7 @@ backends (`mlx`, `transformers`) are only offered when running from source.
 
 ## Tools
 
-The agent has access to six tools:
+The agent has access to seven tools:
 
 - **read** - read a file with line numbers, or list a directory
 - **write** - write content to a file
@@ -42,8 +42,17 @@ The agent has access to six tools:
 - **glob** - find files by pattern, sorted by modification time
 - **grep** - search files for a regex pattern using `rg` when available, falling back to `grep`
 - **bash** - run a shell command with timeout and streaming output
+- **task** - delegate a self-contained subtask to a fresh subagent (its own context, same tools) that returns only its final result
 
 All file operations are sandboxed to the workspace root by default.
+
+### Subagents
+
+The `task` tool runs a nested agent loop on a fresh message history, so the
+parent's context only grows by the returned summary — useful for context-heavy
+subtasks. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
+each subagent round is bounded. For autonomous subagent runs, enable
+`--yes` / `WRENCODE_AUTO_APPROVE` so sub-tool calls don't block on confirmation.
 
 ## Installation
 
@@ -203,6 +212,7 @@ This publishes release assets:
 |`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file path |
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
+|`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
 |`MAX_TOKENS`                 |`4096`                 |Max tokens per response           |
 |`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |
 |`MAX_READ_LINES`             |`800`                  |Max lines returned per read       |

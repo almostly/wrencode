@@ -150,6 +150,11 @@ torch: Any = None  # torch
 AutoModelForCausalLM: Any = None  # transformers.AutoModelForCausalLM
 AutoTokenizer: Any = None  # transformers.AutoTokenizer
 
+# Subagent state: the loaded model (set in main) and a recursion-depth guard.
+_MLX_STATE: Optional[tuple[Any, Any]] = None
+_SUBAGENT_DEPTH = 0
+MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
+
 
 def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
     """Set the module-level backend globals from a backend name plus overrides.
@@ -469,6 +474,30 @@ def bash(args: dict[str, Any]) -> str:
     return "".join(output_lines).strip() or "(empty)"
 
 
+def task(args: dict[str, Any]) -> str:
+    """Run a subagent: a fresh agent loop over a self-contained subtask.
+
+    The subagent shares the workspace and tool set but has its own (empty)
+    message history, so the parent's context only grows by the returned result.
+    Recursion is capped by MAX_SUBAGENT_DEPTH. For autonomous use run with
+    --yes / WRENCODE_AUTO_APPROVE, else each sub-tool call still asks to confirm.
+    """
+    global _SUBAGENT_DEPTH
+    if _SUBAGENT_DEPTH >= MAX_SUBAGENT_DEPTH:
+        return f"error: max subagent depth ({MAX_SUBAGENT_DEPTH}) reached"
+    prompt = _require_str(args, "prompt")
+    _SUBAGENT_DEPTH += 1
+    print(f"{CYAN}  ↳ subagent:{RESET}{DIM} {prompt[:70]}{RESET}")
+    sub: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    try:
+        run_agent_turn(sub, build_system_prompt(), _MLX_STATE, max_iters=12)
+    finally:
+        _SUBAGENT_DEPTH -= 1
+    texts = [flatten_content(m["content"]) for m in sub if m["role"] == "assistant"]
+    print(f"{CYAN}  ↳ subagent done{RESET}")
+    return (texts[-1] if texts else "") or "(subagent produced no text output)"
+
+
 ToolFn = Callable[[dict[str, Any]], str]
 ToolEntry = tuple[str, dict[str, str], ToolFn]
 
@@ -499,6 +528,12 @@ TOOLS: dict[str, ToolEntry] = {
         grep,
     ),
     "bash": ("Run shell command", {"cmd": "string"}, bash),
+    "task": (
+        "Delegate a self-contained subtask to a fresh subagent (same tools, "
+        "own context); returns only its final result",
+        {"prompt": "string"},
+        task,
+    ),
 }
 
 
@@ -1055,6 +1090,7 @@ Available tools:
 - glob(pat): Find files matching pattern
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
+- task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result
 
 To use a tool, format it EXACTLY like this:
 <tool_call>{{"tool": "name", "args": {{"key": "value"}}}}</tool_call>
@@ -1074,9 +1110,19 @@ def run_agent_turn(
     messages: list[dict[str, Any]],
     system_prompt: str,
     mlx_state: Optional[tuple[Any, Any]],
+    max_iters: int = 0,
 ) -> None:
-    """Generate a response and execute any tool calls, repeating until no tools remain."""
+    """Generate a response and execute any tool calls, repeating until no tools remain.
+
+    max_iters > 0 caps the tool-calling rounds (used to bound subagents);
+    0 means unlimited, preserving the interactive default.
+    """
+    iters = 0
     while True:
+        if max_iters and iters >= max_iters:
+            print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
+            break
+        iters += 1
         print(f"{DIM}Generating...{RESET}", end="\r", flush=True)
         response_text = get_response(messages, system_prompt, mlx_state)
         print(" " * 20, end="\r")
@@ -1454,6 +1500,7 @@ def print_help() -> None:
 
 def main() -> None:
     """Entry point — initialize the agent and run the interactive loop."""
+    global _MLX_STATE
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
         print_help()
@@ -1473,6 +1520,7 @@ def main() -> None:
     print(WREN_BANNER)
     print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}\n")
     mlx_state = load_model()
+    _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()
     messages = load_history()
     if messages:
