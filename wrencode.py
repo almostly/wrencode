@@ -632,13 +632,32 @@ def _tool_call_complete(text: str) -> int:
 
 
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
-    """Parse all <tool_call> blocks from model output into structured dicts."""
+    """Parse all <tool_call> blocks from model output into structured dicts.
+
+    The JSON object is extracted by brace matching (handles nesting), and the
+    closing </tool_call> tag is optional: the mlx/transformers streaming loop
+    stops at the JSON's closing brace before the tag is emitted, so requiring
+    it would drop every local-model tool call.
+    """
     calls: list[dict[str, Any]] = []
-    for m in re.finditer(
-        r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL
-    ):
+    pos = 0
+    while (start := text.find("<tool_call>", pos)) != -1:
+        brace = text.find("{", start)
+        if brace == -1:
+            break
+        depth, end = 0, -1
+        for i, ch in enumerate(text[brace:], brace):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end == -1:
+            break  # JSON not yet complete
         with contextlib.suppress(Exception):
-            d = json.loads(m.group(1))
+            d = json.loads(text[brace:end])
             if d.get("tool") in TOOLS:
                 calls.append(
                     {
@@ -648,6 +667,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                         "input": d.get("args", {}),
                     }
                 )
+        pos = end
     return calls
 
 
