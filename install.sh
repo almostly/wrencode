@@ -1,14 +1,14 @@
 #!/bin/sh
 # WrenCode installer — downloads the latest standalone binary from GitHub Releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/almostly/wrencode/main/install.sh | sh
 #
 # Environment overrides:
 #   WRENCODE_INSTALL_DIR   where to install     (default: ~/.local/bin)
 #   WRENCODE_VERSION       release tag to fetch (default: latest)
 set -eu
 
-REPO="deburky/wrencode"
+REPO="almostly/wrencode"
 BIN_NAME="wrencode"
 INSTALL_DIR="${WRENCODE_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${WRENCODE_VERSION:-latest}"

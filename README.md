@@ -61,7 +61,7 @@ each subagent round is bounded. For autonomous subagent runs, enable
 Run the guided installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/almostly/wrencode/main/install.sh | sh
 ```
 
 It detects your OS/arch, downloads the matching binary from the latest GitHub
@@ -69,14 +69,14 @@ Release, and installs it to `~/.local/bin` (no sudo). Override the location with
 `WRENCODE_INSTALL_DIR`, or pin a release with `WRENCODE_VERSION`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/almostly/wrencode/main/install.sh \
   | WRENCODE_INSTALL_DIR=/usr/local/bin WRENCODE_VERSION=0.1.3 sh
 ```
 
 Or download and run it locally:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deburky/wrencode/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/almostly/wrencode/main/install.sh -o install.sh
 chmod +x install.sh
 ./install.sh
 ```
@@ -86,7 +86,7 @@ Manual install (fallback): download the right binary from GitHub Releases, make 
 macOS Apple Silicon:
 
 ```bash
-curl -L https://github.com/deburky/wrencode/releases/latest/download/wrencode-macos-arm64 -o wrencode
+curl -L https://github.com/almostly/wrencode/releases/latest/download/wrencode-macos-arm64 -o wrencode
 chmod +x wrencode
 sudo mv wrencode /usr/local/bin/wrencode
 ```
@@ -94,7 +94,7 @@ sudo mv wrencode /usr/local/bin/wrencode
 macOS Intel:
 
 ```bash
-curl -L https://github.com/deburky/wrencode/releases/latest/download/wrencode-macos-x64 -o wrencode
+curl -L https://github.com/almostly/wrencode/releases/latest/download/wrencode-macos-x64 -o wrencode
 chmod +x wrencode
 sudo mv wrencode /usr/local/bin/wrencode
 ```
@@ -102,7 +102,7 @@ sudo mv wrencode /usr/local/bin/wrencode
 Linux x64:
 
 ```bash
-curl -L https://github.com/deburky/wrencode/releases/latest/download/wrencode-linux-x64 -o wrencode
+curl -L https://github.com/almostly/wrencode/releases/latest/download/wrencode-linux-x64 -o wrencode
 chmod +x wrencode
 sudo mv wrencode /usr/local/bin/wrencode
 ```
@@ -112,7 +112,7 @@ sudo mv wrencode /usr/local/bin/wrencode
 Single file, standard library only (except the backend you choose).
 
 ```bash
-git clone https://github.com/deburky/wrencode
+git clone https://github.com/almostly/wrencode
 cd wrencode
 ```
 
