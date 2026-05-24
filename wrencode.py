@@ -114,7 +114,7 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
     },
     "mlx": {
         "kind": "local-ml",
-        "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+        "model": "deburky/gpt-oss-claude-mlx",
         "label": "Apple Silicon via MLX  (source install)",
     },
 }

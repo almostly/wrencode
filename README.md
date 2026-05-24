@@ -32,6 +32,12 @@ saved choice, e.g. for CI.
 The standalone binary can't bundle the heavy ML stack, so the local-weights
 backends (`mlx`, `transformers`) are only offered when running from source.
 
+The default local models are
+[`deburky/gpt-oss-claude-code`](https://huggingface.co/deburky/gpt-oss-claude-code)
+(transformers) and
+[`deburky/gpt-oss-claude-mlx`](https://huggingface.co/deburky/gpt-oss-claude-mlx)
+(MLX) — override either with `MODEL=...`.
+
 ## Tools
 
 The agent has access to seven tools:
@@ -238,3 +244,7 @@ To clear history: use `/c` in the session, or delete `~/.wrencode/history.json` 
 ## License
 
 MIT - Copyright 2026 Denis Burakov.
+
+-----
+
+![Almostly](assets/almostly-badge.svg)
