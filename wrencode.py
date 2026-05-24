@@ -413,7 +413,15 @@ def grep(args: dict[str, Any]) -> str:
 
 
 def confirm(prompt: str) -> bool:
-    """Prompt the user for y/N confirmation and return True if confirmed."""
+    """Prompt for y/N confirmation; auto-approve if WRENCODE_AUTO_APPROVE is set.
+
+    Auto-approve enables headless/CI use and subagents (which can't field an
+    interactive prompt), at the cost of running writes and shell commands
+    without review — only use it in a sandboxed workspace you trust.
+    """
+    if os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes"):
+        print(f"{DIM}⚠ {prompt} [auto-approved]{RESET}")
+        return True
     return input(f"\n{YELLOW}⚠ {prompt} [y/N]{RESET} ").strip().lower() in (
         "y",
         "yes",
@@ -1431,11 +1439,16 @@ def print_help() -> None:
     print("Usage: wrencode [options]\n")
     print("Options:")
     print("  --configure     (re)choose and save the inference backend")
+    print("  --yes           auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("  --version, -V   print version and exit")
     print("  --help, -h      show this help\n")
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
         "(e.g. ANTHROPIC_API_KEY) take precedence over saved config."
+    )
+    print(
+        "Warning: --yes runs writes and shell commands without confirmation; "
+        "use it only in a sandboxed workspace."
     )
 
 
@@ -1449,6 +1462,8 @@ def main() -> None:
         print(f"wrencode {WRENCODE_VERSION}")
         return
     force = "--configure" in args or (bool(args) and args[0] == "configure")
+    if "--yes" in args or "--auto-approve" in args:
+        os.environ["WRENCODE_AUTO_APPROVE"] = "1"
 
     os.environ.setdefault(
         "WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve())

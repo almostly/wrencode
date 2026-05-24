@@ -202,6 +202,7 @@ This publishes release assets:
 |`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
 |`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file path |
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
+|`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`MAX_TOKENS`                 |`4096`                 |Max tokens per response           |
 |`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |
 |`MAX_READ_LINES`             |`800`                  |Max lines returned per read       |
