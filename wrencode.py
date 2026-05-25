@@ -575,9 +575,54 @@ def flatten_content(content: Any) -> str:
     return "\n".join(parts)
 
 
+# Lightweight, language-agnostic code coloring — no pygments, keeps the binary lean.
+_CODE_TOKEN = re.compile(
+    r"(?P<comment>#[^\n]*|//[^\n]*)"
+    r"|(?P<string>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`)"
+    r"|(?P<num>\b\d[\d_.]*\b)"
+    r"|(?P<kw>\b(?:def|class|return|import|from|if|elif|else|for|while|try|except|"
+    r"finally|with|as|in|not|and|or|is|lambda|yield|async|await|pass|break|continue|"
+    r"raise|global|nonlocal|assert|True|False|None|const|let|var|function|export|"
+    r"default|new|this|fn|match|struct|enum|pub|use|mut|public|private|static|void)\b)"
+)
+
+
+def _highlight_code(code: str) -> str:
+    """Apply light ANSI syntax coloring to a code block (best-effort, any language)."""
+
+    def color(m: "re.Match[str]") -> str:
+        g = m.lastgroup
+        if g == "comment":
+            return f"{DIM}{m.group()}{RESET}"
+        if g == "string":
+            return f"{GREEN}{m.group()}{RESET}"
+        if g == "num":
+            return f"{YELLOW}{m.group()}{RESET}"
+        if g == "kw":
+            return f"{BLUE}{m.group()}{RESET}"
+        return m.group()
+
+    return _CODE_TOKEN.sub(color, code)
+
+
 def render_markdown(text: str) -> str:
-    """Render basic markdown bold syntax to terminal bold escape codes."""
-    return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
+    """Render fenced code blocks (lightly highlighted), inline code, and bold."""
+    blocks: list[str] = []
+
+    def stash(m: "re.Match[str]") -> str:
+        lang = m.group(1) or ""
+        body = _highlight_code(m.group(2).rstrip("\n"))
+        head = f"{DIM}┌─ {lang}{RESET}\n" if lang else f"{DIM}┌─{RESET}\n"
+        bordered = "\n".join(f"{DIM}│{RESET} {ln}" for ln in body.split("\n"))
+        blocks.append(f"\n{head}{bordered}\n{DIM}└─{RESET}")
+        return f"\x00B{len(blocks) - 1}\x00"
+
+    text = re.sub(r"```(\w*)\n?(.*?)```", stash, text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", f"{CYAN}\\1{RESET}", text)
+    text = re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
+    for i, b in enumerate(blocks):
+        text = text.replace(f"\x00B{i}\x00", b)
+    return text
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1562,6 +1607,7 @@ def main() -> None:
     )
     resolve_configuration(force_chooser=force)
 
+    sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(WREN_BANNER)
     print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}\n")
     mlx_state = load_model()
@@ -1573,7 +1619,7 @@ def main() -> None:
 
     while True:
         try:
-            user_input = input(f"{BOLD}{BLUE}❯{RESET} ").strip()
+            user_input = input(f"{BRIGHT_CYAN}❯{RESET} ").strip()
             if not user_input:
                 continue
             action = handle_slash_command(user_input, messages, mlx_state)
