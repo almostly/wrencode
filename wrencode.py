@@ -8,14 +8,17 @@ HuggingFace Transformers, Anthropic, OpenAI, OpenRouter, and local proxy.
 Provides a tool-calling agent loop with file read/write/edit, glob, grep,
 and bash — enough to autonomously navigate and modify a codebase.
 
-Copyright 2026 Denis Burakov. All Rights Reserved.
+Copyright (c) 2026 Almostly
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
-furnished to do so.
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -67,7 +70,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend Configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.1.4"
+WRENCODE_VERSION = "0.1.4.1"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
@@ -80,42 +83,42 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
         "model": "claude-haiku-4-5-20251001",
         "key_env": "ANTHROPIC_API_KEY",
         "api_base": "https://api.anthropic.com/v1/messages",
-        "label": "Anthropic Claude  (API key)",
+        "label": "Anthropic Claude (API key)",
     },
     "openai": {
         "kind": "api",
         "model": "gpt-4o-mini",
         "key_env": "OPENAI_API_KEY",
         "api_base": "https://api.openai.com/v1/chat/completions",
-        "label": "OpenAI GPT  (API key)",
+        "label": "OpenAI GPT (API key)",
     },
     "openrouter": {
         "kind": "api",
         "model": "anthropic/claude-3-haiku",
         "key_env": "OPENROUTER_API_KEY",
         "api_base": "https://openrouter.ai/api/v1/chat/completions",
-        "label": "OpenRouter — any model  (API key)",
+        "label": "OpenRouter — any model (API key)",
     },
     "local": {
         "kind": "local-proxy",
         "model": "gpt-oss-20b",
         "key_env": "LOCAL_API_KEY",
-        "label": "Local proxy  (Anthropic-compatible server on localhost)",
+        "label": "Local proxy (Anthropic-compatible server on localhost)",
     },
     "ollama": {
         "kind": "local-proxy",
         "model": "llama3.2",
-        "label": "Ollama  (local models via `ollama serve`)",
+        "label": "Ollama (local models via `ollama serve`)",
     },
     "transformers": {
         "kind": "local-ml",
         "model": "deburky/gpt-oss-claude-code",
-        "label": "HuggingFace Transformers  (CPU/GPU, source install)",
+        "label": "HuggingFace Transformers (CPU/GPU, source install)",
     },
     "mlx": {
         "kind": "local-ml",
         "model": "deburky/gpt-oss-claude-mlx",
-        "label": "Apple Silicon via MLX  (source install)",
+        "label": "Apple Silicon via MLX (source install)",
     },
 }
 

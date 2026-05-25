@@ -243,7 +243,7 @@ To clear history: use `/c` in the session, or delete `~/.wrencode/history.json` 
 
 ## License
 
-MIT - Copyright 2026 Denis Burakov.
+MIT - Copyright 2026 Almostly.
 
 -----
 
