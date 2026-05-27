@@ -32,6 +32,7 @@ THE SOFTWARE.
 # flake8: noqa: E501, E203
 
 import contextlib
+import ast
 import getpass
 import glob as globlib
 import json
@@ -194,6 +195,7 @@ MAX_READ_LINES = int(os.environ.get("MAX_READ_LINES", "800"))
 GREP_MAX = int(os.environ.get("GREP_MAX_MATCHES", "80"))
 BASH_TIMEOUT = int(os.environ.get("BASH_TIMEOUT", "120"))
 MAX_OUT = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "48000"))
+TOOL_ERROR_REPEAT_LIMIT = int(os.environ.get("TOOL_ERROR_REPEAT_LIMIT", "3"))
 _GLOB_SKIP: set[str] = {
     s
     for s in os.environ.get(
@@ -342,7 +344,7 @@ def edit(args: dict[str, Any]) -> str:
     """Replace a unique string in a file with a new string."""
     path = resolve_tool_path(_require_str(args, "path"))
     old = _require_str(args, "old")
-    new = args.get("new", "")
+    new = str(args.get("new", ""))
     if not path.is_file():
         return f"error: not a file: {path}"
     if path.stat().st_size > MAX_READ_BYTES:
@@ -353,14 +355,27 @@ def edit(args: dict[str, Any]) -> str:
     count = text.count(old)
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times (use all=true)"
+    updated = (
+        text.replace(old, new)
+        if args.get("all")
+        else text.replace(old, new, 1)
+    )
+    if updated == text:
+        return "error: edit produced no change"
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        try:
+            ast.parse(updated)
+        except SyntaxError as exc:
+            return f"error: edit would make invalid Python: {exc}"
+    elif suffix == ".json":
+        try:
+            json.loads(updated)
+        except json.JSONDecodeError as exc:
+            return f"error: edit would make invalid JSON: {exc}"
     if not confirm(f"Edit {path!r}"):
         return "cancelled"
-    path.write_text(
-        text.replace(old, str(new))
-        if args.get("all")
-        else text.replace(old, str(new), 1),
-        encoding="utf-8",
-    )
+    path.write_text(updated, encoding="utf-8")
     return "ok"
 
 
@@ -386,9 +401,15 @@ def glob(args: dict[str, Any]) -> str:
 def grep(args: dict[str, Any]) -> str:
     """Search files for a regex pattern using ripgrep."""
     pat = _require_str(args, "pat")
-    root = resolve_tool_path(args.get("path", "."))
-    if not root.is_dir():
-        return f"error: grep path must be a directory: {root}"
+    target_raw = args.get("path", ".")
+    try:
+        target = resolve_tool_path(target_raw)
+    except Exception as exc:
+        return f"error: invalid grep path {target_raw!r}: {exc}"
+    if not target.exists():
+        return f"error: grep path not found: {target}"
+    search_dir = target if target.is_dir() else target.parent
+    scope = "." if target.is_dir() else target.name
     rg = shutil.which("rg")
     grep_bin = shutil.which("grep")
     if not rg and not grep_bin:
@@ -396,14 +417,14 @@ def grep(args: dict[str, Any]) -> str:
     tool = rg or grep_bin
     assert tool is not None  # guaranteed by the check above
     cmd = (
-        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, "."]
+        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, scope]
         if rg
-        else [tool, "-R", "-n", "-I", "--", pat, "."]
+        else [tool, "-R", "-n", "-I", "--", pat, scope]
     )
     try:
         proc = subprocess.run(
             cmd,
-            cwd=str(root),
+            cwd=str(search_dir),
             capture_output=True,
             text=True,
             timeout=90,
@@ -679,6 +700,56 @@ def _tool_call_complete(text: str) -> int:
     return last
 
 
+def _balance_json_object(raw: str) -> str:
+    """Best-effort brace balancing for a JSON object string."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    if depth > 0:
+        raw += "}" * depth
+    return raw
+
+
+def _parse_tool_payload(raw_payload: str) -> Optional[dict[str, Any]]:
+    """Best-effort parse of a <tool_call> payload."""
+    raw = raw_payload.strip()
+    if not raw:
+        return None
+    with contextlib.suppress(Exception):
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    with contextlib.suppress(Exception):
+        parsed = json.loads(_balance_json_object(raw))
+        if isinstance(parsed, dict):
+            return parsed
+    with contextlib.suppress(Exception):
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    with contextlib.suppress(Exception):
+        parsed = ast.literal_eval(_balance_json_object(raw))
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse all <tool_call> blocks from model output into structured dicts.
 
@@ -689,10 +760,15 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """
     calls: list[dict[str, Any]] = []
     pos = 0
-    while (start := text.find("<tool_call>", pos)) != -1:
+    open_tag = "<tool_call>"
+    close_tag = "</tool_call>"
+    while (start := text.find(open_tag, pos)) != -1:
         brace = text.find("{", start)
+        close = text.find(close_tag, start)
         if brace == -1:
-            break
+            # malformed block with no JSON payload; skip and keep scanning
+            pos = close + len(close_tag) if close != -1 else start + len(open_tag)
+            continue
         depth, end = 0, -1
         for i, ch in enumerate(text[brace:], brace):
             if ch == "{":
@@ -702,20 +778,24 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                 if depth == 0:
                     end = i + 1
                     break
-        if end == -1:
-            break  # JSON not yet complete
-        with contextlib.suppress(Exception):
-            d = json.loads(text[brace:end])
-            if d.get("tool") in TOOLS:
-                calls.append(
-                    {
-                        "type": "tool_use",
-                        "id": f"call_{len(calls)}",
-                        "name": d["tool"],
-                        "input": d.get("args", {}),
-                    }
-                )
-        pos = end
+        payload: Optional[dict[str, Any]] = None
+        if end != -1:
+            payload = _parse_tool_payload(text[brace:end])
+            pos = end
+        elif close != -1 and close > brace:
+            payload = _parse_tool_payload(text[brace:close])
+            pos = close + len(close_tag)
+        else:
+            break  # JSON may still be streaming
+        if payload and payload.get("tool") in TOOLS:
+            calls.append(
+                {
+                    "type": "tool_use",
+                    "id": f"call_{len(calls)}",
+                    "name": payload["tool"],
+                    "input": payload.get("args", {}),
+                }
+            )
     return calls
 
 
@@ -1186,6 +1266,8 @@ def run_agent_turn(
     0 means unlimited, preserving the interactive default.
     """
     iters = 0
+    last_tool_error: Optional[str] = None
+    repeated_tool_error_count = 0
     while True:
         if max_iters and iters >= max_iters:
             print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
@@ -1215,6 +1297,7 @@ def run_agent_turn(
             if not tool_calls:
                 break
             tool_results: list[dict[str, Any]] = []
+            stop_due_to_repeated_error = False
             for tc in tool_calls:
                 arg_preview = (
                     str(list(tc["input"].values())[0])[:50]
@@ -1248,10 +1331,27 @@ def run_agent_turn(
                             "content": result,
                         }
                     )
+                if result.startswith("error:"):
+                    if result == last_tool_error:
+                        repeated_tool_error_count += 1
+                    else:
+                        last_tool_error = result
+                        repeated_tool_error_count = 1
+                    if repeated_tool_error_count >= TOOL_ERROR_REPEAT_LIMIT:
+                        print(
+                            f"{YELLOW}Stopping: repeated identical tool error {repeated_tool_error_count} times.{RESET}"
+                        )
+                        stop_due_to_repeated_error = True
+                        break
+                else:
+                    last_tool_error = None
+                    repeated_tool_error_count = 0
             if BACKEND == "anthropic":
                 messages.append({"role": "user", "content": tool_results})
             else:
                 messages.extend(tool_results)
+            if stop_due_to_repeated_error:
+                break
             continue
 
         # XML tool call path (mlx, transformers, openrouter, local)
@@ -1267,6 +1367,7 @@ def run_agent_turn(
             [{"type": "text", "text": display_text}] if display_text else []
         )
         xml_tool_results: list[dict[str, Any]] = []
+        stop_due_to_repeated_error = False
         for tc in xml_tool_calls:
             arg_preview = (
                 str(list(tc["input"].values())[0])[:50] if tc["input"] else ""
@@ -1290,9 +1391,24 @@ def run_agent_turn(
                 }
             )
             content_blocks.append(tc)
+            if result.startswith("error:"):
+                if result == last_tool_error:
+                    repeated_tool_error_count += 1
+                else:
+                    last_tool_error = result
+                    repeated_tool_error_count = 1
+                if repeated_tool_error_count >= TOOL_ERROR_REPEAT_LIMIT:
+                    print(
+                        f"{YELLOW}Stopping: repeated identical tool error {repeated_tool_error_count} times.{RESET}"
+                    )
+                    stop_due_to_repeated_error = True
+                    break
+            else:
+                last_tool_error = None
+                repeated_tool_error_count = 0
 
         messages.append({"role": "assistant", "content": content_blocks})
-        if not xml_tool_results:
+        if stop_due_to_repeated_error or not xml_tool_results:
             break
         messages.append({"role": "user", "content": xml_tool_results})
 
