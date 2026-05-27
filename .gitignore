@@ -17,6 +17,7 @@ dist/
 .venv/
 venv/
 env/
+.tmp/
 
 # WrenCode local state (when pointed at a repo-local config dir)
 .wrencode/
