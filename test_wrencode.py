@@ -295,6 +295,27 @@ class TestParseToolCalls(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["name"], "write")
 
+    def test_malformed_block_without_json_is_skipped(self):
+        text = (
+            "<tool_call>not-json</tool_call>"
+            '<tool_call>{"tool": "read", "args": {"path": "ok.py"}}</tool_call>'
+        )
+        calls = wrencode.parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "read")
+
+    def test_python_literal_payload_is_accepted(self):
+        text = "<tool_call>{'tool': 'glob', 'args': {'pat': '*.py'}}</tool_call>"
+        calls = wrencode.parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "glob")
+
+    def test_close_tag_fallback_for_unbalanced_json(self):
+        text = '<tool_call>{"tool":"read","args":{"path":"a.py"</tool_call>'
+        calls = wrencode.parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "read")
+
 
 # ---------------------------------------------------------------------------
 # apply_backend
@@ -517,6 +538,24 @@ class TestFileTools(unittest.TestCase):
         self.assertNotIn("foo", read_back)
         self.assertEqual(read_back.count("bar"), 3)
 
+    def test_edit_no_op_is_rejected(self):
+        wrencode.write({"path": "f.txt", "content": "unchanged"})
+        result = wrencode.edit({"path": "f.txt", "old": "unchanged", "new": "unchanged"})
+        self.assertIn("error", result.lower())
+        self.assertIn("no change", result.lower())
+
+    def test_edit_invalid_python_is_rejected(self):
+        wrencode.write({"path": "bad.py", "content": "def ok():\n    return 1\n"})
+        result = wrencode.edit({"path": "bad.py", "old": "return 1", "new": "return ("})
+        self.assertIn("error", result.lower())
+        self.assertIn("invalid python", result.lower())
+
+    def test_edit_invalid_json_is_rejected(self):
+        wrencode.write({"path": "bad.json", "content": '{"a": 1}'})
+        result = wrencode.edit({"path": "bad.json", "old": "1", "new": "}"})
+        self.assertIn("error", result.lower())
+        self.assertIn("invalid json", result.lower())
+
     def test_edit_nonexistent_file(self):
         result = wrencode.edit({"path": "nope.txt", "old": "x", "new": "y"})
         self.assertIn("error", result.lower())
@@ -551,6 +590,16 @@ class TestFileTools(unittest.TestCase):
         wrencode.write({"path": "code.py", "content": "nothing here"})
         result = wrencode.grep({"pat": "XYZNOTFOUND", "path": "."})
         self.assertEqual(result.strip(), "none")
+
+    def test_grep_accepts_file_path(self):
+        wrencode.write({"path": "single.py", "content": "needle = 1"})
+        result = wrencode.grep({"pat": "needle", "path": "single.py"})
+        self.assertIn("needle", result)
+
+    def test_grep_missing_path_returns_error(self):
+        result = wrencode.grep({"pat": "x", "path": "missing.py"})
+        self.assertIn("error", result.lower())
+        self.assertIn("not found", result.lower())
 
 
     def test_outside_workspace_is_rejected(self):
@@ -686,6 +735,20 @@ class TestAgentLoopSmoke(unittest.TestCase):
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=3)
 
         self.assertEqual(call_count[0], 3)
+
+    def test_repeated_identical_tool_error_stops_loop(self):
+        call_count = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            call_count[0] += 1
+            return '<tool_call>{"tool": "read", "args": {"path": "missing.txt"}}</tool_call>'
+
+        wrencode.get_response = mock_get_response
+
+        messages = [{"role": "user", "content": "keep retrying"}]
+        wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=20)
+
+        self.assertEqual(call_count[0], wrencode.TOOL_ERROR_REPEAT_LIMIT)
 
 
 # ---------------------------------------------------------------------------
