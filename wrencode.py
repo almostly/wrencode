@@ -32,6 +32,7 @@ THE SOFTWARE.
 # flake8: noqa: E501, E203
 
 import contextlib
+import ast
 import getpass
 import glob as globlib
 import json
@@ -197,6 +198,12 @@ BASH_TIMEOUT = int(os.environ.get("BASH_TIMEOUT", "120"))
 MAX_OUT = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "48000"))
 TOOL_ERROR_REPEAT_LIMIT = int(os.environ.get("TOOL_ERROR_REPEAT_LIMIT", "3"))
 TASK_TRACE_MAX = int(os.environ.get("TASK_TRACE_MAX", "20"))
+TOOL_GROUNDED_RETRY_LIMIT = int(
+    os.environ.get("TOOL_GROUNDED_RETRY_LIMIT", "1")
+)
+MALFORMED_TOOL_CALL_RETRY_LIMIT = int(
+    os.environ.get("MALFORMED_TOOL_CALL_RETRY_LIMIT", "1")
+)
 _GLOB_SKIP: set[str] = {
     s
     for s in os.environ.get(
@@ -975,6 +982,70 @@ def _tool_call_complete(text: str) -> int:
                 break
     return last
 
+_TOOL_REQUIRED_RE = re.compile(
+    r"\b("
+    r"read|open|inspect|find|search|grep|glob|list|show|"
+    r"write|edit|modify|change|fix|refactor|implement|update|"
+    r"run|test|build|lint|compile|file|files|directory|folder|path|repo"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _likely_requires_tools(text: str) -> bool:
+    """Heuristic for whether a prompt likely needs workspace/tool interaction."""
+    return bool(_TOOL_REQUIRED_RE.search(text or ""))
+
+
+def _balance_json_object(raw: str) -> str:
+    """Best-effort brace balancing for a JSON object string."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    if depth > 0:
+        raw += "}" * depth
+    return raw
+
+
+def _parse_tool_payload(raw_payload: str) -> Optional[dict[str, Any]]:
+    """Best-effort parse of a <tool_call> payload."""
+    raw = raw_payload.strip()
+    if not raw:
+        return None
+    with contextlib.suppress(Exception):
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    with contextlib.suppress(Exception):
+        parsed = json.loads(_balance_json_object(raw))
+        if isinstance(parsed, dict):
+            return parsed
+    with contextlib.suppress(Exception):
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    with contextlib.suppress(Exception):
+        parsed = ast.literal_eval(_balance_json_object(raw))
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
 
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse all <tool_call> blocks from model output into structured dicts.
@@ -986,10 +1057,15 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """
     calls: list[dict[str, Any]] = []
     pos = 0
-    while (start := text.find("<tool_call>", pos)) != -1:
+    open_tag = "<tool_call>"
+    close_tag = "</tool_call>"
+    while (start := text.find(open_tag, pos)) != -1:
         brace = text.find("{", start)
+        close = text.find(close_tag, start)
         if brace == -1:
-            break
+            # malformed block with no JSON payload; skip and keep scanning
+            pos = close + len(close_tag) if close != -1 else start + len(open_tag)
+            continue
         depth, end = 0, -1
         for i, ch in enumerate(text[brace:], brace):
             if ch == "{":
@@ -999,20 +1075,24 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                 if depth == 0:
                     end = i + 1
                     break
-        if end == -1:
-            break  # JSON not yet complete
-        with contextlib.suppress(Exception):
-            d = json.loads(text[brace:end])
-            if d.get("tool") in TOOLS:
-                calls.append(
-                    {
-                        "type": "tool_use",
-                        "id": f"call_{len(calls)}",
-                        "name": d["tool"],
-                        "input": d.get("args", {}),
-                    }
-                )
-        pos = end
+        payload: Optional[dict[str, Any]] = None
+        if end != -1:
+            payload = _parse_tool_payload(text[brace:end])
+            pos = end
+        elif close != -1 and close > brace:
+            payload = _parse_tool_payload(text[brace:close])
+            pos = close + len(close_tag)
+        else:
+            break  # JSON may still be streaming
+        if payload and payload.get("tool") in TOOLS:
+            calls.append(
+                {
+                    "type": "tool_use",
+                    "id": f"call_{len(calls)}",
+                    "name": payload["tool"],
+                    "input": payload.get("args", {}),
+                }
+            )
     return calls
 
 
@@ -1486,6 +1566,18 @@ def run_agent_turn(
     """
     repeated_failures: dict[str, int] = {}
     loop_breaker: Optional[dict[str, Any]] = None
+    tools_executed = 0
+    grounded_retries = 0
+    malformed_tool_retries = 0
+    first_user_text = next(
+        (
+            flatten_content(m.get("content"))
+            for m in messages
+            if m.get("role") == "user" and flatten_content(m.get("content"))
+        ),
+        "",
+    )
+    requires_grounded_tools = _likely_requires_tools(first_user_text)
 
     def _record_tool(
         iter_no: int, tool_name: str, tool_input: dict[str, Any], result: str
@@ -1545,6 +1637,19 @@ def run_agent_turn(
                     data["choices"][0]["message"]
                 )  # preserve tool_calls exactly
             if not tool_calls:
+                if (
+                    requires_grounded_tools
+                    and tools_executed == 0
+                    and grounded_retries < TOOL_GROUNDED_RETRY_LIMIT
+                ):
+                    grounded_retries += 1
+                    nudge = (
+                        "Before finalizing, use tools to gather concrete evidence from the workspace "
+                        "(for example read/glob/grep/bash), then answer."
+                    )
+                    print(f"\n{DIM}↻ requesting grounded tool use{RESET}")
+                    messages.append({"role": "user", "content": nudge})
+                    continue
                 return {"iterations": iters, "loop_breaker": loop_breaker}
             tool_results: list[dict[str, Any]] = []
             for tc in tool_calls:
@@ -1585,6 +1690,7 @@ def run_agent_turn(
                 messages.append({"role": "user", "content": tool_results})
             else:
                 messages.extend(tool_results)
+            tools_executed += len(tool_calls)
             if loop_breaker:
                 stop_text = (
                     "Stopped due to repeated failing tool call "
@@ -1599,6 +1705,7 @@ def run_agent_turn(
 
         # XML tool call path (mlx, transformers, openrouter, local)
         xml_tool_calls = parse_tool_calls(response_text)
+        has_tool_marker = "<tool_call>" in response_text
         display_text = re.sub(
             r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
         ).strip()
@@ -1634,11 +1741,40 @@ def run_agent_turn(
                 }
             )
             content_blocks.append(tc)
+        if (
+            has_tool_marker
+            and not xml_tool_calls
+            and malformed_tool_retries < MALFORMED_TOOL_CALL_RETRY_LIMIT
+        ):
+            malformed_tool_retries += 1
+            warning = (
+                "Your previous <tool_call> payload was malformed. "
+                "Emit exactly one valid JSON tool call in this format: "
+                "<tool_call>{\"tool\":\"name\",\"args\":{...}}</tool_call>"
+            )
+            print(f"\n{DIM}↻ requesting valid tool_call JSON{RESET}")
+            messages.append({"role": "assistant", "content": content_blocks})
+            messages.append({"role": "user", "content": warning})
+            continue
 
         messages.append({"role": "assistant", "content": content_blocks})
         if not xml_tool_results:
+            if (
+                requires_grounded_tools
+                and tools_executed == 0
+                and grounded_retries < TOOL_GROUNDED_RETRY_LIMIT
+            ):
+                grounded_retries += 1
+                nudge = (
+                    "Before finalizing, use tools to gather concrete evidence from the workspace "
+                    "(for example read/glob/grep/bash), then answer."
+                )
+                print(f"\n{DIM}↻ requesting grounded tool use{RESET}")
+                messages.append({"role": "user", "content": nudge})
+                continue
             return {"iterations": iters, "loop_breaker": loop_breaker}
         messages.append({"role": "user", "content": xml_tool_results})
+        tools_executed += len(xml_tool_calls)
         if loop_breaker:
             stop_text = (
                 "Stopped due to repeated failing tool call "

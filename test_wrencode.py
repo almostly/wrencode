@@ -295,6 +295,28 @@ class TestParseToolCalls(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["name"], "write")
 
+    def test_malformed_missing_trailing_brace_is_repaired(self):
+        text = '<tool_call>{"tool": "read", "args": {"path": "foo.py"}</tool_call>'
+        calls = wrencode.parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "read")
+        self.assertEqual(calls[0]["input"], {"path": "foo.py"})
+
+    def test_python_style_payload_fallback(self):
+        text = "<tool_call>{'tool': 'glob', 'args': {'pat': '*.py'}}</tool_call>"
+        calls = wrencode.parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "glob")
+
+    def test_malformed_block_without_json_is_skipped(self):
+        text = (
+            "<tool_call>oops</tool_call>"
+            '<tool_call>{"tool": "glob", "args": {"pat": "*.py"}}</tool_call>'
+        )
+        calls = wrencode.parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "glob")
+
 
 # ---------------------------------------------------------------------------
 # apply_backend
@@ -724,6 +746,64 @@ class TestAgentLoopSmoke(unittest.TestCase):
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=3)
 
         self.assertEqual(call_count[0], 3)
+
+    def test_grounded_retry_prompts_for_tool_use(self):
+        """If prompt implies file work and no tool is used, agent nudges once then continues."""
+        target = pathlib.Path(self._tmp) / "greeting.txt"
+        target.write_text("Hello grounded flow!", encoding="utf-8")
+
+        call_count = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return "I think the file says hello."
+            if call_count[0] == 2:
+                return '<tool_call>{"tool": "read", "args": {"path": "greeting.txt"}}</tool_call>'
+            return "The file says: Hello grounded flow!"
+
+        wrencode.get_response = mock_get_response
+        messages = [{"role": "user", "content": "Read greeting.txt and report exact contents"}]
+        wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=6)
+
+        self.assertEqual(call_count[0], 3)
+        assistant_texts = []
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                assistant_texts.append(c)
+            elif isinstance(c, list):
+                assistant_texts.append(wrencode.flatten_content(c))
+        self.assertTrue(any("Hello grounded flow!" in t for t in assistant_texts))
+
+    def test_malformed_tool_call_gets_retry_nudge(self):
+        """Malformed <tool_call> block should request retry and then proceed."""
+        target = pathlib.Path(self._tmp) / "retry.txt"
+        target.write_text("retry-ok", encoding="utf-8")
+
+        call_count = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return "<tool_call>oops</tool_call>"
+            if call_count[0] == 2:
+                return '<tool_call>{"tool": "read", "args": {"path": "retry.txt"}}</tool_call>'
+            return "done: retry-ok"
+
+        wrencode.get_response = mock_get_response
+        messages = [{"role": "user", "content": "Read retry.txt"}]
+        wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=6)
+
+        self.assertEqual(call_count[0], 3)
+        user_texts = [
+            wrencode.flatten_content(m["content"])
+            for m in messages
+            if m["role"] == "user"
+        ]
+        self.assertTrue(any("malformed" in t for t in user_texts))
 
 
 # ---------------------------------------------------------------------------
