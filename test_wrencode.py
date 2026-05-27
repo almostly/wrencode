@@ -674,6 +674,34 @@ class TestAgentLoopSmoke(unittest.TestCase):
 
         self.assertEqual(call_count[0], 1)
 
+    def test_repeated_tool_error_loop_breaker(self):
+        """Agent stops early when the same failing tool call repeats."""
+        call_count = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            call_count[0] += 1
+            return '<tool_call>{"tool": "grep", "args": {"pat": "TODO", "path": "missing.py"}}</tool_call>'
+
+        wrencode.get_response = mock_get_response
+
+        messages = [{"role": "user", "content": "find TODO"}]
+        wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=10)
+
+        self.assertEqual(call_count[0], wrencode.TOOL_ERROR_REPEAT_LIMIT)
+        assistant_texts = []
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                assistant_texts.append(c)
+            elif isinstance(c, list):
+                assistant_texts.append(wrencode.flatten_content(c))
+        self.assertTrue(
+            any("Stopped due to repeated failing tool call" in t for t in assistant_texts),
+            f"Expected loop-breaker assistant message, got: {assistant_texts}",
+        )
+
     def test_tool_call_dispatches_real_tool(self):
         """Verify that run_tool dispatches to the real read implementation."""
         target = pathlib.Path(self._tmp) / "real.txt"
@@ -796,7 +824,7 @@ class TestTaskGuardrails(unittest.TestCase):
         wrencode.run_agent_turn = self._orig_run_agent_turn
 
     def test_task_forbid_write_blocks_write_tool(self):
-        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0):
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0, trace_sink=None):
             out = wrencode.run_tool("write", {"path": "unsafe.txt", "content": "x"})
             messages.append({"role": "assistant", "content": [{"type": "text", "text": out}]})
 
@@ -805,8 +833,53 @@ class TestTaskGuardrails(unittest.TestCase):
         self.assertIn("blocked by task guardrails", result)
         self.assertFalse(pathlib.Path(self._tmp, "unsafe.txt").exists())
 
+    def test_task_returns_structured_json_by_default(self):
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0, trace_sink=None):
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+            )
+
+        wrencode.run_agent_turn = fake_subagent
+        result = wrencode.task({"prompt": "simple"})
+        payload = json.loads(result)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["summary"], "done")
+        self.assertIn("tool_stats", payload)
+
+    def test_task_verbose_includes_trace(self):
+        wrencode.write({"path": "note.txt", "content": "hello"})
+
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0, trace_sink=None):
+            _ = wrencode.run_tool("read", {"path": "note.txt"})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            )
+
+        wrencode.run_agent_turn = fake_subagent
+        result = wrencode.task({"prompt": "trace me", "verbose": True})
+        payload = json.loads(result)
+        self.assertEqual(payload["status"], "ok")
+        self.assertIn("trace", payload)
+        self.assertGreaterEqual(len(payload["trace"]), 1)
+        self.assertGreaterEqual(payload["tool_stats"]["calls"], 1)
+
+    def test_task_fast_path_single_tool_call(self):
+        wrencode.write({"path": "note.txt", "content": "fast hello"})
+
+        def should_not_run(*args, **kwargs):
+            raise AssertionError("run_agent_turn should not be called in fast path")
+
+        wrencode.run_agent_turn = should_not_run
+        prompt = '<tool_call>{"tool":"read","args":{"path":"note.txt"}}</tool_call>'
+        result = wrencode.task({"prompt": prompt, "verbose": True})
+        payload = json.loads(result)
+        self.assertEqual(payload["mode"], "fast_path")
+        self.assertIn("fast hello", payload["summary"])
+        self.assertIn("trace", payload)
+        self.assertEqual(payload["trace"][0]["tool"], "read")
+
     def test_task_read_only_blocks_bash(self):
-        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0):
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0, trace_sink=None):
             out = wrencode.run_tool("bash", {"cmd": "echo hi"})
             messages.append({"role": "assistant", "content": [{"type": "text", "text": out}]})
 
@@ -817,7 +890,7 @@ class TestTaskGuardrails(unittest.TestCase):
     def test_task_allowed_tools_only_permits_listed_tools(self):
         wrencode.write({"path": "note.txt", "content": "hello"})
 
-        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0):
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0, trace_sink=None):
             allowed = wrencode.run_tool("read", {"path": "note.txt"})
             blocked = wrencode.run_tool("glob", {"pat": "*.txt"})
             text = f"{allowed}\n--\n{blocked}"

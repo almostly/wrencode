@@ -195,6 +195,8 @@ MAX_READ_LINES = int(os.environ.get("MAX_READ_LINES", "800"))
 GREP_MAX = int(os.environ.get("GREP_MAX_MATCHES", "80"))
 BASH_TIMEOUT = int(os.environ.get("BASH_TIMEOUT", "120"))
 MAX_OUT = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "48000"))
+TOOL_ERROR_REPEAT_LIMIT = int(os.environ.get("TOOL_ERROR_REPEAT_LIMIT", "3"))
+TASK_TRACE_MAX = int(os.environ.get("TASK_TRACE_MAX", "20"))
 _GLOB_SKIP: set[str] = {
     s
     for s in os.environ.get(
@@ -346,6 +348,70 @@ def _effective_tool_policy() -> dict[str, Any]:
         "forbid_write": forbid_write,
         "forbid_bash": forbid_bash,
     }
+
+
+def _strip_tool_call_blocks(text: str) -> str:
+    """Remove <tool_call> blocks from text."""
+    return re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+
+
+def _task_fast_path_call(prompt: str) -> Optional[dict[str, Any]]:
+    """Return a single tool call when prompt is exactly one <tool_call> block."""
+    calls = parse_tool_calls(prompt)
+    if len(calls) != 1:
+        return None
+    if _strip_tool_call_blocks(prompt).strip():
+        return None
+    return {"name": calls[0]["name"], "input": calls[0]["input"]}
+
+
+def _task_status(summary: str, tool_errors: int, loop_breaker: Optional[dict[str, Any]]) -> str:
+    """Classify task result status for structured output."""
+    if loop_breaker:
+        return "error"
+    if "blocked by task guardrails" in summary:
+        return "blocked"
+    if summary.startswith("error:") or tool_errors > 0:
+        return "error"
+    if summary == "(subagent produced no text output)":
+        return "partial"
+    return "ok"
+
+
+def _task_result_payload(
+    summary: str,
+    mode: str,
+    duration_ms: float,
+    iterations: int,
+    trace: list[dict[str, Any]],
+    loop_breaker: Optional[dict[str, Any]],
+    verbose: bool,
+) -> dict[str, Any]:
+    """Build structured task output payload."""
+    by_tool: dict[str, int] = {}
+    tool_errors = 0
+    for t in trace:
+        tool = str(t.get("tool", ""))
+        by_tool[tool] = by_tool.get(tool, 0) + 1
+        if t.get("is_error"):
+            tool_errors += 1
+    payload: dict[str, Any] = {
+        "status": _task_status(summary, tool_errors, loop_breaker),
+        "summary": summary,
+        "mode": mode,
+        "duration_ms": round(duration_ms, 3),
+        "iterations": iterations,
+        "tool_stats": {
+            "calls": len(trace),
+            "errors": tool_errors,
+            "by_tool": by_tool,
+        },
+    }
+    if loop_breaker:
+        payload["loop_breaker"] = loop_breaker
+    if verbose:
+        payload["trace"] = trace[:TASK_TRACE_MAX]
+    return payload
 
 
 # -----------------------------------------------------------------------------------------------
@@ -574,6 +640,11 @@ def task(args: dict[str, Any]) -> str:
     read_only = _optional_bool(args, "read_only", False)
     forbid_write = _optional_bool(args, "forbid_write", False)
     forbid_bash = _optional_bool(args, "forbid_bash", False)
+    verbose = _optional_bool(args, "verbose", False)
+    fast_path = _optional_bool(args, "fast_path", True)
+    result_mode = str(args.get("result_mode", "json")).strip().lower() or "json"
+    if result_mode not in {"json", "text"}:
+        return "error: result_mode must be 'json' or 'text'"
     allowed_tools = _parse_allowed_tools(args.get("allowed_tools"))
     if read_only:
         forbid_write = True
@@ -597,6 +668,44 @@ def task(args: dict[str, Any]) -> str:
             + ", ".join(sorted(allowed_tools))
             + " (all other tools are blocked)"
         )
+    started = time.perf_counter()
+    trace: list[dict[str, Any]] = []
+    loop_breaker: Optional[dict[str, Any]] = None
+    iterations = 0
+    mode = "subagent"
+    fast = _task_fast_path_call(prompt) if fast_path else None
+    if fast:
+        _SUBAGENT_DEPTH += 1
+        _TOOL_POLICY_STACK.append(policy)
+        mode = "fast_path"
+        print(f"{CYAN}  ↳ subagent:{RESET}{DIM} fast-path {fast['name']}{RESET}")
+        try:
+            result = run_tool(fast["name"], fast["input"])
+            trace.append(
+                {
+                    "iter": 1,
+                    "tool": fast["name"],
+                    "input": fast["input"],
+                    "is_error": result.startswith("error:"),
+                    "result_preview": result.split("\n", 1)[0][:120],
+                }
+            )
+            summary = result
+        finally:
+            _TOOL_POLICY_STACK.pop()
+            _SUBAGENT_DEPTH -= 1
+        payload = _task_result_payload(
+            summary=summary,
+            mode=mode,
+            duration_ms=(time.perf_counter() - started) * 1000,
+            iterations=1,
+            trace=trace,
+            loop_breaker=None,
+            verbose=verbose,
+        )
+        if result_mode == "text":
+            return summary
+        return json.dumps(payload, ensure_ascii=False)
     sub_prompt = build_system_prompt()
     if guardrail_lines:
         sub_prompt += (
@@ -608,14 +717,58 @@ def task(args: dict[str, Any]) -> str:
     print(f"{CYAN}  ↳ subagent:{RESET}{DIM} {prompt[:70]}{RESET}")
     sub: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     _TOOL_POLICY_STACK.append(policy)
+    fallback_trace: list[dict[str, Any]] = []
+    original_run_tool = run_tool
+
+    def _run_tool_with_fallback_trace(name: str, tool_args: dict[str, Any]) -> str:
+        result = original_run_tool(name, tool_args)
+        fallback_trace.append(
+            {
+                "iter": len(fallback_trace) + 1,
+                "tool": name,
+                "input": tool_args,
+                "is_error": result.startswith("error:"),
+                "result_preview": result.split("\n", 1)[0][:120],
+            }
+        )
+        return result
+
+    globals()["run_tool"] = _run_tool_with_fallback_trace
     try:
-        run_agent_turn(sub, sub_prompt, _MLX_STATE, max_iters=12)
+        run_meta = run_agent_turn(
+            sub,
+            sub_prompt,
+            _MLX_STATE,
+            max_iters=12,
+            trace_sink=trace,
+        ) or {}
+        if not trace and fallback_trace:
+            trace.extend(fallback_trace)
+        loop_breaker = run_meta.get("loop_breaker")
+        iterations = int(run_meta.get("iterations", 0))
     finally:
+        globals()["run_tool"] = original_run_tool
         _TOOL_POLICY_STACK.pop()
         _SUBAGENT_DEPTH -= 1
     texts = [flatten_content(m["content"]) for m in sub if m["role"] == "assistant"]
     print(f"{CYAN}  ↳ subagent done{RESET}")
-    return (texts[-1] if texts else "") or "(subagent produced no text output)"
+    summary = (texts[-1] if texts else "") or "(subagent produced no text output)"
+    payload = _task_result_payload(
+        summary=summary,
+        mode=mode,
+        duration_ms=(time.perf_counter() - started) * 1000,
+        iterations=iterations,
+        trace=trace,
+        loop_breaker=loop_breaker,
+        verbose=verbose,
+    )
+    if result_mode == "text":
+        if verbose and trace:
+            items = trace[:TASK_TRACE_MAX]
+            tool_list = ", ".join(t["tool"] for t in items)
+            return f"{summary}\n[trace] tools={tool_list}"
+        return summary
+    return json.dumps(payload, ensure_ascii=False)
 
 
 ToolFn = Callable[[dict[str, Any]], str]
@@ -650,13 +803,16 @@ TOOLS: dict[str, ToolEntry] = {
     "bash": ("Run shell command", {"cmd": "string"}, bash),
     "task": (
         "Delegate a self-contained subtask to a fresh subagent (same tools, "
-        "own context); returns only its final result",
+        "own context); returns a structured JSON result by default",
         {
             "prompt": "string",
             "read_only": "boolean?",
             "allowed_tools": "array<string>|string?",
             "forbid_write": "boolean?",
             "forbid_bash": "boolean?",
+            "verbose": "boolean?",
+            "fast_path": "boolean?",
+            "result_mode": "string?",
         },
         task,
     ),
@@ -1299,7 +1455,7 @@ Available tools:
 - glob(pat): Find files matching pattern
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
-- task(prompt, read_only?, allowed_tools?, forbid_write?, forbid_bash?): Delegate a self-contained subtask to a fresh subagent; returns only its result
+- task(prompt, read_only?, allowed_tools?, forbid_write?, forbid_bash?, verbose?, fast_path?, result_mode?): Delegate a subtask and return structured result metadata
 
 To use a tool, format it EXACTLY like this:
 <tool_call>{{"tool": "name", "args": {{"key": "value"}}}}</tool_call>
@@ -1320,17 +1476,52 @@ def run_agent_turn(
     system_prompt: str,
     mlx_state: Optional[tuple[Any, Any]],
     max_iters: int = 0,
-) -> None:
+    trace_sink: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
     """Generate a response and execute any tool calls, repeating until no tools remain.
 
     max_iters > 0 caps the tool-calling rounds (used to bound subagents);
     0 means unlimited, preserving the interactive default.
+    Returns loop metadata for subagent callers.
     """
+    repeated_failures: dict[str, int] = {}
+    loop_breaker: Optional[dict[str, Any]] = None
+
+    def _record_tool(
+        iter_no: int, tool_name: str, tool_input: dict[str, Any], result: str
+    ) -> None:
+        nonlocal loop_breaker
+        if trace_sink is not None:
+            trace_sink.append(
+                {
+                    "iter": iter_no,
+                    "tool": tool_name,
+                    "input": tool_input,
+                    "is_error": result.startswith("error:"),
+                    "result_preview": result.split("\n", 1)[0][:120],
+                }
+            )
+        if not result.startswith("error:"):
+            return
+        sig = (
+            f"{tool_name}|"
+            f"{json.dumps(tool_input, sort_keys=True, default=str)}|"
+            f"{result}"
+        )
+        repeated_failures[sig] = repeated_failures.get(sig, 0) + 1
+        if repeated_failures[sig] >= TOOL_ERROR_REPEAT_LIMIT and loop_breaker is None:
+            loop_breaker = {
+                "tool": tool_name,
+                "input": tool_input,
+                "error": result,
+                "repeat_count": repeated_failures[sig],
+            }
+
     iters = 0
     while True:
         if max_iters and iters >= max_iters:
             print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
-            break
+            return {"iterations": iters, "loop_breaker": loop_breaker}
         iters += 1
         print(f"{DIM}Generating...{RESET}", end="\r", flush=True)
         response_text = get_response(messages, system_prompt, mlx_state)
@@ -1354,7 +1545,7 @@ def run_agent_turn(
                     data["choices"][0]["message"]
                 )  # preserve tool_calls exactly
             if not tool_calls:
-                break
+                return {"iterations": iters, "loop_breaker": loop_breaker}
             tool_results: list[dict[str, Any]] = []
             for tc in tool_calls:
                 arg_preview = (
@@ -1366,6 +1557,7 @@ def run_agent_turn(
                     f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
                 )
                 result = run_tool(tc["name"], tc["input"])
+                _record_tool(iters, tc["name"], tc["input"], result)
                 lines = result.split("\n")
                 preview = lines[0][:60] + (
                     f" ... +{len(lines) - 1} lines"
@@ -1393,6 +1585,16 @@ def run_agent_turn(
                 messages.append({"role": "user", "content": tool_results})
             else:
                 messages.extend(tool_results)
+            if loop_breaker:
+                stop_text = (
+                    "Stopped due to repeated failing tool call "
+                    f"'{loop_breaker['tool']}' with the same args "
+                    f"({loop_breaker['repeat_count']}x). Last error: "
+                    f"{loop_breaker['error']}"
+                )
+                print(f"\n{CYAN}>{RESET} {render_markdown(stop_text)}")
+                messages.append({"role": "assistant", "content": stop_text})
+                return {"iterations": iters, "loop_breaker": loop_breaker}
             continue
 
         # XML tool call path (mlx, transformers, openrouter, local)
@@ -1416,6 +1618,7 @@ def run_agent_turn(
                 f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
             )
             result = run_tool(tc["name"], tc["input"])
+            _record_tool(iters, tc["name"], tc["input"], result)
             lines = result.split("\n")
             preview = lines[0][:60] + (
                 f" ... +{len(lines) - 1} lines"
@@ -1434,8 +1637,18 @@ def run_agent_turn(
 
         messages.append({"role": "assistant", "content": content_blocks})
         if not xml_tool_results:
-            break
+            return {"iterations": iters, "loop_breaker": loop_breaker}
         messages.append({"role": "user", "content": xml_tool_results})
+        if loop_breaker:
+            stop_text = (
+                "Stopped due to repeated failing tool call "
+                f"'{loop_breaker['tool']}' with the same args "
+                f"({loop_breaker['repeat_count']}x). Last error: "
+                f"{loop_breaker['error']}"
+            )
+            print(f"\n{CYAN}>{RESET} {render_markdown(stop_text)}")
+            messages.append({"role": "assistant", "content": stop_text})
+            return {"iterations": iters, "loop_breaker": loop_breaker}
 
 
 # -----------------------------------------------------------------------------------------------
