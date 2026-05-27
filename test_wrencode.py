@@ -551,6 +551,16 @@ class TestFileTools(unittest.TestCase):
         wrencode.write({"path": "code.py", "content": "nothing here"})
         result = wrencode.grep({"pat": "XYZNOTFOUND", "path": "."})
         self.assertEqual(result.strip(), "none")
+    def test_grep_accepts_file_path(self):
+        wrencode.write({"path": "code.py", "content": "# TODO: fix this\nx = 1"})
+        result = wrencode.grep({"pat": "TODO", "path": "code.py"})
+        self.assertIn("TODO", result)
+        self.assertNotIn("error:", result.lower())
+
+    def test_grep_missing_path_has_recovery_hint(self):
+        result = wrencode.grep({"pat": "TODO", "path": "missing.py"})
+        self.assertIn("path not found", result)
+        self.assertIn("try path='.'", result)
 
 
     def test_outside_workspace_is_rejected(self):
@@ -760,6 +770,63 @@ class TestRunTool(unittest.TestCase):
         wrencode.write({"path": "big.txt", "content": big_content})
         result = wrencode.run_tool("read", {"path": "big.txt"})
         self.assertIn("truncated", result)
+
+
+class TestTaskGuardrails(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = str(pathlib.Path(tempfile.mkdtemp()).resolve())
+        self._orig_workspace = os.environ.get("WRENCODE_WORKSPACE")
+        self._orig_auto_approve = os.environ.get("WRENCODE_AUTO_APPROVE")
+        self._orig_run_agent_turn = wrencode.run_agent_turn
+        os.environ["WRENCODE_WORKSPACE"] = self._tmp
+        os.environ["WRENCODE_AUTO_APPROVE"] = "1"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        if self._orig_workspace is not None:
+            os.environ["WRENCODE_WORKSPACE"] = self._orig_workspace
+        elif "WRENCODE_WORKSPACE" in os.environ:
+            del os.environ["WRENCODE_WORKSPACE"]
+        if self._orig_auto_approve is not None:
+            os.environ["WRENCODE_AUTO_APPROVE"] = self._orig_auto_approve
+        elif "WRENCODE_AUTO_APPROVE" in os.environ:
+            del os.environ["WRENCODE_AUTO_APPROVE"]
+        wrencode.run_agent_turn = self._orig_run_agent_turn
+
+    def test_task_forbid_write_blocks_write_tool(self):
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0):
+            out = wrencode.run_tool("write", {"path": "unsafe.txt", "content": "x"})
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": out}]})
+
+        wrencode.run_agent_turn = fake_subagent
+        result = wrencode.task({"prompt": "write a file", "forbid_write": True})
+        self.assertIn("blocked by task guardrails", result)
+        self.assertFalse(pathlib.Path(self._tmp, "unsafe.txt").exists())
+
+    def test_task_read_only_blocks_bash(self):
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0):
+            out = wrencode.run_tool("bash", {"cmd": "echo hi"})
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": out}]})
+
+        wrencode.run_agent_turn = fake_subagent
+        result = wrencode.task({"prompt": "run command", "read_only": True})
+        self.assertIn("tool 'bash' blocked by task guardrails", result)
+
+    def test_task_allowed_tools_only_permits_listed_tools(self):
+        wrencode.write({"path": "note.txt", "content": "hello"})
+
+        def fake_subagent(messages, system_prompt, mlx_state, max_iters=0):
+            allowed = wrencode.run_tool("read", {"path": "note.txt"})
+            blocked = wrencode.run_tool("glob", {"pat": "*.txt"})
+            text = f"{allowed}\n--\n{blocked}"
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
+
+        wrencode.run_agent_turn = fake_subagent
+        result = wrencode.task({"prompt": "read then glob", "allowed_tools": ["read"]})
+        self.assertIn("hello", result)
+        self.assertIn("tool 'glob' blocked by task guardrails", result)
 
 
 if __name__ == "__main__":

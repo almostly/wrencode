@@ -157,6 +157,7 @@ AutoTokenizer: Any = None  # transformers.AutoTokenizer
 _MLX_STATE: Optional[tuple[Any, Any]] = None
 _SUBAGENT_DEPTH = 0
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
+_TOOL_POLICY_STACK: list[dict[str, Any]] = []
 
 
 def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
@@ -286,6 +287,67 @@ def _optional_int(
         raise ValueError(f"'{key}' must be an integer, got {val!r}") from e
 
 
+def _optional_bool(args: dict[str, Any], key: str, default: bool = False) -> bool:
+    """Return an optional boolean from args dict, accepting common truthy/falsey strings."""
+    val = args.get(key)
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)) and val in (0, 1):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+    raise ValueError(f"'{key}' must be a boolean, got {val!r}")
+
+
+def _parse_allowed_tools(raw: Any) -> Optional[set[str]]:
+    """Parse allowed_tools from task args as a set, validating tool names."""
+    if raw is None:
+        return None
+    names: list[str]
+    if isinstance(raw, str):
+        names = [p.strip() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        names = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        raise ValueError(
+            "'allowed_tools' must be a list of tool names or a comma-separated string"
+        )
+    if not names:
+        raise ValueError("'allowed_tools' must include at least one tool name")
+    unknown = sorted({n for n in names if n not in TOOLS})
+    if unknown:
+        available = ", ".join(sorted(TOOLS))
+        raise ValueError(
+            f"unknown tools in allowed_tools: {', '.join(unknown)} "
+            f"(available: {available})"
+        )
+    return set(names)
+
+
+def _effective_tool_policy() -> dict[str, Any]:
+    """Compute merged guardrails from all active task policy scopes."""
+    allowed: Optional[set[str]] = None
+    forbid_write = False
+    forbid_bash = False
+    for policy in _TOOL_POLICY_STACK:
+        p_allowed = policy.get("allowed_tools")
+        if p_allowed is not None:
+            allowed = set(p_allowed) if allowed is None else allowed & set(p_allowed)
+        forbid_write = forbid_write or bool(policy.get("forbid_write"))
+        forbid_bash = forbid_bash or bool(policy.get("forbid_bash"))
+    return {
+        "allowed_tools": allowed,
+        "forbid_write": forbid_write,
+        "forbid_bash": forbid_bash,
+    }
+
+
 # -----------------------------------------------------------------------------------------------
 # Tools
 # -----------------------------------------------------------------------------------------------
@@ -387,8 +449,24 @@ def grep(args: dict[str, Any]) -> str:
     """Search files for a regex pattern using ripgrep."""
     pat = _require_str(args, "pat")
     root = resolve_tool_path(args.get("path", "."))
-    if not root.is_dir():
-        return f"error: grep path must be a directory: {root}"
+    search_cwd = root
+    search_targets: list[str] = ["."]
+    if root.is_file():
+        search_cwd = root.parent
+        search_targets = [root.name]
+    elif root.is_dir():
+        search_cwd = root
+        search_targets = ["."]
+    elif root.exists():
+        return (
+            f"error: grep path must be a file or directory; got {root} "
+            f"(try path='.' or a specific file path)"
+        )
+    else:
+        return (
+            f"error: grep path not found: {root} "
+            f"(try path='.' or an existing file/directory)"
+        )
     rg = shutil.which("rg")
     grep_bin = shutil.which("grep")
     if not rg and not grep_bin:
@@ -396,14 +474,18 @@ def grep(args: dict[str, Any]) -> str:
     tool = rg or grep_bin
     assert tool is not None  # guaranteed by the check above
     cmd = (
-        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, "."]
+        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, *search_targets]
         if rg
-        else [tool, "-R", "-n", "-I", "--", pat, "."]
+        else (
+            [tool, "-R", "-n", "-I", "--", pat, "."]
+            if root.is_dir()
+            else [tool, "-n", "-I", "--", pat, *search_targets]
+        )
     )
     try:
         proc = subprocess.run(
             cmd,
-            cwd=str(root),
+            cwd=str(search_cwd),
             capture_output=True,
             text=True,
             timeout=90,
@@ -489,12 +571,47 @@ def task(args: dict[str, Any]) -> str:
     if _SUBAGENT_DEPTH >= MAX_SUBAGENT_DEPTH:
         return f"error: max subagent depth ({MAX_SUBAGENT_DEPTH}) reached"
     prompt = _require_str(args, "prompt")
+    read_only = _optional_bool(args, "read_only", False)
+    forbid_write = _optional_bool(args, "forbid_write", False)
+    forbid_bash = _optional_bool(args, "forbid_bash", False)
+    allowed_tools = _parse_allowed_tools(args.get("allowed_tools"))
+    if read_only:
+        forbid_write = True
+        forbid_bash = True
+    policy = {
+        "allowed_tools": allowed_tools,
+        "forbid_write": forbid_write,
+        "forbid_bash": forbid_bash,
+    }
+    guardrail_lines: list[str] = []
+    if read_only:
+        guardrail_lines.append("- read_only=true (write/edit/bash are blocked)")
+    else:
+        if forbid_write:
+            guardrail_lines.append("- forbid_write=true (write/edit are blocked)")
+        if forbid_bash:
+            guardrail_lines.append("- forbid_bash=true (bash is blocked)")
+    if allowed_tools is not None:
+        guardrail_lines.append(
+            "- allowed_tools="
+            + ", ".join(sorted(allowed_tools))
+            + " (all other tools are blocked)"
+        )
+    sub_prompt = build_system_prompt()
+    if guardrail_lines:
+        sub_prompt += (
+            "\n\nSubagent guardrails:\n"
+            + "\n".join(guardrail_lines)
+            + "\nIf a blocked tool is needed, explain the constraint and proceed with allowed tools."
+        )
     _SUBAGENT_DEPTH += 1
     print(f"{CYAN}  ↳ subagent:{RESET}{DIM} {prompt[:70]}{RESET}")
     sub: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    _TOOL_POLICY_STACK.append(policy)
     try:
-        run_agent_turn(sub, build_system_prompt(), _MLX_STATE, max_iters=12)
+        run_agent_turn(sub, sub_prompt, _MLX_STATE, max_iters=12)
     finally:
+        _TOOL_POLICY_STACK.pop()
         _SUBAGENT_DEPTH -= 1
     texts = [flatten_content(m["content"]) for m in sub if m["role"] == "assistant"]
     print(f"{CYAN}  ↳ subagent done{RESET}")
@@ -534,7 +651,13 @@ TOOLS: dict[str, ToolEntry] = {
     "task": (
         "Delegate a self-contained subtask to a fresh subagent (same tools, "
         "own context); returns only its final result",
-        {"prompt": "string"},
+        {
+            "prompt": "string",
+            "read_only": "boolean?",
+            "allowed_tools": "array<string>|string?",
+            "forbid_write": "boolean?",
+            "forbid_bash": "boolean?",
+        },
         task,
     ),
 }
@@ -543,6 +666,24 @@ TOOLS: dict[str, ToolEntry] = {
 def run_tool(name: str, args: dict[str, Any]) -> str:
     """Execute a named tool with args, truncating output if it exceeds MAX_OUT."""
     try:
+        policy = _effective_tool_policy()
+        allowed = policy["allowed_tools"]
+        if allowed is not None and name not in allowed:
+            allow_list = ", ".join(sorted(allowed)) or "(none)"
+            return (
+                f"error: tool '{name}' blocked by task guardrails; "
+                f"allowed_tools={allow_list}"
+            )
+        if policy["forbid_write"] and name in {"write", "edit"}:
+            return (
+                f"error: tool '{name}' blocked by task guardrails "
+                "(forbid_write/read_only)"
+            )
+        if policy["forbid_bash"] and name == "bash":
+            return (
+                "error: tool 'bash' blocked by task guardrails "
+                "(forbid_bash/read_only)"
+            )
         result = TOOLS[name][2](args)
         if len(result) > MAX_OUT:
             result = (
@@ -1158,7 +1299,7 @@ Available tools:
 - glob(pat): Find files matching pattern
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
-- task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result
+- task(prompt, read_only?, allowed_tools?, forbid_write?, forbid_bash?): Delegate a self-contained subtask to a fresh subagent; returns only its result
 
 To use a tool, format it EXACTLY like this:
 <tool_call>{{"tool": "name", "args": {{"key": "value"}}}}</tool_call>
