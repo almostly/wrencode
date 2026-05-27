@@ -127,6 +127,14 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
 API_BACKENDS: frozenset[str] = frozenset(
     name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "api"
 )
+_COMPLEX_REFACTOR_RE = re.compile(
+    r"\b("
+    r"refactor|migration|migrate|cross-module|cross module|"
+    r"dependency|dependencies|api redesign|redesign|rollback|"
+    r"rename across|call sites|breaking change"
+    r")\b",
+    flags=re.IGNORECASE,
+)
 LOCAL_ML_BACKENDS: frozenset[str] = frozenset(
     name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "local-ml"
 )
@@ -203,6 +211,10 @@ TOOL_GROUNDED_RETRY_LIMIT = int(
 )
 MALFORMED_TOOL_CALL_RETRY_LIMIT = int(
     os.environ.get("MALFORMED_TOOL_CALL_RETRY_LIMIT", "1")
+)
+CHECKPOINT_DISCOVERY_MIN = int(os.environ.get("CHECKPOINT_DISCOVERY_MIN", "1"))
+CHECKPOINT_VALIDATION_RETRY_LIMIT = int(
+    os.environ.get("CHECKPOINT_VALIDATION_RETRY_LIMIT", "1")
 )
 _GLOB_SKIP: set[str] = {
     s
@@ -488,14 +500,29 @@ def edit(args: dict[str, Any]) -> str:
     count = text.count(old)
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times (use all=true)"
-    if not confirm(f"Edit {path!r}"):
-        return "cancelled"
-    path.write_text(
+    updated = (
         text.replace(old, str(new))
         if args.get("all")
-        else text.replace(old, str(new), 1),
-        encoding="utf-8",
+        else text.replace(old, str(new), 1)
     )
+    if updated == text:
+        return "error: edit produced no changes"
+    if path.suffix == ".py":
+        try:
+            ast.parse(updated)
+        except SyntaxError as e:
+            return (
+                "error: post-edit validation failed for Python syntax "
+                f"({e.msg} at line {e.lineno})"
+            )
+    if path.suffix == ".json":
+        try:
+            json.loads(updated)
+        except Exception as e:
+            return f"error: post-edit validation failed for JSON ({e})"
+    if not confirm(f"Edit {path!r}"):
+        return "cancelled"
+    path.write_text(updated, encoding="utf-8")
     return "ok"
 
 
@@ -995,6 +1022,46 @@ _TOOL_REQUIRED_RE = re.compile(
 def _likely_requires_tools(text: str) -> bool:
     """Heuristic for whether a prompt likely needs workspace/tool interaction."""
     return bool(_TOOL_REQUIRED_RE.search(text or ""))
+
+
+def _requires_checkpoint_gates(text: str) -> bool:
+    """Return True when the task appears to be a complex semantic refactor."""
+    return bool(_COMPLEX_REFACTOR_RE.search(text or ""))
+
+
+def _is_mutating_tool(name: str) -> bool:
+    """Return True if a tool mutates workspace state."""
+    return name in {"write", "edit"}
+
+
+def _is_discovery_tool(name: str) -> bool:
+    """Return True if a tool gathers pre-change context."""
+    return name in {"read", "glob", "grep"}
+
+
+def _is_validation_tool(name: str, tool_input: dict[str, Any]) -> bool:
+    """Return True if a tool call plausibly validates edits."""
+    if name in {"read", "grep"}:
+        return True
+    if name != "bash":
+        return False
+    cmd = str(tool_input.get("cmd", "")).lower()
+    checks = (
+        "test",
+        "pytest",
+        "unittest",
+        "lint",
+        "mypy",
+        "ruff",
+        "compile",
+        "py_compile",
+        "go test",
+        "cargo test",
+        "npm test",
+        "pnpm test",
+        "make test",
+    )
+    return any(k in cmd for k in checks)
 
 
 def _balance_json_object(raw: str) -> str:
@@ -1569,6 +1636,7 @@ def run_agent_turn(
     tools_executed = 0
     grounded_retries = 0
     malformed_tool_retries = 0
+    checkpoint_retries = 0
     first_user_text = next(
         (
             flatten_content(m.get("content"))
@@ -1578,6 +1646,9 @@ def run_agent_turn(
         "",
     )
     requires_grounded_tools = _likely_requires_tools(first_user_text)
+    requires_checkpoint_gates = _requires_checkpoint_gates(first_user_text)
+    discovery_events = 0
+    mutations_since_validation = 0
 
     def _record_tool(
         iter_no: int, tool_name: str, tool_input: dict[str, Any], result: str
@@ -1638,6 +1709,20 @@ def run_agent_turn(
                 )  # preserve tool_calls exactly
             if not tool_calls:
                 if (
+                    requires_checkpoint_gates
+                    and mutations_since_validation > 0
+                    and checkpoint_retries < CHECKPOINT_VALIDATION_RETRY_LIMIT
+                ):
+                    checkpoint_retries += 1
+                    nudge = (
+                        "Before finalizing this refactor, run a validation checkpoint "
+                        "with tools (for example bash test/lint/compile or read/grep "
+                        "to verify the edited call sites)."
+                    )
+                    print(f"\n{DIM}↻ requesting validation checkpoint{RESET}")
+                    messages.append({"role": "user", "content": nudge})
+                    continue
+                if (
                     requires_grounded_tools
                     and tools_executed == 0
                     and grounded_retries < TOOL_GROUNDED_RETRY_LIMIT
@@ -1661,8 +1746,40 @@ def run_agent_turn(
                 print(
                     f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
                 )
-                result = run_tool(tc["name"], tc["input"])
-                _record_tool(iters, tc["name"], tc["input"], result)
+                tool_name = tc["name"]
+                tool_input = tc["input"]
+                if (
+                    requires_checkpoint_gates
+                    and _is_mutating_tool(tool_name)
+                    and discovery_events < CHECKPOINT_DISCOVERY_MIN
+                ):
+                    result = (
+                        "error: checkpoint gate: gather context first with "
+                        "read/glob/grep before mutating files"
+                    )
+                elif (
+                    requires_checkpoint_gates
+                    and _is_mutating_tool(tool_name)
+                    and mutations_since_validation > 0
+                ):
+                    result = (
+                        "error: checkpoint gate: run a validation step "
+                        "(bash test/lint/compile or read/grep verification) "
+                        "before the next mutation"
+                    )
+                else:
+                    result = run_tool(tool_name, tool_input)
+                _record_tool(iters, tool_name, tool_input, result)
+                if not result.startswith("error:"):
+                    if _is_discovery_tool(tool_name):
+                        discovery_events += 1
+                    if _is_mutating_tool(tool_name):
+                        mutations_since_validation += 1
+                    elif (
+                        mutations_since_validation > 0
+                        and _is_validation_tool(tool_name, tool_input)
+                    ):
+                        mutations_since_validation = 0
                 lines = result.split("\n")
                 preview = lines[0][:60] + (
                     f" ... +{len(lines) - 1} lines"
@@ -1724,8 +1841,40 @@ def run_agent_turn(
             print(
                 f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
             )
-            result = run_tool(tc["name"], tc["input"])
-            _record_tool(iters, tc["name"], tc["input"], result)
+            tool_name = tc["name"]
+            tool_input = tc["input"]
+            if (
+                requires_checkpoint_gates
+                and _is_mutating_tool(tool_name)
+                and discovery_events < CHECKPOINT_DISCOVERY_MIN
+            ):
+                result = (
+                    "error: checkpoint gate: gather context first with "
+                    "read/glob/grep before mutating files"
+                )
+            elif (
+                requires_checkpoint_gates
+                and _is_mutating_tool(tool_name)
+                and mutations_since_validation > 0
+            ):
+                result = (
+                    "error: checkpoint gate: run a validation step "
+                    "(bash test/lint/compile or read/grep verification) "
+                    "before the next mutation"
+                )
+            else:
+                result = run_tool(tool_name, tool_input)
+            _record_tool(iters, tool_name, tool_input, result)
+            if not result.startswith("error:"):
+                if _is_discovery_tool(tool_name):
+                    discovery_events += 1
+                if _is_mutating_tool(tool_name):
+                    mutations_since_validation += 1
+                elif (
+                    mutations_since_validation > 0
+                    and _is_validation_tool(tool_name, tool_input)
+                ):
+                    mutations_since_validation = 0
             lines = result.split("\n")
             preview = lines[0][:60] + (
                 f" ... +{len(lines) - 1} lines"
@@ -1759,6 +1908,20 @@ def run_agent_turn(
 
         messages.append({"role": "assistant", "content": content_blocks})
         if not xml_tool_results:
+            if (
+                requires_checkpoint_gates
+                and mutations_since_validation > 0
+                and checkpoint_retries < CHECKPOINT_VALIDATION_RETRY_LIMIT
+            ):
+                checkpoint_retries += 1
+                nudge = (
+                    "Before finalizing this refactor, run a validation checkpoint "
+                    "with tools (for example bash test/lint/compile or read/grep "
+                    "to verify the edited call sites)."
+                )
+                print(f"\n{DIM}↻ requesting validation checkpoint{RESET}")
+                messages.append({"role": "user", "content": nudge})
+                continue
             if (
                 requires_grounded_tools
                 and tools_executed == 0

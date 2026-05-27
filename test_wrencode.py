@@ -543,6 +543,25 @@ class TestFileTools(unittest.TestCase):
         result = wrencode.edit({"path": "nope.txt", "old": "x", "new": "y"})
         self.assertIn("error", result.lower())
 
+    def test_edit_rejects_invalid_python_and_keeps_original(self):
+        wrencode.write({"path": "bad.py", "content": "def f():\n    return 1\n"})
+        result = wrencode.edit(
+            {"path": "bad.py", "old": "return 1", "new": "return ("}
+        )
+        self.assertIn("post-edit validation failed for Python syntax", result)
+        read_back = strip_ansi(wrencode.read({"path": "bad.py"}))
+        self.assertIn("return 1", read_back)
+        self.assertNotIn("return (", read_back)
+
+    def test_edit_rejects_invalid_json_and_keeps_original(self):
+        wrencode.write({"path": "cfg.json", "content": '{"ok": true}\n'})
+        result = wrencode.edit(
+            {"path": "cfg.json", "old": '{"ok": true}', "new": '{"ok": true'}
+        )
+        self.assertIn("post-edit validation failed for JSON", result)
+        read_back = strip_ansi(wrencode.read({"path": "cfg.json"}))
+        self.assertIn('{"ok": true}', read_back)
+
 
     def test_glob_finds_matching_files(self):
         wrencode.write({"path": "a.py", "content": "x"})
@@ -804,6 +823,203 @@ class TestAgentLoopSmoke(unittest.TestCase):
             if m["role"] == "user"
         ]
         self.assertTrue(any("malformed" in t for t in user_texts))
+
+    def test_checkpoint_gate_requires_discovery_before_edit(self):
+        target = pathlib.Path(self._tmp) / "mod.py"
+        target.write_text("def a():\n    return 1\n", encoding="utf-8")
+        call_count = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return '<tool_call>{"tool": "edit", "args": {"path": "mod.py", "old": "return 1", "new": "return 2"}}</tool_call>'
+            if call_count[0] == 2:
+                return '<tool_call>{"tool": "read", "args": {"path": "mod.py"}}</tool_call>'
+            if call_count[0] == 3:
+                return '<tool_call>{"tool": "edit", "args": {"path": "mod.py", "old": "return 1", "new": "return 2"}}</tool_call>'
+            if call_count[0] == 4:
+                return '<tool_call>{"tool": "bash", "args": {"cmd": "echo test checkpoint"}}</tool_call>'
+            return "done"
+
+        wrencode.get_response = mock_get_response
+        messages = [{"role": "user", "content": "Do a cross-module refactor with API migration."}]
+        wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=8)
+        self.assertEqual(call_count[0], 5)
+        tool_results = [
+            b.get("content", "")
+            for m in messages
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if b.get("type") == "tool_result"
+        ]
+        self.assertTrue(
+            any("checkpoint gate: gather context first" in str(r) for r in tool_results)
+        )
+
+    def test_checkpoint_gate_requests_validation_before_finalize(self):
+        target = pathlib.Path(self._tmp) / "mod.py"
+        target.write_text("def a():\n    return 1\n", encoding="utf-8")
+        call_count = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return '<tool_call>{"tool": "read", "args": {"path": "mod.py"}}</tool_call>'
+            if call_count[0] == 2:
+                return '<tool_call>{"tool": "edit", "args": {"path": "mod.py", "old": "return 1", "new": "return 2"}}</tool_call>'
+            if call_count[0] == 3:
+                return "finished"
+            if call_count[0] == 4:
+                return '<tool_call>{"tool": "bash", "args": {"cmd": "echo test validation checkpoint"}}</tool_call>'
+            return "done"
+
+        wrencode.get_response = mock_get_response
+        messages = [{"role": "user", "content": "Perform a dependency migration refactor."}]
+        wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=8)
+        self.assertEqual(call_count[0], 5)
+        user_texts = [
+            wrencode.flatten_content(m["content"])
+            for m in messages
+            if m["role"] == "user"
+        ]
+        self.assertTrue(any("validation checkpoint" in t for t in user_texts))
+
+
+class TestSemanticRefactorAdversarialBenchmarks(unittest.TestCase):
+    """Broader scenario coverage for semantic refactors under clean and adversarial profiles."""
+
+    def setUp(self):
+        self._orig_workspace = os.environ.get("WRENCODE_WORKSPACE")
+        self._orig_auto_approve = os.environ.get("WRENCODE_AUTO_APPROVE")
+        self._orig_backend = wrencode.BACKEND
+        self._orig_get_response = wrencode.get_response
+        os.environ["WRENCODE_AUTO_APPROVE"] = "1"
+        wrencode.apply_backend("ollama")
+
+    def tearDown(self):
+        if self._orig_workspace is not None:
+            os.environ["WRENCODE_WORKSPACE"] = self._orig_workspace
+        elif "WRENCODE_WORKSPACE" in os.environ:
+            del os.environ["WRENCODE_WORKSPACE"]
+        if self._orig_auto_approve is not None:
+            os.environ["WRENCODE_AUTO_APPROVE"] = self._orig_auto_approve
+        elif "WRENCODE_AUTO_APPROVE" in os.environ:
+            del os.environ["WRENCODE_AUTO_APPROVE"]
+        wrencode.BACKEND = self._orig_backend
+        wrencode.get_response = self._orig_get_response
+
+    def _run_scenario(self, scenario, profile):
+        root = pathlib.Path(tempfile.mkdtemp()).resolve()
+        os.environ["WRENCODE_WORKSPACE"] = str(root)
+        for rel, content in scenario["files"].items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+        steps = list(scenario["steps"])
+        first_path = steps[0][0] if steps else "src"
+        actions: list[tuple[str, dict[str, str]]] = [("read", {"path": first_path})]
+        for path, old, new in steps:
+            actions.append(("edit", {"path": path, "old": old, "new": new}))
+            actions.append(
+                ("grep", {"pat": "return|def|calc_total|times2|compute", "path": "src"})
+            )
+        state = {"i": 0}
+
+        def responder(messages, system_prompt, mlx_state):
+            if profile == "hard":
+                return '<tool_call>{"tool":"grep","args":{"pat":"TODO","path":"missing.py"}}</tool_call>'
+            if profile == "recoverable" and state["i"] == 0:
+                state["i"] += 1
+                return "<tool_call>oops</tool_call>"
+            if profile == "recoverable" and state["i"] == 1:
+                state["i"] += 1
+                return "I can probably finalize now."
+            if profile == "recoverable" and state["i"] == 2:
+                state["i"] += 1
+                return '<tool_call>{"tool":"edit","args":{"path":"missing.py","old":"x","new":"y"}}</tool_call>'
+            idx = state["i"] if profile == "clean" else state["i"] - 3
+            if 0 <= idx < len(actions):
+                tool, tool_args = actions[idx]
+                state["i"] += 1
+                return (
+                    f'<tool_call>{{"tool":"{tool}","args":'
+                    + json.dumps(tool_args)
+                    + "}</tool_call>"
+                )
+            return "done"
+
+        wrencode.get_response = responder
+        messages = [{"role": "user", "content": scenario["prompt"]}]
+        meta = wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=40)
+        verified = scenario["verify"](root)
+        return {"verified": verified, "loop_breaker": bool(meta.get("loop_breaker"))}
+
+    def test_semantic_refactor_matrix_clean_recoverable_and_hard(self):
+        scenarios = [
+            {
+                "prompt": "Cross-module API redesign and migration.",
+                "files": {
+                    "src/api.py": "def calc_total(items):\n    return sum(items)\n",
+                    "src/service.py": "from src.api import calc_total\n\ndef run(items):\n    return calc_total(items)\n",
+                },
+                "steps": [
+                    ("src/api.py", "def calc_total(items):", "def calc_total(items, tax_rate=0.0):"),
+                    ("src/api.py", "return sum(items)", "subtotal = sum(items)\n    return subtotal + subtotal * tax_rate"),
+                    ("src/service.py", "calc_total(items)", "calc_total(items, tax_rate=0.1)"),
+                ],
+                "verify": lambda root: (
+                    "calc_total(items, tax_rate=0.1)"
+                    in (root / "src/service.py").read_text(encoding="utf-8")
+                    and "tax_rate=0.0"
+                    in (root / "src/api.py").read_text(encoding="utf-8")
+                ),
+            },
+            {
+                "prompt": "Dependency migration across module graph.",
+                "files": {
+                    "src/legacy.py": "def mul2(x):\n    return x * 2\n",
+                    "src/core.py": "from src.legacy import mul2\n\ndef run(x):\n    return mul2(x)\n",
+                },
+                "steps": [
+                    ("src/legacy.py", "def mul2(x):", "def times2(x):"),
+                    ("src/core.py", "from src.legacy import mul2", "from src.legacy import times2"),
+                    ("src/core.py", "mul2(x)", "times2(x)"),
+                ],
+                "verify": lambda root: (
+                    "times2(x)" in (root / "src/core.py").read_text(encoding="utf-8")
+                    and "def times2(x):"
+                    in (root / "src/legacy.py").read_text(encoding="utf-8")
+                ),
+            },
+            {
+                "prompt": "Backward-compatible compute API migration with rollback safety.",
+                "files": {
+                    "src/compute.py": "def compute(x):\n    return x + 1\n",
+                    "src/use.py": "from src.compute import compute\n\ndef use(x):\n    return compute(x)\n",
+                },
+                "steps": [
+                    ("src/compute.py", "def compute(x):", "def compute(x, y=None):"),
+                    ("src/compute.py", "return x + 1", "if y is None:\n        return x + 1\n    return x + y"),
+                    ("src/use.py", "compute(x)", "compute(x, y=1)"),
+                ],
+                "verify": lambda root: (
+                    "compute(x, y=1)"
+                    in (root / "src/use.py").read_text(encoding="utf-8")
+                    and "def compute(x, y=None):"
+                    in (root / "src/compute.py").read_text(encoding="utf-8")
+                ),
+            },
+        ]
+
+        clean = [self._run_scenario(s, "clean") for s in scenarios]
+        recoverable = [self._run_scenario(s, "recoverable") for s in scenarios]
+        hard = [self._run_scenario(s, "hard") for s in scenarios]
+
+        self.assertTrue(all(r["verified"] for r in clean))
+        self.assertEqual(len(recoverable), len(scenarios))
+        self.assertTrue(all(not r["verified"] for r in hard))
+        self.assertTrue(all(r["loop_breaker"] for r in hard))
 
 
 # ---------------------------------------------------------------------------
