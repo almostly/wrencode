@@ -482,31 +482,10 @@ def _read_user_input_interactive() -> str:
 
 
 def read_confirm_choice() -> str:
-    """Pick approve / allow-all / decline with ↑↓ arrows."""
-    options = ["", "a", "n"]
-    labels = [
-        "Enter   approve once",
-        "a       allow all for this session",
-        "n       no — say what to do differently",
-    ]
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        idx = pick_from_list(
-            "",
-            options,
-            labels=labels,
-            initial_index=0,
-            system_key_only=True,
-            direct_keys={"a": 1},
-            expand_index=2,
-            reject_keys={"n"},
-            hint="↑↓ move · Enter approve · Tab/→ edit decline · a allow all · Esc cancel",
-        )
-        if idx is None:
-            raise KeyboardInterrupt
-        return options[idx]
-    print(f"{DIM}  Enter   approve once{RESET}")
-    print(f"{DIM}  a       allow all for this session{RESET}")
-    print(f"{DIM}  n       no — say what to do differently{RESET}")
+    """Prompt for approve / allow-all / decline."""
+    print(f"{DIM}  Enter/y   approve once{RESET}")
+    print(f"{DIM}  a         allow all for this session{RESET}")
+    print(f"{DIM}  n         decline{RESET}")
     try:
         return input(f"{BLUE}❯{RESET} ").strip().lower()
     except KeyboardInterrupt:
@@ -1763,6 +1742,19 @@ CRITICAL: You MUST use tools for file operations. Never say you can't access fil
 # -----------------------------------------------------------------------------------------------
 # Agent Loop
 # -----------------------------------------------------------------------------------------------
+def _track_error(
+    result: str, last: Optional[str], count: int
+) -> tuple[Optional[str], int, bool]:
+    """Update repeated-error state; return (last_error, count, should_stop)."""
+    if result.startswith("error:"):
+        count = count + 1 if result == last else 1
+        if count >= TOOL_ERROR_REPEAT_LIMIT:
+            print(f"{YELLOW}Stopping: repeated identical tool error {count} times.{RESET}")
+            return result, count, True
+        return result, count, False
+    return None, 0, False
+
+
 def run_agent_turn(
     messages: list[dict[str, Any]],
     system_prompt: str,
@@ -1830,21 +1822,11 @@ def run_agent_turn(
                                 "content": result,
                             }
                         )
-                    if result.startswith("error:"):
-                        if result == last_tool_error:
-                            repeated_tool_error_count += 1
-                        else:
-                            last_tool_error = result
-                            repeated_tool_error_count = 1
-                        if repeated_tool_error_count >= TOOL_ERROR_REPEAT_LIMIT:
-                            print(
-                                f"{YELLOW}Stopping: repeated identical tool error {repeated_tool_error_count} times.{RESET}"
-                            )
-                            stop_due_to_repeated_error = True
-                            break
-                    else:
-                        last_tool_error = None
-                        repeated_tool_error_count = 0
+                    last_tool_error, repeated_tool_error_count, stop_due_to_repeated_error = (
+                        _track_error(result, last_tool_error, repeated_tool_error_count)
+                    )
+                    if stop_due_to_repeated_error:
+                        break
                 if BACKEND == "anthropic":
                     messages.append({"role": "user", "content": tool_results})
                 else:
@@ -1880,21 +1862,11 @@ def run_agent_turn(
                     }
                 )
                 content_blocks.append(tc)
-                if result.startswith("error:"):
-                    if result == last_tool_error:
-                        repeated_tool_error_count += 1
-                    else:
-                        last_tool_error = result
-                        repeated_tool_error_count = 1
-                    if repeated_tool_error_count >= TOOL_ERROR_REPEAT_LIMIT:
-                        print(
-                            f"{YELLOW}Stopping: repeated identical tool error {repeated_tool_error_count} times.{RESET}"
-                        )
-                        stop_due_to_repeated_error = True
-                        break
-                else:
-                    last_tool_error = None
-                    repeated_tool_error_count = 0
+                last_tool_error, repeated_tool_error_count, stop_due_to_repeated_error = (
+                    _track_error(result, last_tool_error, repeated_tool_error_count)
+                )
+                if stop_due_to_repeated_error:
+                    break
 
             messages.append({"role": "assistant", "content": content_blocks})
             if stop_due_to_repeated_error or not xml_tool_results:
