@@ -136,11 +136,6 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn("write", plain)
         self.assertNotIn("write write", plain)
 
-    def test_format_user_turn_line(self):
-        line = wrencode.format_user_turn_line("hello")
-        self.assertIn("❯", line)
-        self.assertIn("hello", strip_ansi(line))
-
     def test_print_system_uses_banner_cyan(self):
         import io
 
@@ -153,10 +148,6 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn("\033[96m", out)
         self.assertIn("\033[1m", out)
         self.assertIn("Cleared", strip_ansi(out))
-
-    def test_loader_frame_returns_braille_symbol(self):
-        frame = wrencode.loader_frame(0)
-        self.assertIn(frame, wrencode._COMPOSE_FRAMES)
 
     def test_context_loader_frame(self):
         with mock.patch.object(wrencode, "BACKEND", "anthropic"), mock.patch.object(

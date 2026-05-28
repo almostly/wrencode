@@ -40,6 +40,7 @@ import os
 import pathlib
 import platform
 import re
+import shlex
 import select
 import shutil
 import subprocess
@@ -63,10 +64,8 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                 if _line.startswith("export "):
                     _line = _line[len("export ") :]
                 _k, _v = _line.split("=", 1)
-                _v = _v.strip()
-                # Strip matching surrounding quotes, e.g. KEY="value" or KEY='value'.
-                if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in ("'", '"'):
-                    _v = _v[1:-1]
+                with contextlib.suppress(Exception):
+                    _v = shlex.split(_v)[0]
                 os.environ.setdefault(_k.strip(), _v)
 
 # -----------------------------------------------------------------------------------------------
@@ -264,17 +263,8 @@ def _loader_context_text() -> str:
     return f"{b} · {m} · waiting…"
 
 
-def _loader_symbol(step: int) -> str:
-    return _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
-
-
-def loader_frame(step: int) -> str:
-    """Current loader frame (plain text)."""
-    return _loader_symbol(step)
-
-
 def loader_display(step: int) -> str:
-    sym = _loader_symbol(step)
+    sym = _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
     text = _loader_context_text()
     if not colors_enabled():
         return f"{sym} {text}"
@@ -482,10 +472,7 @@ def _read_user_input_interactive() -> str:
 
 
 def read_confirm_choice() -> str:
-    """Prompt for approve / allow-all / decline."""
-    print(f"{DIM}  Enter/y   approve once{RESET}")
-    print(f"{DIM}  a         allow all for this session{RESET}")
-    print(f"{DIM}  n         decline{RESET}")
+    """Read one approval key: Enter/y, a, or n."""
     try:
         return input(f"{BLUE}❯{RESET} ").strip().lower()
     except KeyboardInterrupt:
@@ -831,15 +818,12 @@ def get_response_cancellable(
     return result[0]
 
 
-def confirm(action: str = "", *, show_prompt: bool = False) -> str:
+def confirm(action: str = "") -> str:
     """Prompt for approval. Returns 'ok' or a cancellation message for the agent.
 
-    Enter approves once; ``a`` approves all remaining actions this session;
+    Enter/y approves once; ``a`` approves all remaining actions this session;
     ``n`` declines and asks what to do differently. Auto-approve via
     WRENCODE_AUTO_APPROVE / --yes enables headless use and subagents.
-
-    Tool actions are shown by print_tool_action(); by default only the
-    Enter/a/n hints are shown here (not a duplicate path/command line).
     """
     global _SESSION_AUTO_APPROVE
     if (
@@ -849,13 +833,9 @@ def confirm(action: str = "", *, show_prompt: bool = False) -> str:
         label = action or "action"
         print(f"{DIM}⚠ {label} [auto-approved]{RESET}")
         return "ok"
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        print()
-        if show_prompt and action:
-            print(f"{YELLOW}⚠ {action}{RESET}")
-        print(f"{DIM}  Enter   approve once{RESET}")
-        print(f"{DIM}  a       allow all for this session{RESET}")
-        print(f"{DIM}  n       no — say what to do differently{RESET}")
+    print(f"{DIM}  Enter/y   approve once{RESET}")
+    print(f"{DIM}  a         allow all for this session{RESET}")
+    print(f"{DIM}  n         decline{RESET}")
     while True:
         try:
             choice = read_confirm_choice()
@@ -1158,10 +1138,6 @@ def print_agent_message(text: str) -> None:
     print()
 
 
-def format_user_turn_line(user_input: str) -> str:
-    """Format the current user request line (prompt + text, no trailing newline)."""
-    return f"{BRIGHT_CYAN}❯{RESET} {user_input}"
-
 
 @contextlib.contextmanager
 def thinking_spinner() -> Any:
@@ -1313,20 +1289,16 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
             # malformed block with no JSON payload; skip and keep scanning
             pos = close + len(close_tag) if close != -1 else start + len(open_tag)
             continue
-        depth, end = 0, -1
-        for i, ch in enumerate(text[brace:], brace):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
         payload: Optional[dict[str, Any]] = None
-        if end != -1:
-            payload = _parse_tool_payload(text[brace:end])
-            pos = end
-        elif close != -1 and close > brace:
+        with contextlib.suppress(Exception):
+            obj, rel_end = json.JSONDecoder().raw_decode(text, brace)
+            if isinstance(obj, dict):
+                payload = obj if obj.get("tool") in TOOLS else None
+                pos = rel_end
+                if payload:
+                    calls.append({"type": "tool_use", "id": f"call_{len(calls)}", "name": payload["tool"], "input": payload.get("args", {})})
+                continue
+        if close != -1 and close > brace:
             payload = _parse_tool_payload(text[brace:close])
             pos = close + len(close_tag)
         else:
@@ -1432,7 +1404,7 @@ def _http_post(
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read())
+            return json.load(resp)
     except urllib.error.HTTPError as e:
         raise Exception(f"HTTP {e.code}: {e.read().decode()}") from e
 
@@ -1987,7 +1959,6 @@ def pick_from_list(
     *,
     labels: Optional[list[str]] = None,
     initial_index: int = 0,
-    **_kwargs: Any,
 ) -> Optional[int]:
     """Pick one option from a numbered list."""
     if not options:
@@ -2031,7 +2002,7 @@ def fetch_openrouter_models() -> list[str]:
             headers={"Authorization": f"Bearer {key}"},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
+            data = json.load(resp)
         ids = sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
         if ids:
             OPENROUTER_MODELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -2048,7 +2019,7 @@ def fetch_ollama_models() -> list[str]:
     base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     try:
         with urllib.request.urlopen(f"{base}/api/tags", timeout=5) as resp:
-            data = json.loads(resp.read())
+            data = json.load(resp)
         names = sorted(
             m.get("name", "") for m in data.get("models", []) if m.get("name")
         )
@@ -2341,7 +2312,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
             with urllib.request.urlopen(f"{base}/api/tags", timeout=3) as r:
                 installed = {
                     m.get("name", "")
-                    for m in json.loads(r.read().decode()).get("models", [])
+                    for m in json.load(r).get("models", [])
                 }
             want = MODEL if ":" in MODEL else f"{MODEL}:latest"
             if not (
