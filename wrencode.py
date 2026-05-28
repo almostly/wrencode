@@ -64,8 +64,10 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                 if _line.startswith("export "):
                     _line = _line[len("export ") :]
                 _k, _v = _line.split("=", 1)
-                with contextlib.suppress(Exception):
-                    _v = shlex.split(_v)[0]
+                try:
+                    _v = shlex.split(_v)[0] if _v else _v
+                except ValueError:
+                    pass  # malformed quoting — use raw value
                 os.environ.setdefault(_k.strip(), _v)
 
 # -----------------------------------------------------------------------------------------------
@@ -280,34 +282,17 @@ def colors_enabled() -> bool:
     return sys.stdout.isatty()
 
 
-def system_s() -> str:
-    """Opening ANSI sequence for system / slash-command text (banner cyan)."""
-    if not colors_enabled():
-        return ""
-    return f"{BOLD}{BRIGHT_CYAN}"
-
-
-def system_e() -> str:
-    return RESET if colors_enabled() else ""
-
-
 def print_system(text: str, *, end: str = "\n") -> None:
     """Print slash-command / configure feedback in banner cyan."""
+    s = f"{BOLD}{BRIGHT_CYAN}" if colors_enabled() else ""
+    e = RESET if colors_enabled() else ""
     if sys.stdout.isatty():
         sys.stdout.write("\r")
-    sys.stdout.write(f"{system_s()}{text}{system_e()}{end}")
+    sys.stdout.write(f"{s}{text}{e}{end}")
     sys.stdout.flush()
 
 
 _INPUT_HISTORY: list[str] = []
-
-
-def _slash_command_token(text: str) -> tuple[str, str]:
-    """Return (slash_command, remainder) for live input coloring."""
-    if not text.startswith("/"):
-        return "", text
-    cmd, _, rest = text.partition(" ")
-    return cmd, rest
 
 
 def format_input_line(text: str) -> str:
@@ -315,12 +300,13 @@ def format_input_line(text: str) -> str:
     if not colors_enabled():
         return f"❯ {text}"
     prompt = f"{BRIGHT_CYAN}❯{RESET} "
-    cmd, rest = _slash_command_token(text)
-    if not cmd:
+    if not text.startswith("/"):
         return prompt + text
-    line = f"{prompt}{system_s()}{cmd}{system_e()}"
+    cmd, _, rest = text.partition(" ")
+    s = f"{BOLD}{BRIGHT_CYAN}"
+    line = prompt + s + cmd + RESET
     if rest:
-        line += f" {rest}"
+        line += " " + rest
     return line
 
 
@@ -471,13 +457,6 @@ def _read_user_input_interactive() -> str:
     return text
 
 
-def read_confirm_choice() -> str:
-    """Read one approval key: Enter/y, a, or n."""
-    try:
-        return input(f"{BLUE}❯{RESET} ").strip().lower()
-    except KeyboardInterrupt:
-        raise
-
 
 def read_feedback_line() -> str:
     """Read decline feedback after choosing n in the approval picker."""
@@ -534,15 +513,6 @@ def workspace_root() -> pathlib.Path:
     return pathlib.Path(os.getcwd()).resolve()
 
 
-def paths_unrestricted() -> bool:
-    """Return True if WRENCODE_UNRESTRICTED_PATHS is set to a truthy value."""
-    return os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def resolve_tool_path(raw: Any) -> pathlib.Path:
     """Resolve a raw path argument to an absolute Path within the workspace."""
     if not raw or not str(raw).strip():
@@ -550,7 +520,7 @@ def resolve_tool_path(raw: Any) -> pathlib.Path:
     p = pathlib.Path(str(raw).strip()).expanduser()
     root = workspace_root()
     p = p.resolve() if p.is_absolute() else (root / p).resolve()
-    if not paths_unrestricted():
+    if os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower() not in ("1", "true", "yes"):
         try:
             p.relative_to(root)
         except ValueError:
@@ -756,7 +726,7 @@ def _cancel_listener() -> None:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if not ready:
                     continue
-                ch = sys.stdin.read(1)
+                ch = os.read(fd, 1).decode("utf-8", errors="replace")
                 if ch == "\x1b":
                     _CANCEL_REQUESTED.set()
                     break
@@ -838,7 +808,7 @@ def confirm(action: str = "") -> str:
     print(f"{DIM}  n         decline{RESET}")
     while True:
         try:
-            choice = read_confirm_choice()
+            choice = input(f"{BLUE}❯{RESET} ").strip().lower()
         except KeyboardInterrupt:
             print()
             return "cancelled: user interrupted"
@@ -1220,55 +1190,6 @@ def _tool_call_complete(text: str) -> int:
     return last
 
 
-def _balance_json_object(raw: str) -> str:
-    """Best-effort brace balancing for a JSON object string."""
-    depth = 0
-    in_string = False
-    escaped = False
-    for ch in raw:
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\":
-            escaped = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-    if depth > 0:
-        raw += "}" * depth
-    return raw
-
-
-def _parse_tool_payload(raw_payload: str) -> Optional[dict[str, Any]]:
-    """Best-effort parse of a <tool_call> payload."""
-    raw = raw_payload.strip()
-    if not raw:
-        return None
-    with contextlib.suppress(Exception):
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    with contextlib.suppress(Exception):
-        parsed = json.loads(_balance_json_object(raw))
-        if isinstance(parsed, dict):
-            return parsed
-    with contextlib.suppress(Exception):
-        parsed = ast.literal_eval(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    with contextlib.suppress(Exception):
-        parsed = ast.literal_eval(_balance_json_object(raw))
-        if isinstance(parsed, dict):
-            return parsed
-    return None
-
 
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse all <tool_call> blocks from model output into structured dicts.
@@ -1299,7 +1220,11 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                     calls.append({"type": "tool_use", "id": f"call_{len(calls)}", "name": payload["tool"], "input": payload.get("args", {})})
                 continue
         if close != -1 and close > brace:
-            payload = _parse_tool_payload(text[brace:close])
+            payload = None
+            with contextlib.suppress(Exception):
+                d = json.loads(text[brace:close])
+                if isinstance(d, dict):
+                    payload = d
             pos = close + len(close_tag)
         else:
             break  # JSON may still be streaming
@@ -1544,29 +1469,27 @@ def get_response(
 # -----------------------------------------------------------------------------------------------
 # History Management
 # -----------------------------------------------------------------------------------------------
-def history_file_path() -> str:
+def history_file_path() -> pathlib.Path:
     """Return the history file path from env override or user-level default."""
     if p := os.environ.get("WRENCODE_HISTORY_FILE"):
-        return str(pathlib.Path(p).expanduser())
-    return str(pathlib.Path.home() / ".wrencode" / "history.json")
+        return pathlib.Path(p).expanduser()
+    return pathlib.Path.home() / ".wrencode" / "history.json"
 
 
 def load_history() -> list[dict[str, Any]]:
     """Load conversation history from the JSON history file."""
-    history_file = history_file_path()
-    if os.path.exists(history_file):
-        with contextlib.suppress(Exception):
-            with open(history_file) as f:
-                return list(json.load(f))
+    with contextlib.suppress(Exception):
+        with open(history_file_path()) as f:
+            return list(json.load(f))
     return []
 
 
 def save_history(messages: list[dict[str, Any]]) -> None:
     """Persist conversation history to the JSON history file."""
     with contextlib.suppress(Exception):
-        history_file = pathlib.Path(history_file_path())
-        history_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(history_file, "w") as f:
+        p = history_file_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
             json.dump(messages, f)
 
 
@@ -1681,7 +1604,7 @@ def build_system_prompt() -> str:
     ws = workspace_root()
     path_rule = (
         "Paths are not restricted to the workspace."
-        if paths_unrestricted()
+        if os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower() in ("1", "true", "yes")
         else "Relative paths resolve under the workspace. Absolute paths must stay inside it."
     )
     return f"""You are a helpful coding assistant with tools to interact with the file system.
@@ -1940,17 +1863,17 @@ def available_backends() -> list[str]:
     (mlx/transformers) are only offered from a source install. MLX is further
     limited to Apple Silicon.
     """
-    out: list[str] = []
-    for name, spec in BACKEND_SPECS.items():
-        if spec["kind"] == "local-ml":
-            if is_frozen():
-                continue
-            if name == "mlx" and not (
-                platform.system() == "Darwin" and platform.machine() == "arm64"
-            ):
-                continue
-        out.append(name)
-    return out
+    return [
+        name for name, spec in BACKEND_SPECS.items()
+        if not (
+            spec["kind"] == "local-ml" and (
+                is_frozen()
+                or (name == "mlx" and not (
+                    platform.system() == "Darwin" and platform.machine() == "arm64"
+                ))
+            )
+        )
+    ]
 
 
 def pick_from_list(
@@ -1971,7 +1894,9 @@ def pick_from_list(
         print_system(title)
         print()
     for i, label in enumerate(labels, 1):
-        print(f"  {BOLD if i - 1 == initial_index else ''}{i}. {label}{RESET if i - 1 == initial_index else ''}")
+        prefix = BOLD if i - 1 == initial_index else ""
+        suffix = RESET if i - 1 == initial_index else ""
+        print("  " + prefix + str(i) + ". " + label + suffix)
     default = str(initial_index + 1)
     while True:
         raw = input(f"{BLUE}❯{RESET} number [{default}]: ").strip() or default

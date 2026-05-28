@@ -210,9 +210,7 @@ class TestConfirm(unittest.TestCase):
         import io
 
         buf = io.StringIO()
-        with mock.patch("sys.stdout", buf), mock.patch.object(
-            wrencode, "read_confirm_choice", return_value=""
-        ):
+        with mock.patch("sys.stdout", buf), mock.patch("builtins.input", return_value=""):
             wrencode.confirm("write")
         plain = strip_ansi(buf.getvalue())
         self.assertNotIn("PosixPath", plain)
@@ -220,27 +218,25 @@ class TestConfirm(unittest.TestCase):
         self.assertIn("approve once", plain)
 
     def test_enter_approves(self):
-        with mock.patch.object(wrencode, "read_confirm_choice", return_value=""):
+        with mock.patch("builtins.input", return_value=""):
             self.assertEqual(wrencode.confirm("write"), "ok")
 
     def test_allow_all_sets_session_flag(self):
-        with mock.patch.object(wrencode, "read_confirm_choice", return_value="a"):
+        with mock.patch("builtins.input", return_value="a"):
             self.assertEqual(wrencode.confirm("write"), "ok")
         self.assertTrue(wrencode._SESSION_AUTO_APPROVE)
 
     def test_decline_collects_feedback(self):
-        with mock.patch.object(
-            wrencode, "read_confirm_choice", return_value="n"
-        ), mock.patch.object(
+        with mock.patch("builtins.input", return_value="n"), mock.patch.object(
             wrencode, "read_feedback_line", return_value="use edit instead"
         ):
             result = wrencode.confirm("write")
         self.assertEqual(result, "cancelled: user declined — use edit instead")
 
     def test_decline_without_feedback(self):
-        with mock.patch.object(
-            wrencode, "read_confirm_choice", return_value="n"
-        ), mock.patch.object(wrencode, "read_feedback_line", return_value=""):
+        with mock.patch("builtins.input", return_value="n"), mock.patch.object(
+            wrencode, "read_feedback_line", return_value=""
+        ):
             result = wrencode.confirm("write")
         self.assertEqual(result, "cancelled: user declined without instructions")
 
@@ -249,9 +245,7 @@ class TestConfirm(unittest.TestCase):
         self.assertEqual(wrencode.confirm("run"), "ok")
 
     def test_ctrl_c_returns_interrupted(self):
-        with mock.patch.object(
-            wrencode, "read_confirm_choice", side_effect=KeyboardInterrupt
-        ):
+        with mock.patch("builtins.input", side_effect=KeyboardInterrupt):
             self.assertEqual(
                 wrencode.confirm("write"),
                 "cancelled: user interrupted",
@@ -560,18 +554,6 @@ class TestParseToolCalls(unittest.TestCase):
             "<tool_call>not-json</tool_call>"
             '<tool_call>{"tool": "read", "args": {"path": "ok.py"}}</tool_call>'
         )
-        calls = wrencode.parse_tool_calls(text)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], "read")
-
-    def test_python_literal_payload_is_accepted(self):
-        text = "<tool_call>{'tool': 'glob', 'args': {'pat': '*.py'}}</tool_call>"
-        calls = wrencode.parse_tool_calls(text)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], "glob")
-
-    def test_close_tag_fallback_for_unbalanced_json(self):
-        text = '<tool_call>{"tool":"read","args":{"path":"a.py"</tool_call>'
         calls = wrencode.parse_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["name"], "read")
