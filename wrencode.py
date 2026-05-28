@@ -253,25 +253,15 @@ _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _LOADER_MODEL_MAX = 32
 
 
-def _loader_backend_label() -> str:
-    if BACKEND:
-        return BACKEND
-    return "backend"
-
-
-def _loader_model_label() -> str:
-    if not MODEL:
-        return "model"
-    if len(MODEL) <= _LOADER_MODEL_MAX:
-        return MODEL
-    keep = _LOADER_MODEL_MAX - 1
-    head = max(8, keep // 2)
-    tail = keep - head
-    return f"{MODEL[:head]}…{MODEL[-tail:]}"
-
-
 def _loader_context_text() -> str:
-    return f"{_loader_backend_label()} · {_loader_model_label()} · waiting…"
+    b = BACKEND or "backend"
+    if MODEL and len(MODEL) > _LOADER_MODEL_MAX:
+        keep = _LOADER_MODEL_MAX - 1
+        head = max(8, keep // 2)
+        m = f"{MODEL[:head]}…{MODEL[-(keep - head):]}"
+    else:
+        m = MODEL or "model"
+    return f"{b} · {m} · waiting…"
 
 
 def _loader_symbol(step: int) -> str:
@@ -1387,30 +1377,26 @@ _TYPE_MAP: dict[str, str] = {
 }
 
 
-def _build_anthropic_tools() -> list[dict[str, Any]]:
-    """Build Anthropic-native tool definitions from the TOOLS registry."""
-    result = []
-    for name, (description, params, _) in TOOLS.items():
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for param_name, param_type in params.items():
-            properties[param_name] = {
-                "type": _TYPE_MAP.get(param_type, "string")
-            }
-            if not param_type.endswith("?"):
-                required.append(param_name)
-        result.append(
-            {
-                "name": name,
-                "description": description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
-            }
-        )
-    return result
+def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
+    """Build tool definitions for 'anthropic' or 'openai' format from the TOOLS registry."""
+    out = []
+    for name, (desc, params, _) in TOOLS.items():
+        props = {k: {"type": _TYPE_MAP.get(v, "string")} for k, v in params.items()}
+        req = [k for k, v in params.items() if not v.endswith("?")]
+        schema = {"type": "object", "properties": props, "required": req}
+        if fmt == "anthropic":
+            out.append({"name": name, "description": desc, "input_schema": schema})
+        else:
+            out.append({"type": "function", "function": {"name": name, "description": desc, "parameters": schema}})
+    return out
+
+
+def _anthropic_headers() -> dict[str, str]:
+    return {"Content-Type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01"}
+
+
+def _openai_headers() -> dict[str, str]:
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
 
 def _parse_anthropic_response(
@@ -1434,33 +1420,6 @@ def _parse_anthropic_response(
     return "\n".join(text_parts).strip(), tool_calls
 
 
-def _build_openai_tools() -> list[dict[str, Any]]:
-    """Build OpenAI-native function definitions from the TOOLS registry."""
-    result = []
-    for name, (description, params, _) in TOOLS.items():
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for param_name, param_type in params.items():
-            properties[param_name] = {
-                "type": _TYPE_MAP.get(param_type, "string")
-            }
-            if not param_type.endswith("?"):
-                required.append(param_name)
-        result.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
-                },
-            }
-        )
-    return result
 
 
 def _parse_openai_response(
@@ -1523,13 +1482,10 @@ def get_response(
                 + messages,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
-                "tools": _build_openai_tools(),
+                "tools": _build_tool_schemas("openai"),
                 "tool_choice": "auto",
             },
-            {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {API_KEY}",
-            },
+            _openai_headers(),
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
@@ -1544,20 +1500,12 @@ def get_response(
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
             },
-            {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {API_KEY}",
-            },
+            _openai_headers(),
         )
         return str(data["choices"][0]["message"]["content"])
 
     # Anthropic — native tool use API
     if BACKEND == "anthropic":
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-        }
         data = _http_post(
             API_BASE,
             {
@@ -1565,19 +1513,14 @@ def get_response(
                 "system": system_prompt,
                 "messages": messages,
                 "max_tokens": MAX_TOKENS,
-                "tools": _build_anthropic_tools(),
+                "tools": _build_tool_schemas("anthropic"),
             },
-            headers,
+            _anthropic_headers(),
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
     # Local proxy — Anthropic messages API; tool calls returned as XML <tool_call> tags in text
     if BACKEND == "local":
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-        }
         data = _http_post(
             API_BASE,
             {
@@ -1586,7 +1529,7 @@ def get_response(
                 "messages": flat,
                 "max_tokens": MAX_TOKENS,
             },
-            headers,
+            _anthropic_headers(),
         )
         text = "".join(
             b["text"]
@@ -1692,11 +1635,7 @@ def _compact_via_api(history_text: str) -> str:
                 "messages": [{"role": "user", "content": summarise_prompt}],
                 "max_tokens": 512,
             },
-            {
-                "Content-Type": "application/json",
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-            },
+            _anthropic_headers(),
         )
         return "\n".join(
             b["text"]
@@ -1709,19 +1648,13 @@ def _compact_via_api(history_text: str) -> str:
             {
                 "model": MODEL,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant.",
-                    },
+                    {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": summarise_prompt},
                 ],
                 "max_tokens": 512,
                 "temperature": 0.3,
             },
-            {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {API_KEY}",
-            },
+            _openai_headers(),
         )
         return (data["choices"][0]["message"].get("content") or "").strip()
     return ""
