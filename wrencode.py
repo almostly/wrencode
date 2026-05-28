@@ -72,7 +72,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend Configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.1.4.2"
+WRENCODE_VERSION = "0.1.4.3"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
@@ -249,9 +249,7 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 )
 BRIGHT_CYAN = "\033[96m"
 AGENT_TEXT = "\033[38;5;245m"  # muted grey for agent replies (Claude Code-style)
-LOADER_BAR_WIDTH = 18
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-LOADER_STYLE = "context"
 _LOADER_MODEL_MAX = 32
 
 
@@ -280,93 +278,17 @@ def _loader_symbol(step: int) -> str:
     return _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
 
 
-def _frame_context(step: int) -> str:
-    return f"{_loader_symbol(step)} {_loader_context_text()}"
-
-
-def _frame_pull(step: int) -> str:
-    head = "=====>"
-    width = LOADER_BAR_WIDTH
-    max_start = max(0, width - len(head))
-    start = step % (max_start + 1) if max_start else 0
-    inner = [" "] * width
-    for i, ch in enumerate(head):
-        if start + i < width:
-            inner[start + i] = ch
-    return f"[{''.join(inner)}]"
-
-
-def _frame_compose(step: int) -> str:
-    return _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
-
-
-def _frame_dots(step: int) -> str:
-    width = 5
-    pos = step % width
-    return "".join("•" if i == pos else "·" for i in range(width))
-
-
-def _frame_ascii(step: int) -> str:
-    return "|/-\\"[step % 4]
-
-
-def _frame_pulse(step: int) -> str:
-    return "◴◷◶◵"[step % 4]
-
-
-def _frame_wave(step: int) -> str:
-    return "▁▂▃▄▅▆▇█▇▆▅▄▃▂▁"[step % 15]
-
-
-def _frame_off(_step: int) -> str:
-    return ""
-
-
-LOADER_STYLES: dict[str, tuple[str, str, Any]] = {
-    "context": ("Context", "⠋ backend · model · waiting…", _frame_context),
-    "compose": ("Compose", "⠋  Docker Compose spinner", _frame_compose),
-    "pull": ("Pull bar", "[=====>     ]  docker pull slide", _frame_pull),
-    "dots": ("Dots", "· • ·  traveling dot", _frame_dots),
-    "ascii": ("ASCII", "| / - \\  classic spinner", _frame_ascii),
-    "pulse": ("Pulse", "◴ ◷ ◶ ◵  quarter arc", _frame_pulse),
-    "wave": ("Wave", "▁▂▃▄▅  single-char pulse", _frame_wave),
-    "off": ("Off", "no loader", _frame_off),
-}
-
-
-def apply_loader_style(name: str) -> None:
-    global LOADER_STYLE
-    LOADER_STYLE = name if name in LOADER_STYLES else "context"
-
-
 def loader_frame(step: int) -> str:
     """Current loader frame (plain text)."""
-    _, _, frame_fn = LOADER_STYLES.get(LOADER_STYLE, LOADER_STYLES["context"])
-    return frame_fn(step)
+    return _loader_symbol(step)
 
 
 def loader_display(step: int) -> str:
-    if LOADER_STYLE == "context":
-        sym = _loader_symbol(step)
-        text = _loader_context_text()
-        if not colors_enabled():
-            return f"{sym} {text}"
-        return f"{BRIGHT_CYAN}{sym}{RESET} {DIM}{text}{RESET}"
-    raw = loader_frame(step)
-    if not raw or not colors_enabled():
-        return raw
-    return f"{BRIGHT_CYAN}{raw}{RESET}"
-
-
-def sleek_loader_frame(step: int) -> str:
-    """Alias for tests — uses current style."""
-    return loader_frame(step)
-
-
-def init_loader_style() -> None:
-    """Load saved loader style from config."""
-    style = load_config().get("loader_style", "context")
-    apply_loader_style(style)
+    sym = _loader_symbol(step)
+    text = _loader_context_text()
+    if not colors_enabled():
+        return f"{sym} {text}"
+    return f"{BRIGHT_CYAN}{sym}{RESET} {DIM}{text}{RESET}"
 
 
 def colors_enabled() -> bool:
@@ -395,51 +317,6 @@ def print_system(text: str, *, end: str = "\n") -> None:
         sys.stdout.write("\r")
     sys.stdout.write(f"{system_s()}{text}{system_e()}{end}")
     sys.stdout.flush()
-
-
-def _finish_picker(prev_lines: int) -> None:
-    """Clear the arrow picker in place — erase block without scrollback gaps."""
-    sys.stdout.write("\033[?25h")
-    if prev_lines:
-        # \033[M per line injects blank rows at the bottom margin on many terminals.
-        sys.stdout.write(f"\033[{prev_lines}A\r\033[J")
-    sys.stdout.write("\r")
-    sys.stdout.flush()
-
-
-def _split_label_key_desc(label: str) -> tuple[str, str, str]:
-    """Split 'Enter   approve once' into key, spacer, and description."""
-    i = 0
-    while i < len(label) and label[i] != " ":
-        i += 1
-    key = label[:i]
-    tail = label[i:]
-    desc = tail.lstrip()
-    spacer = tail[: len(tail) - len(desc)]
-    return key, spacer, desc
-
-
-def format_picker_option(
-    mark: str,
-    text: str,
-    *,
-    selected: bool,
-    system_key_only: bool = False,
-) -> str:
-    """Format one picker row; selected row is bold cyan."""
-    if not colors_enabled():
-        return f"{mark}{text}"
-    if system_key_only:
-        key, spacer, desc = _split_label_key_desc(text)
-        key_style = (
-            f"{BOLD}{BRIGHT_CYAN}{key}{RESET}"
-            if selected
-            else f"{BRIGHT_CYAN}{key}{RESET}"
-        )
-        return f"{mark}{key_style}{spacer}{desc}"
-    if selected:
-        return f"{BOLD}{BRIGHT_CYAN}{mark}{text}{RESET}"
-    return f"{mark}{text}"
 
 
 _INPUT_HISTORY: list[str] = []
@@ -1320,7 +1197,7 @@ def format_user_turn_line(user_input: str) -> str:
 @contextlib.contextmanager
 def thinking_spinner() -> Any:
     """Loader on the line below the user's input (style from /loader)."""
-    if not sys.stdout.isatty() or LOADER_STYLE == "off":
+    if not sys.stdout.isatty():
         yield
         return
 
@@ -2138,15 +2015,11 @@ def handle_slash_command(
     if cmd == "/model" or cmd.startswith("/model "):
         model_id = cmd[7:].strip() if cmd.startswith("/model ") else ""
         return "handled", switch_model_runtime(model_id)
-    if cmd == "/loader":
-        pick_loader_style()
-        return "handled", _MLX_UNCHANGED
     if cmd == "/help":
         print_system("/c — clear  /compact — summarize  /q — quit")
         print_system(
             "/backend — switch backend (↑↓)  /model — switch model (↑↓)"
         )
-        print_system("/loader — pick loading animation (↑↓)")
         print_system("/model <id> — set model directly  /configure — same as /backend")
         return "handled", _MLX_UNCHANGED
     return None, _MLX_UNCHANGED
@@ -2203,222 +2076,32 @@ def available_backends() -> list[str]:
     return out
 
 
-PICKER_WINDOW = 14
-
-
-def _read_arrow_key(fd: int) -> str:
-    """Read a single key in raw mode; arrows return up/down/left/right."""
-    ch = os.read(fd, 1).decode("utf-8", errors="replace")
-    if ch == "\x1b":
-        if select.select([fd], [], [], 0.04)[0]:
-            rest = os.read(fd, 2)
-            if rest == b"[A":
-                return "up"
-            if rest == b"[B":
-                return "down"
-            if rest == b"[C":
-                return "right"
-            if rest == b"[D":
-                return "left"
-        return "esc"
-    if ch in "\r\n":
-        return "enter"
-    if ch == "\t":
-        return "tab"
-    if ch == "\x03":
-        return "ctrl_c"
-    if ch in ("q", "Q"):
-        return "esc"
-    if len(ch) == 1 and ch.isprintable():
-        return ch
-    return "other"
-
-
-def _pick_from_list_fallback(
-    title: str,
-    options: list[str],
-    labels: list[str],
-    initial_index: int,
-    system_key_only: bool = False,
-) -> Optional[int]:
-    print()
-    if title:
-        print_system(title)
-        print()
-    for i, label in enumerate(labels, 1):
-        sel = i - 1 == initial_index
-        mark = "> " if sel else "  "
-        sys.stdout.write(
-            format_picker_option(
-                mark, f"{i}. {label}", selected=sel, system_key_only=system_key_only
-            )
-            + "\n"
-        )
-    sys.stdout.flush()
-    default = str(initial_index + 1)
-    while True:
-        raw = input(f"{BLUE}❯{RESET} number [{default}]: ").strip() or default
-        if raw.isdigit() and 1 <= int(raw) <= len(options):
-            return int(raw) - 1
-        print(f"{RED}Enter a number between 1 and {len(options)}.{RESET}")
-
-
-def _pick_from_list_arrows(
-    title: str,
-    options: list[str],
-    labels: list[str],
-    initial_index: int,
-    system_key_only: bool = False,
-    direct_keys: Optional[dict[str, int]] = None,
-    expand_index: Optional[int] = None,
-    reject_keys: Optional[set[str]] = None,
-    hint: Optional[str] = None,
-) -> Optional[int]:
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    selected = max(0, min(initial_index, len(options) - 1))
-    chosen: Optional[int] = selected
-    prev_lines = 0
-    try:
-        tty.setraw(fd)
-        sys.stdout.write("\033[?25l")
-        sys.stdout.flush()
-        while True:
-            window = PICKER_WINDOW
-            start = max(0, min(selected - window // 2, max(0, len(options) - window)))
-            end = min(len(options), start + window)
-            if end - start < window:
-                start = max(0, end - window)
-
-            lines = []
-            if hint:
-                lines.append(f"{DIM}{hint}{RESET}")
-            elif direct_keys:
-                shortcuts = " · ".join(sorted(direct_keys))
-                lines.append(
-                    f"{DIM}↑↓ move · Enter select · {shortcuts} shortcut · Esc cancel{RESET}"
-                )
-            else:
-                lines.append(f"{DIM}↑↓ move · Enter select · Esc cancel{RESET}")
-            if title:
-                lines.insert(0, f"{system_s()}{title}{system_e()}")
-            if start > 0:
-                lines.append(f"{DIM}  … {start} more above{RESET}")
-            for i in range(start, end):
-                mark = "▸ " if i == selected else "  "
-                lines.append(
-                    format_picker_option(
-                        mark,
-                        labels[i],
-                        selected=(i == selected),
-                        system_key_only=system_key_only,
-                    )
-                )
-            if end < len(options):
-                lines.append(f"{DIM}  … {len(options) - end} more below{RESET}")
-
-            if prev_lines:
-                sys.stdout.write(f"\033[{prev_lines}A")
-            for line in lines:
-                sys.stdout.write("\r\033[K" + line + "\n")
-            sys.stdout.flush()
-            prev_lines = len(lines)
-
-            key = _read_arrow_key(fd)
-            if key == "up":
-                selected = (selected - 1) % len(options)
-            elif key == "down":
-                selected = (selected + 1) % len(options)
-            elif key == "left":
-                continue
-            elif reject_keys and key in reject_keys:
-                continue
-            elif direct_keys and key in direct_keys:
-                chosen = direct_keys[key]
-                break
-            elif key in ("right", "tab"):
-                chosen = selected
-                break
-            elif key == "enter":
-                if expand_index is not None and selected == expand_index:
-                    continue
-                chosen = selected
-                break
-            elif key in ("esc", "ctrl_c"):
-                chosen = None
-                break
-    finally:
-        _finish_picker(prev_lines)
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    return chosen
-
-
 def pick_from_list(
     title: str,
     options: list[str],
     *,
     labels: Optional[list[str]] = None,
     initial_index: int = 0,
-    system_key_only: bool = False,
-    direct_keys: Optional[dict[str, int]] = None,
-    expand_index: Optional[int] = None,
-    reject_keys: Optional[set[str]] = None,
-    hint: Optional[str] = None,
+    **_kwargs: Any,
 ) -> Optional[int]:
-    """Pick one option with ↑↓ arrows (or numbered fallback when not a TTY)."""
+    """Pick one option from a numbered list."""
     if not options:
         print(f"{YELLOW}No options available.{RESET}")
         return None
     labels = labels if labels is not None else options
     initial_index = max(0, min(initial_index, len(options) - 1))
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        return _pick_from_list_arrows(
-            title,
-            options,
-            labels,
-            initial_index,
-            system_key_only,
-            direct_keys,
-            expand_index,
-            reject_keys,
-            hint,
-        )
-    return _pick_from_list_fallback(
-        title, options, labels, initial_index, system_key_only
-    )
-
-
-def pick_loader_style() -> None:
-    """Interactive picker for /loader."""
-    ids = list(LOADER_STYLES.keys())
-    labels = [f"{LOADER_STYLES[i][0]}  —  {LOADER_STYLES[i][1]}" for i in ids]
-    initial = ids.index(LOADER_STYLE) if LOADER_STYLE in ids else 0
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print_system("Loader styles: " + ", ".join(ids))
-        return
-    idx = pick_from_list(
-        "Choose loader style",
-        ids,
-        labels=labels,
-        initial_index=initial,
-    )
-    if idx is None:
-        print_system("Cancelled.")
-        return
-    choice = ids[idx]
-    apply_loader_style(choice)
-    save_config({**load_config(), "loader_style": choice})
-    name = LOADER_STYLES[choice][0]
-    print_system(f"✓ Loader → {name}")
-    if choice != "off":
-        for i in range(8):
-            sys.stdout.write(f"\r  preview  {loader_display(i)}")
-            sys.stdout.flush()
-            time.sleep(0.07)
-        sys.stdout.write("\r\033[2K\n")
+    print()
+    if title:
+        print_system(title)
+        print()
+    for i, label in enumerate(labels, 1):
+        print(f"  {BOLD if i - 1 == initial_index else ''}{i}. {label}{RESET if i - 1 == initial_index else ''}")
+    default = str(initial_index + 1)
+    while True:
+        raw = input(f"{BLUE}❯{RESET} number [{default}]: ").strip() or default
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        print(f"{RED}Enter a number between 1 and {len(options)}.{RESET}")
 
 
 def fetch_openrouter_models() -> list[str]:
@@ -2794,7 +2477,7 @@ def print_help() -> None:
     print("  --yes           auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("  --version, -V   print version and exit")
     print("  --help, -h      show this help\n")
-    print("Slash commands: /backend /model /loader /c /compact /q  (see /help in session)")
+    print("Slash commands: /backend /model /c /compact /q  (see /help in session)")
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
         "(e.g. ANTHROPIC_API_KEY) take precedence over saved config."
@@ -2823,7 +2506,6 @@ def main() -> None:
         "WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve())
     )
     resolve_configuration(force_chooser=force)
-    init_loader_style()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(WREN_BANNER)

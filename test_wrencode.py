@@ -154,61 +154,25 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn("\033[1m", out)
         self.assertIn("Cleared", strip_ansi(out))
 
-    def test_loading_bar_frame(self):
-        wrencode.apply_loader_style("pull")
-        bar = wrencode.loader_frame(0)
-        self.assertTrue(bar.startswith("[") and bar.endswith("]"))
-        self.assertIn(">", bar)
-        wrencode.apply_loader_style("context")
-        self.assertIn("waiting", wrencode.loader_frame(0))
-
-    def test_apply_loader_style(self):
-        wrencode.apply_loader_style("dots")
-        self.assertEqual(wrencode.LOADER_STYLE, "dots")
-        self.assertIn("•", wrencode.loader_frame(0))
-        wrencode.apply_loader_style("context")
+    def test_loader_frame_returns_braille_symbol(self):
+        frame = wrencode.loader_frame(0)
+        self.assertIn(frame, wrencode._COMPOSE_FRAMES)
 
     def test_context_loader_frame(self):
         with mock.patch.object(wrencode, "BACKEND", "anthropic"), mock.patch.object(
             wrencode, "MODEL", "claude-sonnet-4-20250514"
         ):
-            wrencode.apply_loader_style("context")
-            plain = wrencode.loader_frame(0)
-            self.assertIn("anthropic", plain)
-            self.assertIn("claude-sonnet", plain)
-            self.assertIn("waiting", plain)
-            self.assertTrue(plain[0] in wrencode._COMPOSE_FRAMES)
-        wrencode.apply_loader_style("context")
+            plain = wrencode.loader_display(0)
+            self.assertIn("anthropic", strip_ansi(plain))
+            self.assertIn("claude-sonnet", strip_ansi(plain))
+            self.assertIn("waiting", strip_ansi(plain))
 
     def test_loader_display_gradient(self):
-        wrencode.apply_loader_style("context")
         with mock.patch.object(wrencode, "colors_enabled", return_value=True):
             out = wrencode.loader_display(0)
         self.assertIn("\033[96m", out)
         self.assertIn("\033[2m", out)
         self.assertIn("waiting", strip_ansi(out))
-
-    def test_format_picker_option_selected_is_bold(self):
-        with mock.patch.object(wrencode, "colors_enabled", return_value=True):
-            selected = wrencode.format_picker_option(
-                "▸ ", "Anthropic  [claude]", selected=True
-            )
-            plain = wrencode.format_picker_option(
-                "  ", "OpenAI  [gpt]", selected=False
-            )
-            menu = wrencode.format_picker_option(
-                "▸ ",
-                "Enter   approve once",
-                selected=True,
-                system_key_only=True,
-            )
-        self.assertIn("\033[1m", selected)
-        self.assertNotIn("\033[1m", plain)
-        self.assertNotIn("\033[96m", plain)
-        self.assertIn("Enter", strip_ansi(menu))
-        self.assertIn("approve once", strip_ansi(menu))
-        self.assertIn("\033[96m", menu)
-        self.assertNotIn(f"{wrencode.BRIGHT_CYAN}approve", menu)
 
     def test_format_input_line_slash_is_bold_cyan(self):
         with mock.patch.object(wrencode, "colors_enabled", return_value=True):
@@ -302,28 +266,6 @@ class TestConfirm(unittest.TestCase):
                 "cancelled: user interrupted",
             )
 
-    def test_arrow_key_right_is_not_escape(self):
-        fd = 0
-        reads = [b"\x1b", b"[C"]
-
-        def fake_read(f, n):
-            self.assertEqual(f, fd)
-            return reads.pop(0)
-
-        with mock.patch("select.select", return_value=([fd], [], [])), mock.patch(
-            "os.read", side_effect=fake_read
-        ):
-            self.assertEqual(wrencode._read_arrow_key(fd), "right")
-
-    def test_arrow_key_n_returns_char(self):
-        with mock.patch("os.read", return_value=b"n"):
-            self.assertEqual(wrencode._read_arrow_key(0), "n")
-
-    def test_arrow_key_tab(self):
-        with mock.patch("os.read", return_value=b"\t"):
-            self.assertEqual(wrencode._read_arrow_key(0), "tab")
-
-
 class TestChooseBackendInteractive(unittest.TestCase):
 
     def setUp(self):
@@ -393,16 +335,11 @@ class TestModelPicker(unittest.TestCase):
         self.assertIn("claude-haiku-4-5-20251001", models)
         self.assertIn(wrencode.CUSTOM_MODEL_OPTION, models)
 
-    def test_pick_from_list_fallback(self):
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: False
-        try:
-            with mock.patch("builtins.input", return_value="2"):
-                idx = wrencode.pick_from_list(
-                    "Pick", ["a", "b", "c"], labels=["A", "B", "C"]
-                )
-        finally:
-            sys.stdin.isatty = orig_isatty
+    def test_pick_from_list_numbered(self):
+        with mock.patch("builtins.input", return_value="2"):
+            idx = wrencode.pick_from_list(
+                "Pick", ["a", "b", "c"], labels=["A", "B", "C"]
+            )
         self.assertEqual(idx, 1)
 
     def test_switch_model_direct_id(self):
