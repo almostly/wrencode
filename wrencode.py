@@ -222,7 +222,7 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
 # -----------------------------------------------------------------------------------------------
 # Constants & Environment Variables
 # -----------------------------------------------------------------------------------------------
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 MAX_READ_BYTES = int(os.environ.get("MAX_READ_BYTES", str(4 * 1024 * 1024)))
 MAX_READ_LINES = int(os.environ.get("MAX_READ_LINES", "800"))
 GREP_MAX = int(os.environ.get("GREP_MAX_MATCHES", "80"))
@@ -600,7 +600,9 @@ def read(args: dict[str, Any]) -> str:
 def write(args: dict[str, Any]) -> str:
     """Write content to a file, creating parent directories as needed."""
     path = resolve_tool_path(_require_str(args, "path"))
-    content = args.get("content", "")
+    if "content" not in args:
+        return "error: 'content' is required (model response may have been truncated; raise MAX_TOKENS)"
+    content = args["content"]
     approval = confirm("write")
     if approval != "ok":
         return approval
@@ -1276,8 +1278,31 @@ def _openai_headers() -> dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
 
+def _warn_if_truncated(data: dict[str, Any]) -> None:
+    """Print a stderr warning if the API truncated the response at max_tokens.
+    A truncated `tool_use` may be missing required fields (e.g. `content` for
+    `write`), so callers need to know to raise MAX_TOKENS rather than silently
+    treating an empty operation as success.
+    """
+    if BACKEND == "anthropic":
+        truncated = data.get("stop_reason") == "max_tokens"
+        out_tokens = data.get("usage", {}).get("output_tokens")
+    else:
+        finish = (data.get("choices") or [{}])[0].get("finish_reason")
+        truncated = finish == "length"
+        out_tokens = data.get("usage", {}).get("completion_tokens")
+    if truncated:
+        print(
+            f"{YELLOW}Warning: response truncated at MAX_TOKENS={MAX_TOKENS} "
+            f"(output_tokens={out_tokens}). Tool calls may be incomplete — "
+            f"raise MAX_TOKENS and retry.{RESET}",
+            file=sys.stderr,
+        )
+
+
 def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]:
     """Parse a native (Anthropic / OpenAI) API response into display text and tool calls."""
+    _warn_if_truncated(data)
     if BACKEND == "anthropic":
         blocks = data.get("content", [])
         text = "\n".join(b["text"] for b in blocks if b.get("type") == "text").strip()

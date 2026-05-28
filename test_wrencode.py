@@ -5,6 +5,7 @@ Run (from the repo root — stdlib only, no extra deps):
     # or:  python test_wrencode.py
 """
 
+import io
 import json
 import os
 import pathlib
@@ -731,6 +732,14 @@ class TestFileTools(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertTrue(pathlib.Path(self._tmp, "hello.txt").exists())
 
+    def test_write_errors_when_content_missing(self):
+        # Guards against the MAX_TOKENS-truncation failure mode where the
+        # model emits a tool_use block with `path` but no `content`. Returning
+        # an error lets _track_error halt the loop after a few retries.
+        result = wrencode.write({"path": "hello.txt"})
+        self.assertTrue(result.startswith("error:"))
+        self.assertFalse(pathlib.Path(self._tmp, "hello.txt").exists())
+
     def test_read_returns_content_with_line_numbers(self):
         wrencode.write({"path": "hello.txt", "content": "line one\nline two"})
         result = wrencode.read({"path": "hello.txt"})
@@ -1028,6 +1037,42 @@ class TestFlattenContent(unittest.TestCase):
         result = wrencode.flatten_content(content)
         self.assertIn("part1", result)
         self.assertIn("part2", result)
+
+
+class TestTruncationWarning(unittest.TestCase):
+    """Cover _warn_if_truncated — the safety net for max_tokens-truncated tool calls."""
+
+    def _capture_stderr(self, fn, *args, **kwargs):
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            fn(*args, **kwargs)
+        return buf.getvalue()
+
+    def test_anthropic_warns_on_max_tokens_stop_reason(self):
+        data = {
+            "stop_reason": "max_tokens",
+            "usage": {"output_tokens": 4096},
+            "content": [],
+        }
+        with mock.patch.object(wrencode, "BACKEND", "anthropic"):
+            out = self._capture_stderr(wrencode._warn_if_truncated, data)
+        self.assertIn("truncated", out.lower())
+        self.assertIn("4096", out)
+
+    def test_anthropic_silent_on_tool_use_stop_reason(self):
+        data = {"stop_reason": "tool_use", "usage": {"output_tokens": 500}, "content": []}
+        with mock.patch.object(wrencode, "BACKEND", "anthropic"):
+            out = self._capture_stderr(wrencode._warn_if_truncated, data)
+        self.assertEqual(out, "")
+
+    def test_openai_warns_on_length_finish_reason(self):
+        data = {
+            "choices": [{"finish_reason": "length", "message": {}}],
+            "usage": {"completion_tokens": 4096},
+        }
+        with mock.patch.object(wrencode, "BACKEND", "openai"):
+            out = self._capture_stderr(wrencode._warn_if_truncated, data)
+        self.assertIn("truncated", out.lower())
 
 
 class TestRunTool(unittest.TestCase):
