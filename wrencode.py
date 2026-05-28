@@ -1276,47 +1276,25 @@ def _openai_headers() -> dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
 
-def _parse_anthropic_response(
-    data: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Parse Anthropic API response into display text and tool_use blocks."""
-    text_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
-    for block in data.get("content", []):
-        if block.get("type") == "text":
-            text_parts.append(block["text"])
-        elif block.get("type") == "tool_use":
-            tool_calls.append(
-                {
-                    "type": "tool_use",
-                    "id": block["id"],
-                    "name": block["name"],
-                    "input": block.get("input", {}),
-                }
-            )
-    return "\n".join(text_parts).strip(), tool_calls
-
-
-
-
-def _parse_openai_response(
-    data: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Parse OpenAI API response into display text and tool_call blocks."""
-    message = data["choices"][0]["message"]
-    display_text = message.get("content") or ""
-    tool_calls: list[dict[str, Any]] = []
-    for tc in message.get("tool_calls") or []:
+def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]:
+    """Parse a native (Anthropic / OpenAI) API response into display text and tool calls."""
+    if BACKEND == "anthropic":
+        blocks = data.get("content", [])
+        text = "\n".join(b["text"] for b in blocks if b.get("type") == "text").strip()
+        calls = [
+            ToolCall(b["id"], b["name"], b.get("input", {}))
+            for b in blocks if b.get("type") == "tool_use"
+        ]
+        return text, calls
+    msg = data["choices"][0]["message"]
+    text = (msg.get("content") or "").strip()
+    calls = []
+    for tc in msg.get("tool_calls") or []:
         with contextlib.suppress(Exception):
-            tool_calls.append(
-                {
-                    "type": "tool_use",
-                    "id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "input": json.loads(tc["function"]["arguments"]),
-                }
-            )
-    return display_text.strip(), tool_calls
+            calls.append(ToolCall(
+                tc["id"], tc["function"]["name"], json.loads(tc["function"]["arguments"])
+            ))
+    return text, calls
 
 
 @dataclass
@@ -1336,17 +1314,12 @@ def _parse_response(
     """
     if BACKEND in NATIVE_TOOL_BACKENDS:
         data = json.loads(response_text)
-        if BACKEND == "anthropic":
-            text, calls_raw = _parse_anthropic_response(data)
-        else:
-            text, calls_raw = _parse_openai_response(data)
-        calls = [ToolCall(tc["id"], tc["name"], tc["input"]) for tc in calls_raw]
+        text, calls = _parse_native_response(data)
         return text, calls, data
     text = re.sub(
         r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
     ).strip()
-    calls_raw = parse_tool_calls(response_text)
-    calls = [ToolCall(tc["id"], tc["name"], tc["input"]) for tc in calls_raw]
+    calls = [ToolCall(tc["id"], tc["name"], tc["input"]) for tc in parse_tool_calls(response_text)]
     return text, calls, None
 
 
@@ -1375,17 +1348,12 @@ def _append_tool_results(
     results: list[tuple[ToolCall, str]],
 ) -> None:
     """Append tool results to message history in the correct format."""
-    if BACKEND == "anthropic":
-        messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tc.id, "content": r}
-            for tc, r in results
-        ]})
-    elif BACKEND == "openai":
+    if BACKEND == "openai":
         messages.extend(
             {"role": "tool", "tool_call_id": tc.id, "content": r}
             for tc, r in results
         )
-    else:  # XML path
+    else:  # anthropic + XML path both use tool_result blocks
         messages.append({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": tc.id, "content": r}
             for tc, r in results
@@ -1567,47 +1535,6 @@ def save_history(messages: list[dict[str, Any]]) -> None:
             json.dump(messages, f)
 
 
-def _compact_via_api(history_text: str) -> str:
-    """Call the active API backend to summarise history_text and return the summary."""
-    summarise_prompt = (
-        "Summarize this conversation in 3-5 concise bullet points, "
-        "preserving any file paths, code decisions, or unresolved tasks:\n\n"
-        + history_text
-    )
-    if BACKEND == "anthropic":
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "system": "You are a helpful assistant.",
-                "messages": [{"role": "user", "content": summarise_prompt}],
-                "max_tokens": 512,
-            },
-            _anthropic_headers(),
-        )
-        return "\n".join(
-            b["text"]
-            for b in data.get("content", [])
-            if b.get("type") == "text"
-        ).strip()
-    if BACKEND in {"openai", "openrouter"}:
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": summarise_prompt},
-                ],
-                "max_tokens": 512,
-                "temperature": 0.3,
-            },
-            _openai_headers(),
-        )
-        return (data["choices"][0]["message"].get("content") or "").strip()
-    return ""
-
-
 def compact_messages(
     messages: list[dict[str, Any]],
     model: Any,
@@ -1621,7 +1548,32 @@ def compact_messages(
     )
 
     if BACKEND in API_BACKENDS:
-        summary = _compact_via_api(history_text)
+        prompt = (
+            "Summarize this conversation in 3-5 concise bullet points, "
+            "preserving any file paths, code decisions, or unresolved tasks:\n\n"
+            + history_text
+        )
+        if BACKEND == "anthropic":
+            data = _http_post(API_BASE, {
+                "model": MODEL,
+                "system": "You are a helpful assistant.",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 512,
+            }, _anthropic_headers())
+            summary = "\n".join(
+                b["text"] for b in data.get("content", []) if b.get("type") == "text"
+            ).strip()
+        else:  # openai / openrouter
+            data = _http_post(API_BASE, {
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 512,
+                "temperature": 0.3,
+            }, _openai_headers())
+            summary = (data["choices"][0]["message"].get("content") or "").strip()
     else:
         # MLX / Transformers path
         prompt = tokenizer.apply_chat_template(
