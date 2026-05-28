@@ -33,6 +33,7 @@ THE SOFTWARE.
 
 import contextlib
 import ast
+from dataclasses import dataclass
 import getpass
 import glob as globlib
 import json
@@ -1318,6 +1319,79 @@ def _parse_openai_response(
     return display_text.strip(), tool_calls
 
 
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
+def _parse_response(
+    response_text: str,
+) -> tuple[str, list[ToolCall], Any]:
+    """Parse a raw API response into (display_text, tool_calls, raw_data).
+
+    raw_data is the decoded JSON for native backends (used when appending to
+    history); None for XML backends.
+    """
+    if BACKEND in NATIVE_TOOL_BACKENDS:
+        data = json.loads(response_text)
+        if BACKEND == "anthropic":
+            text, calls_raw = _parse_anthropic_response(data)
+        else:
+            text, calls_raw = _parse_openai_response(data)
+        calls = [ToolCall(tc["id"], tc["name"], tc["input"]) for tc in calls_raw]
+        return text, calls, data
+    text = re.sub(
+        r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
+    ).strip()
+    calls_raw = parse_tool_calls(response_text)
+    calls = [ToolCall(tc["id"], tc["name"], tc["input"]) for tc in calls_raw]
+    return text, calls, None
+
+
+def _append_assistant(
+    messages: list[dict[str, Any]],
+    text: str,
+    tool_calls: list[ToolCall],
+    raw_data: Any,
+) -> None:
+    """Append the assistant turn to message history in the correct format."""
+    if BACKEND == "anthropic":
+        messages.append({"role": "assistant", "content": raw_data.get("content", [])})
+    elif BACKEND == "openai":
+        messages.append(raw_data["choices"][0]["message"])  # preserve tool_calls
+    else:  # XML path
+        blocks: list[dict[str, Any]] = (
+            [{"type": "text", "text": text}] if text else []
+        )
+        for tc in tool_calls:
+            blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input})
+        messages.append({"role": "assistant", "content": blocks})
+
+
+def _append_tool_results(
+    messages: list[dict[str, Any]],
+    results: list[tuple[ToolCall, str]],
+) -> None:
+    """Append tool results to message history in the correct format."""
+    if BACKEND == "anthropic":
+        messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tc.id, "content": r}
+            for tc, r in results
+        ]})
+    elif BACKEND == "openai":
+        messages.extend(
+            {"role": "tool", "tool_call_id": tc.id, "content": r}
+            for tc, r in results
+        )
+    else:  # XML path
+        messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tc.id, "content": r}
+            for tc, r in results
+        ]})
+
+
 # -----------------------------------------------------------------------------------------------
 # HTTP Helper
 # -----------------------------------------------------------------------------------------------
@@ -1674,99 +1748,28 @@ def run_agent_turn(
                 response_text = get_response_cancellable(
                     messages, system_prompt, mlx_state
                 )
-
-            # Anthropic & OpenAI native tool use path
-            if BACKEND in NATIVE_TOOL_BACKENDS:
-                data = json.loads(response_text)
-                if BACKEND == "anthropic":
-                    display_text, tool_calls = _parse_anthropic_response(data)
-                else:
-                    display_text, tool_calls = _parse_openai_response(data)
-                if display_text:
-                    print_agent_message(display_text)
-                if BACKEND == "anthropic":
-                    messages.append(
-                        {"role": "assistant", "content": data.get("content", [])}
-                    )
-                else:
-                    messages.append(
-                        data["choices"][0]["message"]
-                    )  # preserve tool_calls exactly
-                if not tool_calls:
-                    break
-                tool_results: list[dict[str, Any]] = []
-                stop_due_to_repeated_error = False
-                for tc in tool_calls:
-                    check_cancelled()
-                    print_tool_action(tc["name"], tc["input"])
-                    result = run_tool(tc["name"], tc["input"])
-                    print_tool_result(result)
-                    if BACKEND == "anthropic":
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tc["id"],
-                                "content": result,
-                            }
-                        )
-                    else:
-                        tool_results.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            }
-                        )
-                    last_tool_error, repeated_tool_error_count, stop_due_to_repeated_error = (
-                        _track_error(result, last_tool_error, repeated_tool_error_count)
-                    )
-                    if stop_due_to_repeated_error:
-                        break
-                if BACKEND == "anthropic":
-                    messages.append({"role": "user", "content": tool_results})
-                else:
-                    messages.extend(tool_results)
-                if stop_due_to_repeated_error:
-                    break
-                continue
-
-            # XML tool call path (mlx, transformers, openrouter, local)
-            xml_tool_calls = parse_tool_calls(response_text)
-            display_text = re.sub(
-                r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
-            ).strip()
-
+            display_text, tool_calls, raw_data = _parse_response(response_text)
             if display_text:
                 print_agent_message(display_text)
-
-            content_blocks: list[dict[str, Any]] = (
-                [{"type": "text", "text": display_text}] if display_text else []
-            )
-            xml_tool_results: list[dict[str, Any]] = []
-            stop_due_to_repeated_error = False
-            for tc in xml_tool_calls:
+            _append_assistant(messages, display_text, tool_calls, raw_data)
+            if not tool_calls:
+                break
+            results: list[tuple[ToolCall, str]] = []
+            stop = False
+            for tc in tool_calls:
                 check_cancelled()
-                print_tool_action(tc["name"], tc["input"])
-                result = run_tool(tc["name"], tc["input"])
+                print_tool_action(tc.name, tc.input)
+                result = run_tool(tc.name, tc.input)
                 print_tool_result(result)
-                xml_tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tc["id"],
-                        "content": result,
-                    }
-                )
-                content_blocks.append(tc)
-                last_tool_error, repeated_tool_error_count, stop_due_to_repeated_error = (
+                results.append((tc, result))
+                last_tool_error, repeated_tool_error_count, stop = (
                     _track_error(result, last_tool_error, repeated_tool_error_count)
                 )
-                if stop_due_to_repeated_error:
+                if stop:
                     break
-
-            messages.append({"role": "assistant", "content": content_blocks})
-            if stop_due_to_repeated_error or not xml_tool_results:
+            _append_tool_results(messages, results)
+            if stop:
                 break
-            messages.append({"role": "user", "content": xml_tool_results})
     except (UserCancelled, KeyboardInterrupt):
         print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
     finally:
