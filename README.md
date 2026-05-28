@@ -247,4 +247,6 @@ MIT - Copyright 2026 Almostly.
 
 -----
 
-![Almostly](assets/almostly-badge.svg)
+<p align="center">
+  <img src="assets/almostly-badge.svg" alt="Almostly" />
+</p>
