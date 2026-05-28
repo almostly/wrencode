@@ -40,6 +40,7 @@ import os
 import pathlib
 import platform
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -123,7 +124,36 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
-# Backend capability groups, derived from the registry where possible.
+# Curated model lists for arrow-key pickers (OpenRouter/Ollama are fetched live).
+BACKEND_MODELS: dict[str, list[str]] = {
+    "anthropic": [
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-5-haiku-latest",
+        "claude-3-5-sonnet-latest",
+    ],
+    "openai": [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4-turbo",
+        "o1-mini",
+        "o1",
+    ],
+    "openrouter": [
+        "anthropic/claude-3-haiku",
+        "anthropic/claude-3.5-sonnet",
+        "openai/gpt-4o-mini",
+        "google/gemini-flash-1.5",
+        "meta-llama/llama-3.1-8b-instruct",
+    ],
+    "local": ["gpt-oss-20b"],
+    "transformers": ["deburky/gpt-oss-claude-code"],
+    "mlx": ["deburky/gpt-oss-claude-mlx"],
+}
+
+CUSTOM_MODEL_OPTION = "— type a custom model id —"
+_MLX_UNCHANGED = object()
 API_BACKENDS: frozenset[str] = frozenset(
     name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "api"
 )
@@ -136,6 +166,7 @@ CONFIG_DIR = pathlib.Path(
     os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
 ).expanduser()
 CONFIG_FILE = CONFIG_DIR / "config.json"
+OPENROUTER_MODELS_CACHE = CONFIG_DIR / "openrouter_models.json"
 
 # Populated by apply_backend() once configuration is resolved (see resolve_configuration).
 BACKEND = ""
@@ -217,9 +248,442 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
     "\033[31m",
 )
 BRIGHT_CYAN = "\033[96m"
+AGENT_TEXT = "\033[38;5;245m"  # muted grey for agent replies (Claude Code-style)
+LOADER_BAR_WIDTH = 18
+_COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+LOADER_STYLE = "context"
+_LOADER_MODEL_MAX = 32
 
-WREN_BANNER = f"""{BRIGHT_CYAN}
-\u2588\u2588     \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588    \u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588
+
+def _loader_backend_label() -> str:
+    if BACKEND:
+        return BACKEND
+    return "backend"
+
+
+def _loader_model_label() -> str:
+    if not MODEL:
+        return "model"
+    if len(MODEL) <= _LOADER_MODEL_MAX:
+        return MODEL
+    keep = _LOADER_MODEL_MAX - 1
+    head = max(8, keep // 2)
+    tail = keep - head
+    return f"{MODEL[:head]}…{MODEL[-tail:]}"
+
+
+def _loader_context_text() -> str:
+    return f"{_loader_backend_label()} · {_loader_model_label()} · waiting…"
+
+
+def _loader_symbol(step: int) -> str:
+    return _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
+
+
+def _frame_context(step: int) -> str:
+    return f"{_loader_symbol(step)} {_loader_context_text()}"
+
+
+def _frame_pull(step: int) -> str:
+    head = "=====>"
+    width = LOADER_BAR_WIDTH
+    max_start = max(0, width - len(head))
+    start = step % (max_start + 1) if max_start else 0
+    inner = [" "] * width
+    for i, ch in enumerate(head):
+        if start + i < width:
+            inner[start + i] = ch
+    return f"[{''.join(inner)}]"
+
+
+def _frame_compose(step: int) -> str:
+    return _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
+
+
+def _frame_dots(step: int) -> str:
+    width = 5
+    pos = step % width
+    return "".join("•" if i == pos else "·" for i in range(width))
+
+
+def _frame_ascii(step: int) -> str:
+    return "|/-\\"[step % 4]
+
+
+def _frame_pulse(step: int) -> str:
+    return "◴◷◶◵"[step % 4]
+
+
+def _frame_wave(step: int) -> str:
+    return "▁▂▃▄▅▆▇█▇▆▅▄▃▂▁"[step % 15]
+
+
+def _frame_off(_step: int) -> str:
+    return ""
+
+
+LOADER_STYLES: dict[str, tuple[str, str, Any]] = {
+    "context": ("Context", "⠋ backend · model · waiting…", _frame_context),
+    "compose": ("Compose", "⠋  Docker Compose spinner", _frame_compose),
+    "pull": ("Pull bar", "[=====>     ]  docker pull slide", _frame_pull),
+    "dots": ("Dots", "· • ·  traveling dot", _frame_dots),
+    "ascii": ("ASCII", "| / - \\  classic spinner", _frame_ascii),
+    "pulse": ("Pulse", "◴ ◷ ◶ ◵  quarter arc", _frame_pulse),
+    "wave": ("Wave", "▁▂▃▄▅  single-char pulse", _frame_wave),
+    "off": ("Off", "no loader", _frame_off),
+}
+
+
+def apply_loader_style(name: str) -> None:
+    global LOADER_STYLE
+    LOADER_STYLE = name if name in LOADER_STYLES else "context"
+
+
+def loader_frame(step: int) -> str:
+    """Current loader frame (plain text)."""
+    _, _, frame_fn = LOADER_STYLES.get(LOADER_STYLE, LOADER_STYLES["context"])
+    return frame_fn(step)
+
+
+def loader_display(step: int) -> str:
+    if LOADER_STYLE == "context":
+        sym = _loader_symbol(step)
+        text = _loader_context_text()
+        if not colors_enabled():
+            return f"{sym} {text}"
+        return f"{BRIGHT_CYAN}{sym}{RESET} {DIM}{text}{RESET}"
+    raw = loader_frame(step)
+    if not raw or not colors_enabled():
+        return raw
+    return f"{BRIGHT_CYAN}{raw}{RESET}"
+
+
+def sleek_loader_frame(step: int) -> str:
+    """Alias for tests — uses current style."""
+    return loader_frame(step)
+
+
+def init_loader_style() -> None:
+    """Load saved loader style from config."""
+    style = load_config().get("loader_style", "context")
+    apply_loader_style(style)
+
+
+def colors_enabled() -> bool:
+    """True when ANSI styling should be applied."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty()
+
+
+def system_s() -> str:
+    """Opening ANSI sequence for system / slash-command text (banner cyan)."""
+    if not colors_enabled():
+        return ""
+    return f"{BOLD}{BRIGHT_CYAN}"
+
+
+def system_e() -> str:
+    return RESET if colors_enabled() else ""
+
+
+def print_system(text: str, *, end: str = "\n") -> None:
+    """Print slash-command / configure feedback in banner cyan."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r")
+    sys.stdout.write(f"{system_s()}{text}{system_e()}{end}")
+    sys.stdout.flush()
+
+
+def _finish_picker(prev_lines: int) -> None:
+    """Clear the arrow picker in place — erase block without scrollback gaps."""
+    sys.stdout.write("\033[?25h")
+    if prev_lines:
+        # \033[M per line injects blank rows at the bottom margin on many terminals.
+        sys.stdout.write(f"\033[{prev_lines}A\r\033[J")
+    sys.stdout.write("\r")
+    sys.stdout.flush()
+
+
+def _split_label_key_desc(label: str) -> tuple[str, str, str]:
+    """Split 'Enter   approve once' into key, spacer, and description."""
+    i = 0
+    while i < len(label) and label[i] != " ":
+        i += 1
+    key = label[:i]
+    tail = label[i:]
+    desc = tail.lstrip()
+    spacer = tail[: len(tail) - len(desc)]
+    return key, spacer, desc
+
+
+def format_picker_option(
+    mark: str,
+    text: str,
+    *,
+    selected: bool,
+    system_key_only: bool = False,
+) -> str:
+    """Format one picker row; selected row is bold cyan."""
+    if not colors_enabled():
+        return f"{mark}{text}"
+    if system_key_only:
+        key, spacer, desc = _split_label_key_desc(text)
+        key_style = (
+            f"{BOLD}{BRIGHT_CYAN}{key}{RESET}"
+            if selected
+            else f"{BRIGHT_CYAN}{key}{RESET}"
+        )
+        return f"{mark}{key_style}{spacer}{desc}"
+    if selected:
+        return f"{BOLD}{BRIGHT_CYAN}{mark}{text}{RESET}"
+    return f"{mark}{text}"
+
+
+_INPUT_HISTORY: list[str] = []
+
+
+def _slash_command_token(text: str) -> tuple[str, str]:
+    """Return (slash_command, remainder) for live input coloring."""
+    if not text.startswith("/"):
+        return "", text
+    cmd, _, rest = text.partition(" ")
+    return cmd, rest
+
+
+def format_input_line(text: str) -> str:
+    """Render the ❯ prompt line; only the /command token is bold cyan while typing."""
+    if not colors_enabled():
+        return f"❯ {text}"
+    prompt = f"{BRIGHT_CYAN}❯{RESET} "
+    cmd, rest = _slash_command_token(text)
+    if not cmd:
+        return prompt + text
+    line = f"{prompt}{system_s()}{cmd}{system_e()}"
+    if rest:
+        line += f" {rest}"
+    return line
+
+
+def _read_input_char(fd: int) -> str:
+    """Read one UTF-8 character from fd (raw/cbreak mode)."""
+    first = os.read(fd, 1)
+    if not first:
+        return ""
+    extra = 0
+    lead = first[0]
+    if lead & 0x80:
+        if lead & 0xE0 == 0xC0:
+            extra = 1
+        elif lead & 0xF0 == 0xE0:
+            extra = 2
+        elif lead & 0xF8 == 0xF0:
+            extra = 3
+    if extra:
+        first += os.read(fd, extra)
+    return first.decode("utf-8", errors="replace")
+
+
+def _redraw_input_line(text: str) -> None:
+    sys.stdout.write("\r\033[K" + format_input_line(text))
+    sys.stdout.flush()
+
+
+def _read_tty_key(fd: int) -> str:
+    """Read one key; arrow keys return up/down/left/right instead of escape junk."""
+    ch = _read_input_char(fd)
+    if not ch:
+        return ""
+    if ch == "\x1b":
+        if not select.select([fd], [], [], 0.02)[0]:
+            return "esc"
+        seq = os.read(fd, 1)
+        if seq != b"[":
+            return "esc"
+        if not select.select([fd], [], [], 0.02)[0]:
+            return "esc"
+        code = os.read(fd, 1)
+        if code == b"A":
+            return "up"
+        if code == b"B":
+            return "down"
+        if code == b"C":
+            return "right"
+        if code == b"D":
+            return "left"
+        return "esc"
+    if ch in "\r\n":
+        return "enter"
+    if ch in ("\x7f", "\x08"):
+        return "backspace"
+    if ch == "\x03":
+        return "ctrl_c"
+    if ch == "\x04":
+        return "ctrl_d"
+    return ch
+
+
+def _read_tty_line(
+    prompt: str,
+    *,
+    history: bool = False,
+    redraw: Optional[Any] = None,
+) -> str:
+    """Read one line in cbreak mode; swallows arrow keys unless history=True."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    buf: list[str] = []
+    hist_idx = len(_INPUT_HISTORY)
+
+    def _redraw() -> None:
+        if redraw is not None:
+            redraw("".join(buf))
+        else:
+            sys.stdout.write("\r\033[K" + prompt + "".join(buf))
+            sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        _redraw()
+        while True:
+            if not select.select([fd], [], [], None)[0]:
+                continue
+            key = _read_tty_key(fd)
+            if not key:
+                raise EOFError
+            if key == "enter":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buf).strip()
+            if key == "backspace":
+                if buf:
+                    buf.pop()
+                    _redraw()
+                continue
+            if key == "ctrl_c":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+            if key == "ctrl_d":
+                if not buf:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    raise EOFError
+                continue
+            if key == "up" and history and _INPUT_HISTORY:
+                if hist_idx > 0:
+                    hist_idx -= 1
+                    buf = list(_INPUT_HISTORY[hist_idx])
+                    _redraw()
+                continue
+            if key == "down" and history:
+                if hist_idx < len(_INPUT_HISTORY):
+                    hist_idx += 1
+                    buf = (
+                        list(_INPUT_HISTORY[hist_idx])
+                        if hist_idx < len(_INPUT_HISTORY)
+                        else []
+                    )
+                    _redraw()
+                continue
+            if key in ("up", "down", "left", "right", "esc"):
+                continue
+            if len(key) == 1 and (key.isprintable() or key == "\t"):
+                buf.append(key)
+                _redraw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _remember_input(text: str) -> None:
+    if text and (not _INPUT_HISTORY or _INPUT_HISTORY[-1] != text):
+        _INPUT_HISTORY.append(text)
+
+
+def _read_user_input_interactive() -> str:
+    """TTY line editor with live slash-command coloring and history."""
+    text = _read_tty_line("", history=True, redraw=_redraw_input_line)
+    _remember_input(text)
+    return text
+
+
+def read_confirm_choice() -> str:
+    """Pick approve / allow-all / decline with ↑↓ arrows."""
+    options = ["", "a", "n"]
+    labels = [
+        "Enter   approve once",
+        "a       allow all for this session",
+        "n       no — say what to do differently",
+    ]
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        idx = pick_from_list(
+            "",
+            options,
+            labels=labels,
+            initial_index=0,
+            system_key_only=True,
+            direct_keys={"a": 1},
+            expand_index=2,
+            reject_keys={"n"},
+            hint="↑↓ move · Enter approve · Tab/→ edit decline · a allow all · Esc cancel",
+        )
+        if idx is None:
+            raise KeyboardInterrupt
+        return options[idx]
+    print(f"{DIM}  Enter   approve once{RESET}")
+    print(f"{DIM}  a       allow all for this session{RESET}")
+    print(f"{DIM}  n       no — say what to do differently{RESET}")
+    try:
+        return input(f"{BLUE}❯{RESET} ").strip().lower()
+    except KeyboardInterrupt:
+        raise
+
+
+def read_feedback_line() -> str:
+    """Read decline feedback after choosing n in the approval picker."""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        sys.stdout.write(f"\n{YELLOW}What should I do differently?{RESET}\n")
+        sys.stdout.flush()
+        return _read_tty_line(f"{BRIGHT_CYAN}❯{RESET} ")
+    prompt = f"{YELLOW}What should I do differently?{RESET} "
+    return input(prompt).strip()
+
+
+def read_user_input() -> str:
+    """Read one line from the ❯ prompt with live slash-command coloring."""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _read_user_input_interactive()
+
+    if colors_enabled():
+        sys.stdout.write(f"{BRIGHT_CYAN}❯{RESET} ")
+    else:
+        sys.stdout.write("❯ ")
+    sys.stdout.flush()
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\r\n").strip()
+
+# Set by confirm() when the user chooses "allow all" for the rest of the session.
+_SESSION_AUTO_APPROVE = False
+
+# Escape (or Ctrl+C during a turn) sets this so the agent loop returns to the prompt.
+_CANCEL_REQUESTED = threading.Event()
+_LISTENER_STOP = threading.Event()
+
+
+class UserCancelled(Exception):
+    """Raised when the user presses Escape or Ctrl+C during an agent turn."""
+
+
+WREN_BANNER = f"""{BRIGHT_CYAN}\u2588\u2588     \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588    \u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588
 \u2588\u2588     \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588      \u2588\u2588\u2588\u2588   \u2588\u2588 \u2588\u2588      \u2588\u2588    \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588
 \u2588\u2588  \u2588  \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588   \u2588\u2588 \u2588\u2588  \u2588\u2588 \u2588\u2588      \u2588\u2588    \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588\u2588\u2588\u2588
 \u2588\u2588 \u2588\u2588\u2588 \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588      \u2588\u2588  \u2588\u2588 \u2588\u2588 \u2588\u2588      \u2588\u2588    \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588
@@ -333,8 +797,9 @@ def write(args: dict[str, Any]) -> str:
     """Write content to a file, creating parent directories as needed."""
     path = resolve_tool_path(_require_str(args, "path"))
     content = args.get("content", "")
-    if not confirm(f"Write to {path!r}"):
-        return "cancelled"
+    approval = confirm("write")
+    if approval != "ok":
+        return approval
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(content), encoding="utf-8")
     return "ok"
@@ -373,8 +838,9 @@ def edit(args: dict[str, Any]) -> str:
             json.loads(updated)
         except json.JSONDecodeError as exc:
             return f"error: edit would make invalid JSON: {exc}"
-    if not confirm(f"Edit {path!r}"):
-        return "cancelled"
+    approval = confirm("edit")
+    if approval != "ok":
+        return approval
     path.write_text(updated, encoding="utf-8")
     return "ok"
 
@@ -441,27 +907,139 @@ def grep(args: dict[str, Any]) -> str:
     return body
 
 
-def confirm(prompt: str) -> bool:
-    """Prompt for y/N confirmation; auto-approve if WRENCODE_AUTO_APPROVE is set.
+def _cancel_listener() -> None:
+    """Watch stdin for Escape while a blocking agent operation runs."""
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+        import tty
 
-    Auto-approve enables headless/CI use and subagents (which can't field an
-    interactive prompt), at the cost of running writes and shell commands
-    without review — only use it in a sandboxed workspace you trust.
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not _LISTENER_STOP.is_set():
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not ready:
+                    continue
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    _CANCEL_REQUESTED.set()
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def cancel_watch() -> Any:
+    """Enable Escape-to-cancel for the duration of a blocking operation."""
+    if not sys.stdin.isatty():
+        yield
+        return
+    _CANCEL_REQUESTED.clear()
+    _LISTENER_STOP.clear()
+    listener = threading.Thread(target=_cancel_listener, daemon=True)
+    listener.start()
+    try:
+        yield
+    finally:
+        _LISTENER_STOP.set()
+        listener.join(timeout=0.5)
+
+
+def check_cancelled() -> None:
+    """Raise UserCancelled if the user requested cancellation."""
+    if _CANCEL_REQUESTED.is_set():
+        raise UserCancelled()
+
+
+def get_response_cancellable(
+    messages: list[dict[str, Any]],
+    system_prompt: str,
+    mlx_state: Optional[tuple[Any, Any]],
+) -> str:
+    """Run get_response in a worker thread so Escape can interrupt blocking calls."""
+    if not sys.stdin.isatty():
+        return get_response(messages, system_prompt, mlx_state)
+
+    result: list[str] = []
+    error: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            result.append(get_response(messages, system_prompt, mlx_state))
+        except BaseException as exc:  # noqa: BLE001 — propagate to caller
+            error.append(exc)
+
+    with cancel_watch():
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        while t.is_alive():
+            check_cancelled()
+            t.join(timeout=0.15)
+    if error:
+        raise error[0]
+    return result[0]
+
+
+def confirm(action: str = "", *, show_prompt: bool = False) -> str:
+    """Prompt for approval. Returns 'ok' or a cancellation message for the agent.
+
+    Enter approves once; ``a`` approves all remaining actions this session;
+    ``n`` declines and asks what to do differently. Auto-approve via
+    WRENCODE_AUTO_APPROVE / --yes enables headless use and subagents.
+
+    Tool actions are shown by print_tool_action(); by default only the
+    Enter/a/n hints are shown here (not a duplicate path/command line).
     """
-    if os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes"):
-        print(f"{DIM}⚠ {prompt} [auto-approved]{RESET}")
-        return True
-    return input(f"\n{YELLOW}⚠ {prompt} [y/N]{RESET} ").strip().lower() in (
-        "y",
-        "yes",
-    )
+    global _SESSION_AUTO_APPROVE
+    if (
+        os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes")
+        or _SESSION_AUTO_APPROVE
+    ):
+        label = action or "action"
+        print(f"{DIM}⚠ {label} [auto-approved]{RESET}")
+        return "ok"
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print()
+        if show_prompt and action:
+            print(f"{YELLOW}⚠ {action}{RESET}")
+        print(f"{DIM}  Enter   approve once{RESET}")
+        print(f"{DIM}  a       allow all for this session{RESET}")
+        print(f"{DIM}  n       no — say what to do differently{RESET}")
+    while True:
+        try:
+            choice = read_confirm_choice()
+        except KeyboardInterrupt:
+            print()
+            return "cancelled: user interrupted"
+        if choice in ("", "y", "yes"):
+            return "ok"
+        if choice in ("a", "all"):
+            _SESSION_AUTO_APPROVE = True
+            print(f"{DIM}Auto-approving remaining actions this session.{RESET}")
+            return "ok"
+        if choice in ("n", "no"):
+            try:
+                feedback = read_feedback_line()
+            except KeyboardInterrupt:
+                print()
+                return "cancelled: user interrupted"
+            if feedback:
+                return f"cancelled: user declined — {feedback}"
+            return "cancelled: user declined without instructions"
+        print(f"{DIM}Choose Enter, a, or n.{RESET}")
 
 
 def bash(args: dict[str, Any]) -> str:
     """Run a shell command with a timeout, streaming output to the terminal."""
     cmd = _require_str(args, "cmd")
-    if not confirm(f"Run: {cmd!r}"):
-        return "cancelled"
+    approval = confirm("run")
+    if approval != "ok":
+        return approval
     proc = subprocess.Popen(
         cmd,
         shell=True,
@@ -561,10 +1139,88 @@ TOOLS: dict[str, ToolEntry] = {
 }
 
 
+def normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common model arg aliases before dispatching a tool."""
+    out = dict(args or {})
+    if name == "bash" and not str(out.get("cmd", "")).strip():
+        for alias in ("command", "shell", "script", "bash_command"):
+            if str(out.get(alias, "")).strip():
+                out["cmd"] = str(out[alias]).strip()
+                break
+    if name == "glob" and "pat" not in out and "pattern" in out:
+        out["pat"] = out["pattern"]
+    if name == "task" and not str(out.get("prompt", "")).strip():
+        for alias in ("description", "subtask"):
+            if str(out.get(alias, "")).strip():
+                out["prompt"] = str(out[alias]).strip()
+                break
+    return out
+
+
+def format_tool_action(name: str, args: dict[str, Any]) -> str:
+    """Human-readable summary of what a tool call will do."""
+    args = normalize_tool_args(name, args)
+    if name == "bash":
+        cmd = str(args.get("cmd", "")).strip()
+        return f"$ {cmd}" if cmd else "(empty shell command)"
+    if name == "read":
+        path = args.get("path", "?")
+        offset = args.get("offset")
+        limit = args.get("limit")
+        extra = ""
+        if offset is not None or limit is not None:
+            extra = f"  offset={offset}, limit={limit}"
+        return f"read {path}{extra}"
+    if name == "write":
+        path = args.get("path", "?")
+        content = str(args.get("content", ""))
+        lines = content.count("\n") + (1 if content else 0)
+        preview = content[:160].replace("\n", "\\n")
+        suffix = "..." if len(content) > 160 else ""
+        return f"write {path}  ({lines} lines)\n  {preview}{suffix}"
+    if name == "edit":
+        path = args.get("path", "?")
+        old = str(args.get("old", ""))[:80].replace("\n", "\\n")
+        new = str(args.get("new", ""))[:80].replace("\n", "\\n")
+        return f"edit {path}\n  - {old}\n  + {new}"
+    if name == "glob":
+        return f"glob {args.get('pat', args.get('pattern', '?'))}"
+    if name == "grep":
+        return f"grep {args.get('pat', '?')}"
+    if name == "task":
+        prompt = str(args.get("prompt", "")).strip()
+        return f"task {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
+    return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
+
+
+def print_tool_action(name: str, args: dict[str, Any]) -> None:
+    """Print a tool call as plain text — no background boxes."""
+    body = format_tool_action(name, args)
+    first, _, rest = body.partition("\n")
+    print(f"{GREEN}⏺{RESET}{DIM} {first}{RESET}")
+    for line in rest.split("\n"):
+        if line.strip():
+            print(f"{DIM}  {line}{RESET}")
+
+
+def print_tool_result(result: str) -> None:
+    """Print tool output with enough context to see what happened."""
+    lines = result.split("\n")
+    print(f"{DIM}⎿ result{RESET}")
+    if not result:
+        print(f"{DIM}│ (empty){RESET}")
+        return
+    show = lines[:12]
+    for line in show:
+        print(f"{DIM}│ {line}{RESET}")
+    if len(lines) > 12:
+        print(f"{DIM}│ ... +{len(lines) - 12} more lines{RESET}")
+
+
 def run_tool(name: str, args: dict[str, Any]) -> str:
     """Execute a named tool with args, truncating output if it exceeds MAX_OUT."""
     try:
-        result = TOOLS[name][2](args)
+        result = TOOLS[name][2](normalize_tool_args(name, args))
         if len(result) > MAX_OUT:
             result = (
                 result[:MAX_OUT]
@@ -647,6 +1303,48 @@ def render_markdown(text: str) -> str:
     for i, b in enumerate(blocks):
         text = text.replace(f"\x00B{i}\x00", b)
     return text
+
+
+def print_agent_message(text: str) -> None:
+    """Print the agent response in muted grey text — no label, no box."""
+    for line in render_markdown(text).split("\n"):
+        print(f"{AGENT_TEXT}{line}{RESET}")
+    print()
+
+
+def format_user_turn_line(user_input: str) -> str:
+    """Format the current user request line (prompt + text, no trailing newline)."""
+    return f"{BRIGHT_CYAN}❯{RESET} {user_input}"
+
+
+@contextlib.contextmanager
+def thinking_spinner() -> Any:
+    """Loader on the line below the user's input (style from /loader)."""
+    if not sys.stdout.isatty() or LOADER_STYLE == "off":
+        yield
+        return
+
+    stop = threading.Event()
+    step = 0
+
+    def animate() -> None:
+        nonlocal step
+        while not stop.is_set():
+            bar = loader_display(step)
+            step += 1
+            sys.stdout.write(f"\r{bar}")
+            sys.stdout.flush()
+            time.sleep(0.07)
+
+    thread = threading.Thread(target=animate, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=0.4)
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1061,6 +1759,7 @@ def get_response(
     for chunk in stream_generate(
         model, tokenizer, prompt=prompt, max_tokens=MAX_TOKENS, sampler=sampler
     ):
+        check_cancelled()
         out += chunk.text
         end = _tool_call_complete(out)
         if end != -1:
@@ -1268,69 +1967,109 @@ def run_agent_turn(
     iters = 0
     last_tool_error: Optional[str] = None
     repeated_tool_error_count = 0
-    while True:
-        if max_iters and iters >= max_iters:
-            print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
-            break
-        iters += 1
-        print(f"{DIM}Generating...{RESET}", end="\r", flush=True)
-        response_text = get_response(messages, system_prompt, mlx_state)
-        print(" " * 20, end="\r")
-
-        # Anthropic & OpenAI native tool use path
-        if BACKEND in NATIVE_TOOL_BACKENDS:
-            data = json.loads(response_text)
-            if BACKEND == "anthropic":
-                display_text, tool_calls = _parse_anthropic_response(data)
-            else:
-                display_text, tool_calls = _parse_openai_response(data)
-            if display_text:
-                print(f"\n{CYAN}>{RESET} {render_markdown(display_text)}")
-            if BACKEND == "anthropic":
-                messages.append(
-                    {"role": "assistant", "content": data.get("content", [])}
-                )
-            else:
-                messages.append(
-                    data["choices"][0]["message"]
-                )  # preserve tool_calls exactly
-            if not tool_calls:
+    try:
+        while True:
+            if max_iters and iters >= max_iters:
+                print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
                 break
-            tool_results: list[dict[str, Any]] = []
-            stop_due_to_repeated_error = False
-            for tc in tool_calls:
-                arg_preview = (
-                    str(list(tc["input"].values())[0])[:50]
-                    if tc["input"]
-                    else ""
+            iters += 1
+            with thinking_spinner():
+                response_text = get_response_cancellable(
+                    messages, system_prompt, mlx_state
                 )
-                print(
-                    f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
-                )
-                result = run_tool(tc["name"], tc["input"])
-                lines = result.split("\n")
-                preview = lines[0][:60] + (
-                    f" ... +{len(lines) - 1} lines"
-                    if len(lines) > 1
-                    else ("..." if len(lines[0]) > 60 else "")
-                )
-                print(f"{DIM}⎿ {preview}{RESET}")
+
+            # Anthropic & OpenAI native tool use path
+            if BACKEND in NATIVE_TOOL_BACKENDS:
+                data = json.loads(response_text)
                 if BACKEND == "anthropic":
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tc["id"],
-                            "content": result,
-                        }
+                    display_text, tool_calls = _parse_anthropic_response(data)
+                else:
+                    display_text, tool_calls = _parse_openai_response(data)
+                if display_text:
+                    print_agent_message(display_text)
+                if BACKEND == "anthropic":
+                    messages.append(
+                        {"role": "assistant", "content": data.get("content", [])}
                     )
                 else:
-                    tool_results.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result,
-                        }
-                    )
+                    messages.append(
+                        data["choices"][0]["message"]
+                    )  # preserve tool_calls exactly
+                if not tool_calls:
+                    break
+                tool_results: list[dict[str, Any]] = []
+                stop_due_to_repeated_error = False
+                for tc in tool_calls:
+                    check_cancelled()
+                    print_tool_action(tc["name"], tc["input"])
+                    result = run_tool(tc["name"], tc["input"])
+                    print_tool_result(result)
+                    if BACKEND == "anthropic":
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tc["id"],
+                                "content": result,
+                            }
+                        )
+                    else:
+                        tool_results.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            }
+                        )
+                    if result.startswith("error:"):
+                        if result == last_tool_error:
+                            repeated_tool_error_count += 1
+                        else:
+                            last_tool_error = result
+                            repeated_tool_error_count = 1
+                        if repeated_tool_error_count >= TOOL_ERROR_REPEAT_LIMIT:
+                            print(
+                                f"{YELLOW}Stopping: repeated identical tool error {repeated_tool_error_count} times.{RESET}"
+                            )
+                            stop_due_to_repeated_error = True
+                            break
+                    else:
+                        last_tool_error = None
+                        repeated_tool_error_count = 0
+                if BACKEND == "anthropic":
+                    messages.append({"role": "user", "content": tool_results})
+                else:
+                    messages.extend(tool_results)
+                if stop_due_to_repeated_error:
+                    break
+                continue
+
+            # XML tool call path (mlx, transformers, openrouter, local)
+            xml_tool_calls = parse_tool_calls(response_text)
+            display_text = re.sub(
+                r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
+            ).strip()
+
+            if display_text:
+                print_agent_message(display_text)
+
+            content_blocks: list[dict[str, Any]] = (
+                [{"type": "text", "text": display_text}] if display_text else []
+            )
+            xml_tool_results: list[dict[str, Any]] = []
+            stop_due_to_repeated_error = False
+            for tc in xml_tool_calls:
+                check_cancelled()
+                print_tool_action(tc["name"], tc["input"])
+                result = run_tool(tc["name"], tc["input"])
+                print_tool_result(result)
+                xml_tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tc["id"],
+                        "content": result,
+                    }
+                )
+                content_blocks.append(tc)
                 if result.startswith("error:"):
                     if result == last_tool_error:
                         repeated_tool_error_count += 1
@@ -1346,71 +2085,16 @@ def run_agent_turn(
                 else:
                     last_tool_error = None
                     repeated_tool_error_count = 0
-            if BACKEND == "anthropic":
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                messages.extend(tool_results)
-            if stop_due_to_repeated_error:
+
+            messages.append({"role": "assistant", "content": content_blocks})
+            if stop_due_to_repeated_error or not xml_tool_results:
                 break
-            continue
-
-        # XML tool call path (mlx, transformers, openrouter, local)
-        xml_tool_calls = parse_tool_calls(response_text)
-        display_text = re.sub(
-            r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
-        ).strip()
-
-        if display_text:
-            print(f"\n{CYAN}>{RESET} {render_markdown(display_text)}")
-
-        content_blocks: list[dict[str, Any]] = (
-            [{"type": "text", "text": display_text}] if display_text else []
-        )
-        xml_tool_results: list[dict[str, Any]] = []
-        stop_due_to_repeated_error = False
-        for tc in xml_tool_calls:
-            arg_preview = (
-                str(list(tc["input"].values())[0])[:50] if tc["input"] else ""
-            )
-            print(
-                f"\n{GREEN}{tc['name'].capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
-            )
-            result = run_tool(tc["name"], tc["input"])
-            lines = result.split("\n")
-            preview = lines[0][:60] + (
-                f" ... +{len(lines) - 1} lines"
-                if len(lines) > 1
-                else ("..." if len(lines[0]) > 60 else "")
-            )
-            print(f"{DIM}⎿ {preview}{RESET}")
-            xml_tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tc["id"],
-                    "content": result,
-                }
-            )
-            content_blocks.append(tc)
-            if result.startswith("error:"):
-                if result == last_tool_error:
-                    repeated_tool_error_count += 1
-                else:
-                    last_tool_error = result
-                    repeated_tool_error_count = 1
-                if repeated_tool_error_count >= TOOL_ERROR_REPEAT_LIMIT:
-                    print(
-                        f"{YELLOW}Stopping: repeated identical tool error {repeated_tool_error_count} times.{RESET}"
-                    )
-                    stop_due_to_repeated_error = True
-                    break
-            else:
-                last_tool_error = None
-                repeated_tool_error_count = 0
-
-        messages.append({"role": "assistant", "content": content_blocks})
-        if stop_due_to_repeated_error or not xml_tool_results:
-            break
-        messages.append({"role": "user", "content": xml_tool_results})
+            messages.append({"role": "user", "content": xml_tool_results})
+    except (UserCancelled, KeyboardInterrupt):
+        print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
+    finally:
+        _CANCEL_REQUESTED.clear()
+        _LISTENER_STOP.set()
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1420,38 +2104,52 @@ def handle_slash_command(
     cmd: str,
     messages: list[dict[str, Any]],
     mlx_state: Optional[tuple[Any, Any]],
-) -> Optional[str]:
-    """Handle a slash command. Returns 'quit', 'handled', or None if not a command."""
+) -> tuple[Optional[str], Any]:
+    """Handle a slash command.
+
+    Returns (action, mlx_state). mlx_state is _MLX_UNCHANGED unless the
+    backend/model changed and the in-process model must be reloaded.
+    """
     if cmd in {"/q", "exit"}:
         save_history(messages)
-        return "quit"
+        return "quit", _MLX_UNCHANGED
     if cmd == "/c":
+        global _SESSION_AUTO_APPROVE
+        _SESSION_AUTO_APPROVE = False
         messages.clear()
         save_history(messages)
-        print(f"{GREEN}Cleared{RESET}")
-        return "handled"
+        print_system("Cleared")
+        return "handled", _MLX_UNCHANGED
     if cmd == "/compact":
         if BACKEND in API_BACKENDS or (BACKEND in LOCAL_ML_BACKENDS and mlx_state):
-            print(f"{DIM}Compacting history...{RESET}")
+            print_system("Compacting history...")
             model, tokenizer = mlx_state or (None, None)
             before = len(messages)
             messages[:] = compact_messages(messages, model, tokenizer)
             save_history(messages)
-            print(
-                f"{GREEN}Compacted {before} → {len(messages)} messages{RESET}"
-            )
+            print_system(f"Compacted {before} → {len(messages)} messages")
         else:
             print(
                 f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}"
             )
-        return "handled"
+        return "handled", _MLX_UNCHANGED
+    if cmd in {"/backend", "/configure"}:
+        return "handled", switch_backend_runtime()
+    if cmd == "/model" or cmd.startswith("/model "):
+        model_id = cmd[7:].strip() if cmd.startswith("/model ") else ""
+        return "handled", switch_model_runtime(model_id)
+    if cmd == "/loader":
+        pick_loader_style()
+        return "handled", _MLX_UNCHANGED
     if cmd == "/help":
-        print(
-            f"{DIM}/c — clear  /compact — summarize history  /q — quit{RESET}\n"
-            f"{DIM}Backends: mlx | transformers | openrouter | openai | anthropic | local{RESET}"
+        print_system("/c — clear  /compact — summarize  /q — quit")
+        print_system(
+            "/backend — switch backend (↑↓)  /model — switch model (↑↓)"
         )
-        return "handled"
-    return None
+        print_system("/loader — pick loading animation (↑↓)")
+        print_system("/model <id> — set model directly  /configure — same as /backend")
+        return "handled", _MLX_UNCHANGED
+    return None, _MLX_UNCHANGED
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1505,55 +2203,452 @@ def available_backends() -> list[str]:
     return out
 
 
+PICKER_WINDOW = 14
+
+
+def _read_arrow_key(fd: int) -> str:
+    """Read a single key in raw mode; arrows return up/down/left/right."""
+    ch = os.read(fd, 1).decode("utf-8", errors="replace")
+    if ch == "\x1b":
+        if select.select([fd], [], [], 0.04)[0]:
+            rest = os.read(fd, 2)
+            if rest == b"[A":
+                return "up"
+            if rest == b"[B":
+                return "down"
+            if rest == b"[C":
+                return "right"
+            if rest == b"[D":
+                return "left"
+        return "esc"
+    if ch in "\r\n":
+        return "enter"
+    if ch == "\t":
+        return "tab"
+    if ch == "\x03":
+        return "ctrl_c"
+    if ch in ("q", "Q"):
+        return "esc"
+    if len(ch) == 1 and ch.isprintable():
+        return ch
+    return "other"
+
+
+def _pick_from_list_fallback(
+    title: str,
+    options: list[str],
+    labels: list[str],
+    initial_index: int,
+    system_key_only: bool = False,
+) -> Optional[int]:
+    print()
+    if title:
+        print_system(title)
+        print()
+    for i, label in enumerate(labels, 1):
+        sel = i - 1 == initial_index
+        mark = "> " if sel else "  "
+        sys.stdout.write(
+            format_picker_option(
+                mark, f"{i}. {label}", selected=sel, system_key_only=system_key_only
+            )
+            + "\n"
+        )
+    sys.stdout.flush()
+    default = str(initial_index + 1)
+    while True:
+        raw = input(f"{BLUE}❯{RESET} number [{default}]: ").strip() or default
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        print(f"{RED}Enter a number between 1 and {len(options)}.{RESET}")
+
+
+def _pick_from_list_arrows(
+    title: str,
+    options: list[str],
+    labels: list[str],
+    initial_index: int,
+    system_key_only: bool = False,
+    direct_keys: Optional[dict[str, int]] = None,
+    expand_index: Optional[int] = None,
+    reject_keys: Optional[set[str]] = None,
+    hint: Optional[str] = None,
+) -> Optional[int]:
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    selected = max(0, min(initial_index, len(options) - 1))
+    chosen: Optional[int] = selected
+    prev_lines = 0
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+        while True:
+            window = PICKER_WINDOW
+            start = max(0, min(selected - window // 2, max(0, len(options) - window)))
+            end = min(len(options), start + window)
+            if end - start < window:
+                start = max(0, end - window)
+
+            lines = []
+            if hint:
+                lines.append(f"{DIM}{hint}{RESET}")
+            elif direct_keys:
+                shortcuts = " · ".join(sorted(direct_keys))
+                lines.append(
+                    f"{DIM}↑↓ move · Enter select · {shortcuts} shortcut · Esc cancel{RESET}"
+                )
+            else:
+                lines.append(f"{DIM}↑↓ move · Enter select · Esc cancel{RESET}")
+            if title:
+                lines.insert(0, f"{system_s()}{title}{system_e()}")
+            if start > 0:
+                lines.append(f"{DIM}  … {start} more above{RESET}")
+            for i in range(start, end):
+                mark = "▸ " if i == selected else "  "
+                lines.append(
+                    format_picker_option(
+                        mark,
+                        labels[i],
+                        selected=(i == selected),
+                        system_key_only=system_key_only,
+                    )
+                )
+            if end < len(options):
+                lines.append(f"{DIM}  … {len(options) - end} more below{RESET}")
+
+            if prev_lines:
+                sys.stdout.write(f"\033[{prev_lines}A")
+            for line in lines:
+                sys.stdout.write("\r\033[K" + line + "\n")
+            sys.stdout.flush()
+            prev_lines = len(lines)
+
+            key = _read_arrow_key(fd)
+            if key == "up":
+                selected = (selected - 1) % len(options)
+            elif key == "down":
+                selected = (selected + 1) % len(options)
+            elif key == "left":
+                continue
+            elif reject_keys and key in reject_keys:
+                continue
+            elif direct_keys and key in direct_keys:
+                chosen = direct_keys[key]
+                break
+            elif key in ("right", "tab"):
+                chosen = selected
+                break
+            elif key == "enter":
+                if expand_index is not None and selected == expand_index:
+                    continue
+                chosen = selected
+                break
+            elif key in ("esc", "ctrl_c"):
+                chosen = None
+                break
+    finally:
+        _finish_picker(prev_lines)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return chosen
+
+
+def pick_from_list(
+    title: str,
+    options: list[str],
+    *,
+    labels: Optional[list[str]] = None,
+    initial_index: int = 0,
+    system_key_only: bool = False,
+    direct_keys: Optional[dict[str, int]] = None,
+    expand_index: Optional[int] = None,
+    reject_keys: Optional[set[str]] = None,
+    hint: Optional[str] = None,
+) -> Optional[int]:
+    """Pick one option with ↑↓ arrows (or numbered fallback when not a TTY)."""
+    if not options:
+        print(f"{YELLOW}No options available.{RESET}")
+        return None
+    labels = labels if labels is not None else options
+    initial_index = max(0, min(initial_index, len(options) - 1))
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _pick_from_list_arrows(
+            title,
+            options,
+            labels,
+            initial_index,
+            system_key_only,
+            direct_keys,
+            expand_index,
+            reject_keys,
+            hint,
+        )
+    return _pick_from_list_fallback(
+        title, options, labels, initial_index, system_key_only
+    )
+
+
+def pick_loader_style() -> None:
+    """Interactive picker for /loader."""
+    ids = list(LOADER_STYLES.keys())
+    labels = [f"{LOADER_STYLES[i][0]}  —  {LOADER_STYLES[i][1]}" for i in ids]
+    initial = ids.index(LOADER_STYLE) if LOADER_STYLE in ids else 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print_system("Loader styles: " + ", ".join(ids))
+        return
+    idx = pick_from_list(
+        "Choose loader style",
+        ids,
+        labels=labels,
+        initial_index=initial,
+    )
+    if idx is None:
+        print_system("Cancelled.")
+        return
+    choice = ids[idx]
+    apply_loader_style(choice)
+    save_config({**load_config(), "loader_style": choice})
+    name = LOADER_STYLES[choice][0]
+    print_system(f"✓ Loader → {name}")
+    if choice != "off":
+        for i in range(8):
+            sys.stdout.write(f"\r  preview  {loader_display(i)}")
+            sys.stdout.flush()
+            time.sleep(0.07)
+        sys.stdout.write("\r\033[2K\n")
+
+
+def fetch_openrouter_models() -> list[str]:
+    """Fetch OpenRouter model ids, with a 24h local cache."""
+    if OPENROUTER_MODELS_CACHE.exists():
+        with contextlib.suppress(Exception):
+            age = time.time() - OPENROUTER_MODELS_CACHE.stat().st_mtime
+            if age < 86400:
+                cached = json.loads(OPENROUTER_MODELS_CACHE.read_text())
+                if isinstance(cached, list) and cached:
+                    return [str(m) for m in cached]
+
+    key = os.environ.get("OPENROUTER_API_KEY") or API_KEY or load_config().get(
+        "api_key", ""
+    )
+    if not key:
+        return list(BACKEND_MODELS.get("openrouter", []))
+
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        ids = sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
+        if ids:
+            OPENROUTER_MODELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            OPENROUTER_MODELS_CACHE.write_text(json.dumps(ids, indent=2))
+            os.chmod(OPENROUTER_MODELS_CACHE, 0o600)
+        return ids or list(BACKEND_MODELS.get("openrouter", []))
+    except Exception as err:
+        print(f"{YELLOW}Could not fetch OpenRouter models: {err}{RESET}")
+        return list(BACKEND_MODELS.get("openrouter", []))
+
+
+def fetch_ollama_models() -> list[str]:
+    """List models reported by a local Ollama server."""
+    base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read())
+        names = sorted(
+            m.get("name", "") for m in data.get("models", []) if m.get("name")
+        )
+        return names or [BACKEND_SPECS["ollama"]["model"]]
+    except Exception as err:
+        print(f"{YELLOW}Could not reach Ollama at {base}: {err}{RESET}")
+        return [BACKEND_SPECS["ollama"]["model"]]
+
+
+def list_models_for_backend(backend: str) -> list[str]:
+    """Return selectable models for a backend (includes a custom-id option)."""
+    spec = BACKEND_SPECS[backend]
+    if backend == "openrouter":
+        models = fetch_openrouter_models()
+    elif backend == "ollama":
+        models = fetch_ollama_models()
+    else:
+        models = list(BACKEND_MODELS.get(backend, [spec["model"]]))
+
+    if not models:
+        models = [spec["model"]]
+    models = list(dict.fromkeys(models))
+    current = MODEL if backend == BACKEND else spec["model"]
+    if current and current not in models:
+        models.insert(0, current)
+    if CUSTOM_MODEL_OPTION not in models:
+        models.append(CUSTOM_MODEL_OPTION)
+    return models
+
+
+def _prompt_api_key_if_needed(
+    backend: str, existing: dict[str, str], cfg: dict[str, str]
+) -> None:
+    """Prompt for an API key when switching to a hosted backend."""
+    spec = BACKEND_SPECS[backend]
+    if spec["kind"] != "api":
+        return
+    key_env = spec["key_env"]
+    if os.environ.get(key_env):
+        print_system(f"✓ Using {key_env} from environment")
+        return
+    saved_key = (
+        existing.get("api_key", "") if existing.get("backend") == backend else ""
+    )
+    keep_hint = " (leave blank to keep saved key)" if saved_key else ""
+    key = getpass.getpass(
+        f"{BLUE}❯{RESET} {key_env}{keep_hint} (input hidden): "
+    ).strip()
+    if key:
+        cfg["api_key"] = key
+    elif saved_key:
+        cfg["api_key"] = saved_key
+        print_system(f"✓ Keeping saved {key_env}")
+    else:
+        print(
+            f"{YELLOW}No key entered — set {key_env} or re-run with /backend.{RESET}"
+        )
+
+
+def persist_backend_choice(cfg: dict[str, str]) -> None:
+    """Merge cfg into saved config and apply module-level backend globals."""
+    merged = {**load_config(), **cfg}
+    save_config(merged)
+    apply_backend(
+        merged["backend"],
+        merged.get("model", ""),
+        merged.get("api_key", ""),
+    )
+
+
+def pick_model_interactive(backend: str) -> Optional[str]:
+    """Arrow-key model picker for a backend; returns model id or None."""
+    models = list_models_for_backend(backend)
+    labels = models[:]
+    initial = models.index(MODEL) if MODEL in models else 0
+    idx = pick_from_list(
+        f"Choose model ({backend})",
+        models,
+        labels=labels,
+        initial_index=initial,
+    )
+    if idx is None:
+        return None
+    choice = models[idx]
+    if choice == CUSTOM_MODEL_OPTION:
+        default = BACKEND_SPECS[backend]["model"]
+        custom = input(f"{BLUE}❯{RESET} model id [{default}]: ").strip()
+        return custom or default
+    return choice
+
+
+def try_reload_model() -> Any:
+    """Load weights for local-ml backends; return None for API/proxy backends."""
+    if BACKEND in LOCAL_ML_BACKENDS:
+        try:
+            return load_model()
+        except SystemExit:
+            return _MLX_UNCHANGED
+    if BACKEND in API_BACKENDS and not API_KEY:
+        key_env = BACKEND_SPECS[BACKEND]["key_env"]
+        print(f"{RED}{key_env} not set — cannot use {BACKEND}.{RESET}")
+        return _MLX_UNCHANGED
+    return None
+
+
+def switch_model_runtime(model_id: str = "") -> Any:
+    """Switch model on the current backend; reload local weights if needed."""
+    if model_id:
+        model = model_id
+    else:
+        if not sys.stdin.isatty():
+            print(f"{RED}/model needs an interactive terminal.{RESET}")
+            return _MLX_UNCHANGED
+        picked = pick_model_interactive(BACKEND)
+        if picked is None:
+            print_system("Cancelled.")
+            return _MLX_UNCHANGED
+        model = picked
+
+    if os.environ.get("MODEL"):
+        print(f"{YELLOW}MODEL env var overrides saved choice.{RESET}")
+
+    persist_backend_choice({"backend": BACKEND, "model": model})
+    print_system(f"✓ Model → {MODEL}")
+    return try_reload_model()
+
+
+def switch_backend_runtime() -> Any:
+    """Switch backend (and model) mid-session; reload local weights if needed."""
+    if not sys.stdin.isatty():
+        print(f"{RED}/backend needs an interactive terminal.{RESET}")
+        return _MLX_UNCHANGED
+
+    existing = load_config()
+    names = available_backends()
+    labels = [
+        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]"
+        for n in names
+    ]
+    initial = names.index(BACKEND) if BACKEND in names else 0
+    idx = pick_from_list("Choose backend", names, labels=labels, initial_index=initial)
+    if idx is None:
+        print_system("Cancelled.")
+        return _MLX_UNCHANGED
+
+    backend = names[idx]
+    model = pick_model_interactive(backend)
+    if model is None:
+        print_system("Cancelled.")
+        return _MLX_UNCHANGED
+
+    cfg: dict[str, str] = {"backend": backend, "model": model}
+    _prompt_api_key_if_needed(backend, existing, cfg)
+    persist_backend_choice(cfg)
+    print_system(f"✓ Backend → {BACKEND}:{MODEL}")
+    return try_reload_model()
+
+
 def choose_backend_interactive() -> None:
     """Prompt the user to pick a backend, persist the choice, and apply it."""
+    existing = load_config()
     names = available_backends()
-    print(f"{BOLD}Choose a backend:{RESET}\n")
-    for i, name in enumerate(names, 1):
-        spec = BACKEND_SPECS[name]
-        print(
-            f"  {BOLD}{i}{RESET}. {spec['label']}  {DIM}[{spec['model']}]{RESET}"
-        )
-    print()
+    labels = [
+        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]"
+        for n in names
+    ]
     if not is_frozen():
-        print(
-            f"{DIM}Local model backends need their deps installed "
-            f"(e.g. pip install mlx-lm, or transformers torch).{RESET}\n"
+        print_system(
+            "Local model backends need mlx-lm or transformers installed."
         )
+        print()
 
-    while True:
-        raw = input(f"{BLUE}❯{RESET} number [1]: ").strip() or "1"
-        if raw.isdigit() and 1 <= int(raw) <= len(names):
-            choice = names[int(raw) - 1]
-            break
-        print(f"{RED}Enter a number between 1 and {len(names)}.{RESET}")
+    idx = pick_from_list("Choose backend", names, labels=labels, initial_index=0)
+    if idx is None:
+        print(f"{RED}Backend selection required.{RESET}")
+        raise SystemExit(1)
 
-    spec = BACKEND_SPECS[choice]
-    cfg: dict[str, str] = {"backend": choice}
+    choice = names[idx]
+    model = pick_model_interactive(choice)
+    if model is None:
+        print(f"{RED}Model selection required.{RESET}")
+        raise SystemExit(1)
 
-    model = input(f"{BLUE}❯{RESET} model [{spec['model']}]: ").strip()
-    if model:
-        cfg["model"] = model
-
-    if spec["kind"] == "api":
-        key_env = spec["key_env"]
-        if os.environ.get(key_env):
-            print(f"{GREEN}✓ Using {key_env} from environment{RESET}")
-        else:
-            key = getpass.getpass(
-                f"{BLUE}❯{RESET} {key_env} (input hidden): "
-            ).strip()
-            if key:
-                cfg["api_key"] = key
-            else:
-                print(
-                    f"{YELLOW}No key entered — set {key_env} before running, "
-                    f"or re-run `wrencode --configure`.{RESET}"
-                )
-
-    save_config(cfg)
-    print(f"{GREEN}✓ Saved backend choice to {CONFIG_FILE}{RESET}\n")
-    apply_backend(choice, cfg.get("model", ""), cfg.get("api_key", ""))
+    cfg: dict[str, str] = {"backend": choice, "model": model}
+    _prompt_api_key_if_needed(choice, existing, cfg)
+    persist_backend_choice(cfg)
+    print_system(f"✓ Saved backend choice to {CONFIG_FILE}")
+    print()
 
 
 def resolve_configuration(force_chooser: bool = False) -> None:
@@ -1618,7 +2713,8 @@ def load_model() -> Optional[tuple[Any, Any]]:
             raise SystemExit(1)
         print(f"{YELLOW}Loading model...{RESET}")
         model, tokenizer = load(MODEL)
-        print(f"{GREEN}✓ Loaded: {getattr(model, 'name', MODEL)}{RESET}\n")
+        print_system(f"✓ Loaded: {getattr(model, 'name', MODEL)}")
+        print()
         return (model, tokenizer)
     if BACKEND == "transformers":
         try:
@@ -1645,10 +2741,11 @@ def load_model() -> Optional[tuple[Any, Any]]:
         _mdl = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to(
             _device
         )
-        print(f"{GREEN}✓ Loaded on {_device}: {MODEL}{RESET}\n")
+        print_system(f"✓ Loaded on {_device}: {MODEL}")
+        print()
         return (_mdl, _tok)
     if BACKEND == "local":
-        print(f"{DIM}Local proxy at {API_BASE}{RESET}\n")
+        print_system(f"Local proxy at {API_BASE}")
         return None
     if BACKEND == "ollama":
         base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -1671,7 +2768,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
             print(
                 f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
             )
-        print(f"{DIM}{BACKEND} ({MODEL}){RESET}\n")
+        print_system(f"{BACKEND} ({MODEL})")
         return None
     # Hosted API backends — all require a key.
     if not API_KEY:
@@ -1681,7 +2778,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
             f"{DIM}Set {key_env}, or run `wrencode --configure` to re-enter it.{RESET}"
         )
         raise SystemExit(1)
-    print(f"{DIM}{BACKEND} ({MODEL}){RESET}\n")
+    print_system(f"{BACKEND} ({MODEL})")
     return None
 
 
@@ -1693,10 +2790,11 @@ def print_help() -> None:
     print("wrencode — a minimal agentic coding assistant\n")
     print("Usage: wrencode [options]\n")
     print("Options:")
-    print("  --configure     (re)choose and save the inference backend")
+    print("  --configure     (re)choose backend and model (↑↓ picker)")
     print("  --yes           auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("  --version, -V   print version and exit")
     print("  --help, -h      show this help\n")
+    print("Slash commands: /backend /model /loader /c /compact /q  (see /help in session)")
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
         "(e.g. ANTHROPIC_API_KEY) take precedence over saved config."
@@ -1725,23 +2823,28 @@ def main() -> None:
         "WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve())
     )
     resolve_configuration(force_chooser=force)
+    init_loader_style()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(WREN_BANNER)
-    print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}\n")
+    print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}")
     mlx_state = load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()
     messages = load_history()
     if messages:
-        print(f"{DIM}Restored {len(messages)} messages{RESET}\n")
+        chats = sum(1 for m in messages if m.get("role") == "user")
+        print(f"{DIM}Restored {chats} chats{RESET}")
 
     while True:
         try:
-            user_input = input(f"{BRIGHT_CYAN}❯{RESET} ").strip()
+            user_input = read_user_input()
             if not user_input:
                 continue
-            action = handle_slash_command(user_input, messages, mlx_state)
+            action, new_mlx = handle_slash_command(user_input, messages, mlx_state)
+            if new_mlx is not _MLX_UNCHANGED:
+                mlx_state = new_mlx
+                _MLX_STATE = mlx_state
             if action == "quit":
                 break
             if action == "handled":
@@ -1751,8 +2854,8 @@ def main() -> None:
             save_history(messages)
         except KeyboardInterrupt:
             save_history(messages)
-            print(f"\n{YELLOW}Interrupted{RESET}")
-            break
+            print(f"\n{DIM}(use /q to quit){RESET}")
+            continue
         except EOFError:
             break
         except Exception as err:

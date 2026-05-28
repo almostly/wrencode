@@ -11,6 +11,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import wrencode
 
@@ -92,6 +93,337 @@ class TestRenderMarkdown(unittest.TestCase):
         result = wrencode.render_markdown("```\nsome code\n```")
         self.assertIn("┌─", result)
         self.assertIn("some code", result)
+
+
+# ---------------------------------------------------------------------------
+# Message blocks & confirm
+# ---------------------------------------------------------------------------
+
+class TestMessageBlocks(unittest.TestCase):
+
+    def test_print_agent_message_uses_muted_grey_no_label(self):
+        import io
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            wrencode.print_agent_message("**done**")
+        out = buf.getvalue()
+        self.assertIn(wrencode.AGENT_TEXT, out)
+        self.assertNotIn("Wren", out)
+        self.assertNotIn("You", out)
+        self.assertNotIn("\x1b[48;", out)  # no background color
+        self.assertIn("done", strip_ansi(out))
+
+    def test_print_tool_action_has_no_background(self):
+        import io
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            wrencode.print_tool_action("read", {"path": "foo.py"})
+        out = buf.getvalue()
+        self.assertNotIn("\x1b[48;", out)
+        self.assertIn("read", strip_ansi(out).lower())
+        self.assertIn("foo.py", strip_ansi(out))
+        self.assertNotIn("read read", strip_ansi(out).lower())
+
+    def test_print_tool_action_no_duplicate_write(self):
+        import io
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            wrencode.print_tool_action(
+                "write", {"path": "/tmp/x.txt", "content": ""}
+            )
+        plain = strip_ansi(buf.getvalue()).lower()
+        self.assertIn("write", plain)
+        self.assertNotIn("write write", plain)
+
+    def test_format_user_turn_line(self):
+        line = wrencode.format_user_turn_line("hello")
+        self.assertIn("❯", line)
+        self.assertIn("hello", strip_ansi(line))
+
+    def test_print_system_uses_banner_cyan(self):
+        import io
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), mock.patch.object(
+            wrencode, "colors_enabled", return_value=True
+        ):
+            wrencode.print_system("Cleared")
+        out = buf.getvalue()
+        self.assertIn("\033[96m", out)
+        self.assertIn("\033[1m", out)
+        self.assertIn("Cleared", strip_ansi(out))
+
+    def test_loading_bar_frame(self):
+        wrencode.apply_loader_style("pull")
+        bar = wrencode.loader_frame(0)
+        self.assertTrue(bar.startswith("[") and bar.endswith("]"))
+        self.assertIn(">", bar)
+        wrencode.apply_loader_style("context")
+        self.assertIn("waiting", wrencode.loader_frame(0))
+
+    def test_apply_loader_style(self):
+        wrencode.apply_loader_style("dots")
+        self.assertEqual(wrencode.LOADER_STYLE, "dots")
+        self.assertIn("•", wrencode.loader_frame(0))
+        wrencode.apply_loader_style("context")
+
+    def test_context_loader_frame(self):
+        with mock.patch.object(wrencode, "BACKEND", "anthropic"), mock.patch.object(
+            wrencode, "MODEL", "claude-sonnet-4-20250514"
+        ):
+            wrencode.apply_loader_style("context")
+            plain = wrencode.loader_frame(0)
+            self.assertIn("anthropic", plain)
+            self.assertIn("claude-sonnet", plain)
+            self.assertIn("waiting", plain)
+            self.assertTrue(plain[0] in wrencode._COMPOSE_FRAMES)
+        wrencode.apply_loader_style("context")
+
+    def test_loader_display_gradient(self):
+        wrencode.apply_loader_style("context")
+        with mock.patch.object(wrencode, "colors_enabled", return_value=True):
+            out = wrencode.loader_display(0)
+        self.assertIn("\033[96m", out)
+        self.assertIn("\033[2m", out)
+        self.assertIn("waiting", strip_ansi(out))
+
+    def test_format_picker_option_selected_is_bold(self):
+        with mock.patch.object(wrencode, "colors_enabled", return_value=True):
+            selected = wrencode.format_picker_option(
+                "▸ ", "Anthropic  [claude]", selected=True
+            )
+            plain = wrencode.format_picker_option(
+                "  ", "OpenAI  [gpt]", selected=False
+            )
+            menu = wrencode.format_picker_option(
+                "▸ ",
+                "Enter   approve once",
+                selected=True,
+                system_key_only=True,
+            )
+        self.assertIn("\033[1m", selected)
+        self.assertNotIn("\033[1m", plain)
+        self.assertNotIn("\033[96m", plain)
+        self.assertIn("Enter", strip_ansi(menu))
+        self.assertIn("approve once", strip_ansi(menu))
+        self.assertIn("\033[96m", menu)
+        self.assertNotIn(f"{wrencode.BRIGHT_CYAN}approve", menu)
+
+    def test_format_input_line_slash_is_bold_cyan(self):
+        with mock.patch.object(wrencode, "colors_enabled", return_value=True):
+            slash = wrencode.format_input_line("/backend")
+            slash_args = wrencode.format_input_line("/backend fgggg")
+            chat = wrencode.format_input_line("hello")
+        self.assertIn("\033[1m", slash)
+        self.assertIn("/backend", strip_ansi(slash))
+        self.assertIn("\033[1m", slash_args)
+        plain_args = strip_ansi(slash_args)
+        self.assertIn("/backend fgggg", plain_args)
+        bold_parts = slash_args.split("\033[1m")
+        self.assertEqual(len(bold_parts), 2)  # bold wraps /backend only
+        self.assertIn("fgggg", bold_parts[-1])
+        self.assertNotIn("\033[1m", chat)
+        self.assertIn("hello", strip_ansi(chat))
+
+    def test_read_user_input_fallback(self):
+        import io
+
+        with mock.patch("sys.stdin", io.StringIO("hello\n")), mock.patch.object(
+            wrencode, "colors_enabled", return_value=False
+        ):
+            self.assertEqual(wrencode.read_user_input(), "hello")
+
+
+class TestConfirm(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_auto = os.environ.get("WRENCODE_AUTO_APPROVE")
+        self._orig_session = wrencode._SESSION_AUTO_APPROVE
+        wrencode._SESSION_AUTO_APPROVE = False
+        if "WRENCODE_AUTO_APPROVE" in os.environ:
+            del os.environ["WRENCODE_AUTO_APPROVE"]
+
+    def tearDown(self):
+        wrencode._SESSION_AUTO_APPROVE = self._orig_session
+        if self._orig_auto is not None:
+            os.environ["WRENCODE_AUTO_APPROVE"] = self._orig_auto
+        elif "WRENCODE_AUTO_APPROVE" in os.environ:
+            del os.environ["WRENCODE_AUTO_APPROVE"]
+
+    def test_confirm_no_duplicate_write_prompt(self):
+        import io
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), mock.patch.object(
+            wrencode, "read_confirm_choice", return_value=""
+        ):
+            wrencode.confirm("write")
+        plain = strip_ansi(buf.getvalue())
+        self.assertNotIn("PosixPath", plain)
+        self.assertNotIn("⚠ write", plain)
+        self.assertIn("approve once", plain)
+
+    def test_enter_approves(self):
+        with mock.patch.object(wrencode, "read_confirm_choice", return_value=""):
+            self.assertEqual(wrencode.confirm("write"), "ok")
+
+    def test_allow_all_sets_session_flag(self):
+        with mock.patch.object(wrencode, "read_confirm_choice", return_value="a"):
+            self.assertEqual(wrencode.confirm("write"), "ok")
+        self.assertTrue(wrencode._SESSION_AUTO_APPROVE)
+
+    def test_decline_collects_feedback(self):
+        with mock.patch.object(
+            wrencode, "read_confirm_choice", return_value="n"
+        ), mock.patch.object(
+            wrencode, "read_feedback_line", return_value="use edit instead"
+        ):
+            result = wrencode.confirm("write")
+        self.assertEqual(result, "cancelled: user declined — use edit instead")
+
+    def test_decline_without_feedback(self):
+        with mock.patch.object(
+            wrencode, "read_confirm_choice", return_value="n"
+        ), mock.patch.object(wrencode, "read_feedback_line", return_value=""):
+            result = wrencode.confirm("write")
+        self.assertEqual(result, "cancelled: user declined without instructions")
+
+    def test_env_auto_approve(self):
+        os.environ["WRENCODE_AUTO_APPROVE"] = "1"
+        self.assertEqual(wrencode.confirm("run"), "ok")
+
+    def test_ctrl_c_returns_interrupted(self):
+        with mock.patch.object(
+            wrencode, "read_confirm_choice", side_effect=KeyboardInterrupt
+        ):
+            self.assertEqual(
+                wrencode.confirm("write"),
+                "cancelled: user interrupted",
+            )
+
+    def test_arrow_key_right_is_not_escape(self):
+        fd = 0
+        reads = [b"\x1b", b"[C"]
+
+        def fake_read(f, n):
+            self.assertEqual(f, fd)
+            return reads.pop(0)
+
+        with mock.patch("select.select", return_value=([fd], [], [])), mock.patch(
+            "os.read", side_effect=fake_read
+        ):
+            self.assertEqual(wrencode._read_arrow_key(fd), "right")
+
+    def test_arrow_key_n_returns_char(self):
+        with mock.patch("os.read", return_value=b"n"):
+            self.assertEqual(wrencode._read_arrow_key(0), "n")
+
+    def test_arrow_key_tab(self):
+        with mock.patch("os.read", return_value=b"\t"):
+            self.assertEqual(wrencode._read_arrow_key(0), "tab")
+
+
+class TestChooseBackendInteractive(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_config_file = wrencode.CONFIG_FILE
+        self._orig_anthropic_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        self._tmp = tempfile.mkdtemp()
+        wrencode.CONFIG_FILE = pathlib.Path(self._tmp) / "config.json"
+
+    def tearDown(self):
+        wrencode.CONFIG_FILE = self._orig_config_file
+        if self._orig_anthropic_key is not None:
+            os.environ["ANTHROPIC_API_KEY"] = self._orig_anthropic_key
+        elif "ANTHROPIC_API_KEY" in os.environ:
+            del os.environ["ANTHROPIC_API_KEY"]
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_reconfigure_preserves_saved_api_key(self):
+        wrencode.save_config(
+            {
+                "backend": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "api_key": "sk-secret",
+            }
+        )
+        with mock.patch.object(wrencode, "pick_from_list", return_value=0), mock.patch.object(
+            wrencode, "pick_model_interactive",
+            return_value="claude-haiku-4-5-20251001",
+        ), mock.patch("getpass.getpass", return_value=""):
+            wrencode.choose_backend_interactive()
+        saved = json.loads(wrencode.CONFIG_FILE.read_text())
+        self.assertEqual(saved["api_key"], "sk-secret")
+        self.assertEqual(wrencode.API_KEY, "sk-secret")
+
+
+class TestToolArgs(unittest.TestCase):
+
+    def test_bash_accepts_command_alias(self):
+        args = wrencode.normalize_tool_args("bash", {"command": "echo hi"})
+        self.assertEqual(args["cmd"], "echo hi")
+
+    def test_format_bash_shows_full_command(self):
+        text = wrencode.format_tool_action(
+            "bash", {"command": "cat << 'EOF'\nhello\nEOF"}
+        )
+        self.assertIn("$ cat << 'EOF'", text)
+        self.assertIn("hello", text)
+
+    def test_run_tool_bash_with_command_alias(self):
+        self._orig = os.environ.get("WRENCODE_AUTO_APPROVE")
+        os.environ["WRENCODE_AUTO_APPROVE"] = "1"
+        try:
+            result = wrencode.run_tool("bash", {"command": "echo wrencode-test"})
+        finally:
+            if self._orig is not None:
+                os.environ["WRENCODE_AUTO_APPROVE"] = self._orig
+            elif "WRENCODE_AUTO_APPROVE" in os.environ:
+                del os.environ["WRENCODE_AUTO_APPROVE"]
+        self.assertIn("wrencode-test", result)
+
+
+class TestModelPicker(unittest.TestCase):
+
+    def test_list_models_includes_current_and_custom(self):
+        wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
+        models = wrencode.list_models_for_backend("anthropic")
+        self.assertIn("claude-haiku-4-5-20251001", models)
+        self.assertIn(wrencode.CUSTOM_MODEL_OPTION, models)
+
+    def test_pick_from_list_fallback(self):
+        orig_isatty = sys.stdin.isatty
+        sys.stdin.isatty = lambda: False
+        try:
+            with mock.patch("builtins.input", return_value="2"):
+                idx = wrencode.pick_from_list(
+                    "Pick", ["a", "b", "c"], labels=["A", "B", "C"]
+                )
+        finally:
+            sys.stdin.isatty = orig_isatty
+        self.assertEqual(idx, 1)
+
+    def test_switch_model_direct_id(self):
+        wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
+        self._orig = os.environ.pop("ANTHROPIC_API_KEY", None)
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        self._orig_config = wrencode.CONFIG_FILE
+        self._tmp = tempfile.mkdtemp()
+        wrencode.CONFIG_FILE = pathlib.Path(self._tmp) / "config.json"
+        try:
+            result = wrencode.switch_model_runtime("claude-sonnet-4-20250514")
+            self.assertIsNone(result)
+            self.assertEqual(wrencode.MODEL, "claude-sonnet-4-20250514")
+        finally:
+            wrencode.CONFIG_FILE = self._orig_config
+            if self._orig is not None:
+                os.environ["ANTHROPIC_API_KEY"] = self._orig
+            elif "ANTHROPIC_API_KEY" in os.environ:
+                del os.environ["ANTHROPIC_API_KEY"]
+            import shutil
+            shutil.rmtree(self._tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
