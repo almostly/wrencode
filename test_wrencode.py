@@ -29,7 +29,6 @@ YELLOW = "\033[33m"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def strip_ansi(s: str) -> str:
     """Remove ANSI escape sequences from a string."""
     import re
@@ -37,9 +36,8 @@ def strip_ansi(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# render_markdown
+# Render markdown
 # ---------------------------------------------------------------------------
-
 class TestRenderMarkdown(unittest.TestCase):
 
     def test_bold(self):
@@ -99,7 +97,6 @@ class TestRenderMarkdown(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Message blocks & confirm
 # ---------------------------------------------------------------------------
-
 class TestMessageBlocks(unittest.TestCase):
 
     def test_print_agent_message_uses_muted_grey_no_label(self):
@@ -350,9 +347,8 @@ class TestModelPicker(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _highlight_code
+# Highlight Code
 # ---------------------------------------------------------------------------
-
 class TestHighlightCode(unittest.TestCase):
 
     def test_keyword_is_blue(self):
@@ -385,9 +381,8 @@ class TestHighlightCode(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# strip_gptoss_tokens
+# Strip GPT OSS tokens
 # ---------------------------------------------------------------------------
-
 class TestStripGptossTokens(unittest.TestCase):
 
     def test_strips_channel_prefix(self):
@@ -412,9 +407,8 @@ class TestStripGptossTokens(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# truncate_at_turn_leak
+# Truncate at turn leak
 # ---------------------------------------------------------------------------
-
 class TestTruncateAtTurnLeak(unittest.TestCase):
 
     def test_truncates_at_user_marker(self):
@@ -445,9 +439,8 @@ class TestTruncateAtTurnLeak(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _tool_call_complete
+# Complete Tool Call
 # ---------------------------------------------------------------------------
-
 class TestToolCallComplete(unittest.TestCase):
 
     def test_complete_with_end_tag(self):
@@ -483,9 +476,8 @@ class TestToolCallComplete(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# parse_tool_calls
+# Parse tool calls
 # ---------------------------------------------------------------------------
-
 class TestParseToolCalls(unittest.TestCase):
 
     def test_single_call_with_end_tag(self):
@@ -561,9 +553,8 @@ class TestParseToolCalls(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# apply_backend
+# Apply backend
 # ---------------------------------------------------------------------------
-
 class TestApplyBackend(unittest.TestCase):
 
     def setUp(self):
@@ -627,9 +618,8 @@ class TestApplyBackend(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# resolve_configuration
+# Resolve configuration
 # ---------------------------------------------------------------------------
-
 class TestResolveConfiguration(unittest.TestCase):
 
     def setUp(self):
@@ -697,7 +687,6 @@ class TestResolveConfiguration(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # File tools (read, write, edit, glob, grep) with workspace sandbox
 # ---------------------------------------------------------------------------
-
 class TestFileTools(unittest.TestCase):
 
     def setUp(self):
@@ -877,7 +866,6 @@ class TestFileTools(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Agent loop smoke test (XML tool-call path via mocked get_response)
 # ---------------------------------------------------------------------------
-
 class TestAgentLoopSmoke(unittest.TestCase):
     """Smoke-test run_agent_turn using a mock backend (no real LLM calls)."""
 
@@ -1005,7 +993,6 @@ class TestAgentLoopSmoke(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Additional helpers / edge cases
 # ---------------------------------------------------------------------------
-
 class TestFlattenContent(unittest.TestCase):
 
     def test_plain_string_unchanged(self):
@@ -1073,6 +1060,45 @@ class TestTruncationWarning(unittest.TestCase):
         with mock.patch.object(wrencode, "BACKEND", "openai"):
             out = self._capture_stderr(wrencode._warn_if_truncated, data)
         self.assertIn("truncated", out.lower())
+
+
+class TestAnthropicPromptCache(unittest.TestCase):
+    """Confirm the anthropic request wires cache_control onto system + last tool."""
+
+    def test_system_and_tools_are_marked_ephemeral(self):
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured["payload"] = payload
+            # minimal valid response shape
+            return {
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        with mock.patch.object(wrencode, "BACKEND", "anthropic"), \
+             mock.patch.object(wrencode, "MODEL", "claude-sonnet-4-6"), \
+             mock.patch.object(wrencode, "API_KEY", "test-key"), \
+             mock.patch.object(wrencode, "API_BASE", "https://api.anthropic.com/v1/messages"), \
+             mock.patch.object(wrencode, "_http_post", fake_post):
+            wrencode.get_response(
+                messages=[{"role": "user", "content": "hi"}],
+                system_prompt="you are a test",
+                mlx_state=None,
+            )
+
+        payload = captured["payload"]
+        # system is now a list with a cache breakpoint
+        self.assertIsInstance(payload["system"], list)
+        self.assertEqual(payload["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(payload["system"][0]["text"], "you are a test")
+        # the last tool entry carries a cache breakpoint
+        self.assertIn("cache_control", payload["tools"][-1])
+        self.assertEqual(payload["tools"][-1]["cache_control"], {"type": "ephemeral"})
+        # earlier tools do not
+        if len(payload["tools"]) > 1:
+            self.assertNotIn("cache_control", payload["tools"][0])
 
 
 class TestRunTool(unittest.TestCase):

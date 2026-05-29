@@ -72,7 +72,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                 os.environ.setdefault(_k.strip(), _v)
 
 # -----------------------------------------------------------------------------------------------
-# Backend Configuration
+# Backend configuration
 # -----------------------------------------------------------------------------------------------
 WRENCODE_VERSION = "0.1.4.4"
 
@@ -220,7 +220,7 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
 
 
 # -----------------------------------------------------------------------------------------------
-# Constants & Environment Variables
+# Constants & environment variables
 # -----------------------------------------------------------------------------------------------
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 MAX_READ_BYTES = int(os.environ.get("MAX_READ_BYTES", str(4 * 1024 * 1024)))
@@ -239,7 +239,7 @@ _GLOB_SKIP: set[str] = {
 }
 
 # -----------------------------------------------------------------------------------------------
-# Terminal Colors
+# Terminal colors
 # -----------------------------------------------------------------------------------------------
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, YELLOW, RED = (
@@ -505,7 +505,7 @@ WREN_BANNER = f"""{BRIGHT_CYAN}\u2588\u2588     \u2588\u2588 \u2588\u2588\u2588\
 
 
 # -----------------------------------------------------------------------------------------------
-# Path Helpers
+# Path helpers
 # -----------------------------------------------------------------------------------------------
 def workspace_root() -> pathlib.Path:
     """Return the resolved workspace root path from env or cwd."""
@@ -533,7 +533,7 @@ def resolve_tool_path(raw: Any) -> pathlib.Path:
 
 
 # -----------------------------------------------------------------------------------------------
-# Input Validation
+# Input validation
 # -----------------------------------------------------------------------------------------------
 def _require_str(args: dict[str, Any], key: str) -> str:
     """Require a non-empty string value from args dict by key."""
@@ -1031,7 +1031,7 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
 
 
 # -----------------------------------------------------------------------------------------------
-# Message Formatting
+# Message formatting
 # -----------------------------------------------------------------------------------------------
 def flatten_content(content: Any) -> str:
     """Flatten Anthropic-style content list to plain string."""
@@ -1143,7 +1143,7 @@ def thinking_spinner() -> Any:
 
 
 # -----------------------------------------------------------------------------------------------
-# Token & Output Cleaning
+# Token & output cleaning
 # -----------------------------------------------------------------------------------------------
 def strip_gptoss_tokens(text: str) -> str:
     """Strip GPT-OSS special tokens and channel markers from model output."""
@@ -1244,7 +1244,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------------------------
-# Anthropic Native Tools
+# Anthropic native tools
 # -----------------------------------------------------------------------------------------------
 _TYPE_MAP: dict[str, str] = {
     "string": "string",
@@ -1300,9 +1300,32 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
         )
 
 
+def _log_usage_debug(data: dict[str, Any]) -> None:
+    """When WRENCODE_DEBUG=1, print one stderr line per turn with token usage.
+    Surfaces cache_creation_input_tokens / cache_read_input_tokens so prompt-
+    cache hit rate is observable without external tooling.
+    """
+    if not os.environ.get("WRENCODE_DEBUG"):
+        return
+    u = data.get("usage", {})
+    if BACKEND == "anthropic":
+        print(
+            f"{DIM}usage: in={u.get('input_tokens')} out={u.get('output_tokens')} "
+            f"cache_write={u.get('cache_creation_input_tokens', 0)} "
+            f"cache_read={u.get('cache_read_input_tokens', 0)}{RESET}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"{DIM}usage: in={u.get('prompt_tokens')} out={u.get('completion_tokens')}{RESET}",
+            file=sys.stderr,
+        )
+
+
 def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]:
     """Parse a native (Anthropic / OpenAI) API response into display text and tool calls."""
     _warn_if_truncated(data)
+    _log_usage_debug(data)
     if BACKEND == "anthropic":
         blocks = data.get("content", [])
         text = "\n".join(b["text"] for b in blocks if b.get("type") == "text").strip()
@@ -1386,7 +1409,7 @@ def _append_tool_results(
 
 
 # -----------------------------------------------------------------------------------------------
-# HTTP Helper
+# HTTP helper
 # -----------------------------------------------------------------------------------------------
 def _http_post(
     url: str, payload: dict[str, Any], headers: dict[str, str]
@@ -1415,7 +1438,7 @@ def get_response(
         for m in messages
     ]
 
-    # OpenAI — native function calling
+    # OpenAI - native function calling
     if BACKEND == "openai":
         data = _http_post(
             API_BASE,
@@ -1432,7 +1455,7 @@ def get_response(
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
-    # OpenRouter / Ollama — OpenAI-compatible chat completions (no native tools)
+    # OpenRouter / Ollama - OpenAI-compatible chat completions (no native tools)
     if BACKEND in {"openrouter", "ollama"}:
         data = _http_post(
             API_BASE,
@@ -1447,22 +1470,30 @@ def get_response(
         )
         return str(data["choices"][0]["message"]["content"])
 
-    # Anthropic — native tool use API
+    # Anthropic - native tool use API
     if BACKEND == "anthropic":
+        # Prompt caching: mark the (large, static) system block + tool schemas as
+        # ephemeral. Anthropic caches everything up to and including each marker
+        # for ~5 minutes; subsequent turns in the same session read at ~10% of
+        # normal input cost. Two breakpoints out of the four allowed per request.
+        tools = _build_tool_schemas("anthropic")
+        if tools:
+            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
         data = _http_post(
             API_BASE,
             {
                 "model": MODEL,
-                "system": system_prompt,
+                "system": [{"type": "text", "text": system_prompt,
+                            "cache_control": {"type": "ephemeral"}}],
                 "messages": messages,
                 "max_tokens": MAX_TOKENS,
-                "tools": _build_tool_schemas("anthropic"),
+                "tools": tools,
             },
             _anthropic_headers(),
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
-    # Local proxy — Anthropic messages API; tool calls returned as XML <tool_call> tags in text
+    # Local proxy - Anthropic messages API; tool calls returned as XML <tool_call> tags in text
     if BACKEND == "local":
         data = _http_post(
             API_BASE,
@@ -1534,7 +1565,7 @@ def get_response(
 
 
 # -----------------------------------------------------------------------------------------------
-# History Management
+# History management
 # -----------------------------------------------------------------------------------------------
 def history_file_path() -> pathlib.Path:
     """Return the history file path from env override or user-level default."""
@@ -1634,7 +1665,7 @@ def compact_messages(
 
 
 # -----------------------------------------------------------------------------------------------
-# Workspace & System Prompt
+# Workspace & system prompt
 # -----------------------------------------------------------------------------------------------
 def git_context() -> str:
     """Return a formatted git status string if inside a git repository."""
@@ -1686,7 +1717,7 @@ CRITICAL: You MUST use tools for file operations. Never say you can't access fil
 
 
 # -----------------------------------------------------------------------------------------------
-# Agent Loop
+# Agentic loop
 # -----------------------------------------------------------------------------------------------
 def _track_error(
     result: str, last: Optional[str], count: int
@@ -1755,7 +1786,7 @@ def run_agent_turn(
 
 
 # -----------------------------------------------------------------------------------------------
-# Slash Commands
+# Slash commands
 # -----------------------------------------------------------------------------------------------
 def handle_slash_command(
     cmd: str,
@@ -1806,7 +1837,7 @@ def handle_slash_command(
 
 
 # -----------------------------------------------------------------------------------------------
-# Backend Selection & Config Persistence
+# Backend selection & config persistence
 # -----------------------------------------------------------------------------------------------
 def is_frozen() -> bool:
     """Set true when running as a PyInstaller standalone binary."""
@@ -2159,7 +2190,7 @@ def resolve_configuration(force_chooser: bool = False) -> None:
 
 
 # -----------------------------------------------------------------------------------------------
-# Model Loading
+# Model loading
 # -----------------------------------------------------------------------------------------------
 def load_model() -> Optional[tuple[Any, Any]]:
     """Load model for the current backend and return mlx_state (or None for API backends)."""
@@ -2247,7 +2278,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
 
 
 # -----------------------------------------------------------------------------------------------
-# Entry Point
+# Entrypoint
 # -----------------------------------------------------------------------------------------------
 def print_help() -> None:
     """Print CLI usage."""
