@@ -16,13 +16,26 @@ jobs:
           - os: ubuntu-latest
             artifact_name: wrencode-linux-x64
             build_prefix: ""
+            bin_ext: ""
           - os: macos-14
             artifact_name: wrencode-macos-x64
             build_prefix: "arch -x86_64"
+            bin_ext: ""
           - os: macos-14
             artifact_name: wrencode-macos-arm64
             build_prefix: ""
+            bin_ext: ""
+          - os: windows-latest
+            artifact_name: wrencode-windows-x64.exe
+            build_prefix: ""
+            bin_ext: ".exe"
     runs-on: ${{ matrix.os }}
+
+    # Use bash on every runner (Git Bash on Windows) so the build/rename steps
+    # are identical across platforms.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -39,8 +52,13 @@ jobs:
       - name: Build single-file binary
         run: ${{ matrix.build_prefix }} pyinstaller --onefile --name wrencode wrencode.py
 
+      - name: Verify the binary bundles a CA trust store
+        run: |
+          test -f "dist/wrencode${{ matrix.bin_ext }}"
+          ./dist/wrencode${{ matrix.bin_ext }} --version
+
       - name: Rename artifact for platform
-        run: mv dist/wrencode dist/${{ matrix.artifact_name }}
+        run: mv "dist/wrencode${{ matrix.bin_ext }}" "dist/${{ matrix.artifact_name }}"
 
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2
