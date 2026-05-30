@@ -34,7 +34,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install build dependencies
-        run: ${{ matrix.build_prefix }} python -m pip install --upgrade pip pyinstaller
+        run: ${{ matrix.build_prefix }} python -m pip install --upgrade pip pyinstaller certifi
 
       - name: Build single-file binary
         run: ${{ matrix.build_prefix }} pyinstaller --onefile --name wrencode wrencode.py

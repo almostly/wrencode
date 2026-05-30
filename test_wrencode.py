@@ -1101,6 +1101,27 @@ class TestAnthropicPromptCache(unittest.TestCase):
             self.assertNotIn("cache_control", payload["tools"][0])
 
 
+class TestCertifiTrustStore(unittest.TestCase):
+    """The startup block points SSL at certifi so the bundled binary can do TLS."""
+
+    def test_ssl_cert_file_points_at_existing_bundle(self):
+        # certifi is a build dep of the binary; if it's importable, the startup
+        # block must have set SSL_CERT_FILE to a real CA bundle file.
+        try:
+            import certifi
+        except ImportError:
+            self.skipTest("certifi not installed in this environment")
+        cert_file = os.environ.get("SSL_CERT_FILE")
+        self.assertEqual(cert_file, certifi.where())
+        self.assertTrue(os.path.exists(cert_file))
+
+    def test_existing_override_is_preserved(self):
+        # setdefault must not clobber a user-provided SSL_CERT_FILE.
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": "/custom/path.pem"}):
+            os.environ.setdefault("SSL_CERT_FILE", "/should/not/win.pem")
+            self.assertEqual(os.environ["SSL_CERT_FILE"], "/custom/path.pem")
+
+
 class TestRunTool(unittest.TestCase):
 
     def setUp(self):
