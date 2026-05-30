@@ -53,6 +53,19 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
 
+# The PyInstaller single-file binary ships no system CA trust store, so urllib's
+# TLS verification fails out of the box ("CERTIFICATE_VERIFY_FAILED") on a clean
+# machine. If certifi is bundled (it is in the binary build), point the SSL
+# defaults at it before any request. Soft import keeps pip/uvx installs
+# dependency-free; setdefault preserves any user-provided override.
+try:
+    import certifi
+
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:
+    pass
+
 # Load .env (next to this script, then the current directory); real env vars win.
 for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
     _env_path = os.path.join(_dir, ".env")
@@ -74,7 +87,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.1.4.5"
+WRENCODE_VERSION = "0.1.4.6"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
