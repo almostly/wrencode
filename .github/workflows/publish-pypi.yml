@@ -1,6 +1,12 @@
 name: publish-pypi
 
 on:
+  # A pushed version tag (e.g. 0.1.4.7) publishes to PyPI automatically,
+  # alongside the binary build in release.yml.
+  push:
+    tags:
+      - "[0-9]*"
+  # Manual runs can still target TestPyPI (or PyPI) on demand.
   workflow_dispatch:
     inputs:
       target:
@@ -19,11 +25,19 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Build
         run: uv build
-      - name: Publish to ${{ inputs.target }}
-        env:
-          UV_PUBLISH_TOKEN: ${{ inputs.target == 'pypi' && secrets.PYPI_API_TOKEN || secrets.TEST_PYPI_API_TOKEN }}
+      - name: Resolve publish target
+        id: target
         run: |
-          if [ "${{ inputs.target }}" = "pypi" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "name=pypi" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ inputs.target }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish to ${{ steps.target.outputs.name }}
+        env:
+          UV_PUBLISH_TOKEN: ${{ steps.target.outputs.name == 'pypi' && secrets.PYPI_API_TOKEN || secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          if [ "${{ steps.target.outputs.name }}" = "pypi" ]; then
             uv publish
           else
             uv publish --publish-url https://test.pypi.org/legacy/
