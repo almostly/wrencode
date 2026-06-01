@@ -87,7 +87,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.1.4.6"
+WRENCODE_VERSION = "0.1.4.7"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
@@ -280,6 +280,7 @@ def _loader_context_text() -> str:
 
 
 def loader_display(step: int) -> str:
+    """Render one animated loader frame for the given step."""
     sym = _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
     text = _loader_context_text()
     if not colors_enabled():
@@ -288,7 +289,7 @@ def loader_display(step: int) -> str:
 
 
 def colors_enabled() -> bool:
-    """True when ANSI styling should be applied."""
+    """Return True when ANSI styling should be applied."""
     if os.environ.get("NO_COLOR") is not None:
         return False
     if os.environ.get("FORCE_COLOR"):
@@ -1293,6 +1294,7 @@ def _openai_headers() -> dict[str, str]:
 
 def _warn_if_truncated(data: dict[str, Any]) -> None:
     """Print a stderr warning if the API truncated the response at max_tokens.
+
     A truncated `tool_use` may be missing required fields (e.g. `content` for
     `write`), so callers need to know to raise MAX_TOKENS rather than silently
     treating an empty operation as success.
@@ -1315,6 +1317,7 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
 
 def _log_usage_debug(data: dict[str, Any]) -> None:
     """When WRENCODE_DEBUG=1, print one stderr line per turn with token usage.
+
     Surfaces cache_creation_input_tokens / cache_read_input_tokens so prompt-
     cache hit rate is observable without external tooling.
     """
@@ -1360,6 +1363,8 @@ def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]
 
 @dataclass
 class ToolCall:
+    """A single tool invocation parsed from a model response."""
+
     id: str
     name: str
     input: dict[str, Any]
@@ -2039,6 +2044,39 @@ def persist_backend_choice(cfg: dict[str, str]) -> None:
     )
 
 
+def verify_api_key() -> tuple[str, str]:
+    """Probe the current backend with API_KEY to see if the key actually works.
+
+    Returns (state, detail): "ok" (accepted), "invalid" (rejected by the
+    service), or "unknown" (couldn't reach it — network/timeout). Local
+    backends and missing keys short-circuit to "ok"/"invalid" without a call.
+    """
+    spec = BACKEND_SPECS[BACKEND]
+    if spec["kind"] != "api":
+        return ("ok", "")
+    if not API_KEY:
+        return ("invalid", "no key")
+    probes = {
+        "anthropic": ("https://api.anthropic.com/v1/models", _anthropic_headers()),
+        "openai": ("https://api.openai.com/v1/models", _openai_headers()),
+        "openrouter": ("https://openrouter.ai/api/v1/key", _openai_headers()),
+    }
+    if BACKEND not in probes:
+        return ("unknown", "")
+    url, headers = probes[BACKEND]
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read(1)
+        return ("ok", "")
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            return ("invalid", f"HTTP {err.code}")
+        return ("unknown", f"HTTP {err.code}")
+    except Exception as err:
+        return ("unknown", str(err))
+
+
 def pick_model_interactive(backend: str) -> Optional[str]:
     """Arrow-key model picker for a backend; returns model id or None."""
     models = list_models_for_backend(backend)
@@ -2153,21 +2191,36 @@ def choose_backend_interactive() -> None:
         raise SystemExit(1)
 
     cfg: dict[str, str] = {"backend": choice, "model": model}
+    spec = BACKEND_SPECS[choice]
     _prompt_api_key_if_needed(choice, existing, cfg)
     persist_backend_choice(cfg)
     print_system(f"✓ Saved backend choice to {CONFIG_FILE}")
-    print()
+
+    # Verify the key actually works before declaring the backend ready, so a
+    # typo or revoked key surfaces here instead of mid-chat. Re-prompt on a
+    # hard rejection; don't block on a transient network failure.
+    for attempt in range(3):
+        state, detail = verify_api_key()
+        if state == "ok":
+            print_system(f"✓ {choice}:{MODEL} ready")
+            return
+        if state == "unknown":
+            print(f"{YELLOW}⚠ Couldn't verify {spec['key_env']} ({detail}).{RESET}")
+            return
+        print(f"{RED}✗ {spec['key_env']} was rejected ({detail}).{RESET}")
+        if not sys.stdin.isatty() or attempt == 2:
+            return
+        newkey = getpass.getpass(
+            f"{BLUE}❯{RESET} re-enter {spec['key_env']} (input hidden): "
+        ).strip()
+        if not newkey:
+            return
+        cfg["api_key"] = newkey
+        persist_backend_choice(cfg)
 
 
-def resolve_configuration(force_chooser: bool = False) -> None:
+def resolve_configuration() -> None:
     """Decide which backend to use: env override > saved config > interactive > error."""
-    if force_chooser:
-        if not sys.stdin.isatty():
-            print(f"{RED}--configure needs an interactive terminal.{RESET}")
-            raise SystemExit(1)
-        choose_backend_interactive()
-        return
-
     # 1. Explicit BACKEND env var — power users / CI. Unchanged from prior behaviour.
     env_backend = os.environ.get("BACKEND")
     if env_backend:
@@ -2183,9 +2236,26 @@ def resolve_configuration(force_chooser: bool = False) -> None:
     # 2. A choice saved from a previous run.
     cfg = load_config()
     if cfg.get("backend") in BACKEND_SPECS:
-        apply_backend(
-            cfg["backend"], cfg.get("model", ""), cfg.get("api_key", "")
+        backend = cfg["backend"]
+        spec = BACKEND_SPECS[backend]
+        # A hosted backend with no usable key — env var unset and nothing
+        # saved (e.g. configured in a dir whose .env supplied the key, so it
+        # was never persisted) — would dead-end in load_model() with a
+        # SystemExit. In a terminal, re-run the chooser so the user can pick a
+        # backend and enter a key instead of the tool exiting immediately.
+        key_missing = (
+            spec["kind"] == "api"
+            and not os.environ.get(spec["key_env"])
+            and not cfg.get("api_key")
         )
+        if key_missing and sys.stdin.isatty():
+            print(
+                f"{YELLOW}Saved backend '{backend}' has no API key "
+                f"({spec['key_env']} is unset and none was saved).{RESET}"
+            )
+            choose_backend_interactive()
+            return
+        apply_backend(backend, cfg.get("model", ""), cfg.get("api_key", ""))
         return
 
     # 3. First run with a real terminal — ask the user.
@@ -2197,7 +2267,7 @@ def resolve_configuration(force_chooser: bool = False) -> None:
     print(f"{RED}No backend configured.{RESET}")
     print(
         "Set BACKEND=<name> (plus the matching API key), "
-        "or run `wrencode --configure` in a terminal."
+        "or run `wrencode` in a terminal to choose one."
     )
     raise SystemExit(1)
 
@@ -2216,7 +2286,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
         except ImportError:
             print(f"{RED}MLX backend needs mlx-lm:{RESET} pip install mlx-lm")
             print(
-                f"{DIM}Or run `wrencode --configure` to pick a hosted backend.{RESET}"
+                f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}"
             )
             raise SystemExit(1)
         print(f"{YELLOW}Loading model...{RESET}")
@@ -2238,7 +2308,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
                 "pip install transformers torch"
             )
             print(
-                f"{DIM}Or run `wrencode --configure` to pick a hosted backend.{RESET}"
+                f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}"
             )
             raise SystemExit(1)
         print(f"{YELLOW}Loading model via transformers...{RESET}")
@@ -2283,7 +2353,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
         key_env = BACKEND_SPECS[BACKEND]["key_env"]
         print(f"{RED}{key_env} not set.{RESET}")
         print(
-            f"{DIM}Set {key_env}, or run `wrencode --configure` to re-enter it.{RESET}"
+            f"{DIM}Set {key_env}, or run `wrencode` in a terminal to enter a key.{RESET}"
         )
         raise SystemExit(1)
     print_system(f"{BACKEND} ({MODEL})")
@@ -2293,15 +2363,36 @@ def load_model() -> Optional[tuple[Any, Any]]:
 # -----------------------------------------------------------------------------------------------
 # Entrypoint
 # -----------------------------------------------------------------------------------------------
+def uninstall() -> None:
+    """Delete saved state and print how to remove the program for this install."""
+    if CONFIG_DIR.exists():
+        try:
+            shutil.rmtree(CONFIG_DIR)
+            print_system(f"✓ Removed saved config {CONFIG_DIR}")
+        except OSError as err:
+            print(f"{YELLOW}Could not remove {CONFIG_DIR}: {err}{RESET}")
+    else:
+        print_system(f"No saved config at {CONFIG_DIR}")
+
+    print_system("To remove the program itself:")
+    if is_frozen():
+        # install.sh drops a standalone binary; sys.executable is that file.
+        print(f"rm {sys.executable}")
+    else:
+        print(f"{DIM}uv tool install:{RESET} uv tool uninstall wrencode")
+        print(f"{DIM}pip install:{RESET} pip uninstall wrencode")
+        print(f"{DIM}uvx cache:{RESET} uv cache clean wrencode")
+
+
 def print_help() -> None:
     """Print CLI usage."""
     print("wrencode — a minimal agentic coding assistant\n")
     print("Usage: wrencode [options]\n")
     print("Options:")
-    print("  --configure     (re)choose backend and model (↑↓ picker)")
-    print("  --yes           auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
-    print("  --version, -V   print version and exit")
-    print("  --help, -h      show this help\n")
+    print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
+    print("--uninstall   remove saved config and show how to delete wrencode")
+    print("--version, -V print version and exit")
+    print("--help, -h    show this help\n")
     print("Slash commands: /backend /model /c /compact /q  (see /help in session)")
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
@@ -2323,14 +2414,16 @@ def main() -> None:
     if "--version" in args or "-V" in args:
         print(f"wrencode {WRENCODE_VERSION}")
         return
-    force = "--configure" in args or (bool(args) and args[0] == "configure")
+    if "--uninstall" in args or (bool(args) and args[0] == "uninstall"):
+        uninstall()
+        return
     if "--yes" in args or "--auto-approve" in args:
         os.environ["WRENCODE_AUTO_APPROVE"] = "1"
 
     os.environ.setdefault(
         "WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve())
     )
-    resolve_configuration(force_chooser=force)
+    resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(WREN_BANNER)

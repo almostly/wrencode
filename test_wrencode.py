@@ -671,6 +671,53 @@ class TestResolveConfiguration(unittest.TestCase):
             if saved_model_env is not None:
                 os.environ["MODEL"] = saved_model_env
 
+    def test_saved_api_backend_without_key_reprompts_on_tty(self):
+        # Saved config names a hosted backend but has no api_key, and the
+        # backend's key env var is unset — in a terminal we should re-run the
+        # chooser instead of dead-ending in load_model() (the "exits
+        # immediately" bug when run outside a dir whose .env supplied the key).
+        config_path = pathlib.Path(self._tmp) / "config.json"
+        with open(config_path, "w") as f:
+            json.dump({"backend": "anthropic", "model": "claude-x"}, f)
+        wrencode.CONFIG_FILE = config_path
+        saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        orig_isatty = sys.stdin.isatty
+        sys.stdin.isatty = lambda: True
+        called = []
+        orig_chooser = wrencode.choose_backend_interactive
+        wrencode.choose_backend_interactive = lambda: called.append(True)
+        try:
+            wrencode.resolve_configuration()
+            self.assertEqual(called, [True])
+        finally:
+            sys.stdin.isatty = orig_isatty
+            wrencode.choose_backend_interactive = orig_chooser
+            if saved_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = saved_key
+
+    def test_saved_api_backend_without_key_non_tty_applies(self):
+        # Same missing-key config but without a terminal: don't re-prompt,
+        # apply the backend so load_model() can surface the actionable error.
+        config_path = pathlib.Path(self._tmp) / "config.json"
+        with open(config_path, "w") as f:
+            json.dump({"backend": "anthropic", "model": "claude-x"}, f)
+        wrencode.CONFIG_FILE = config_path
+        saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        orig_isatty = sys.stdin.isatty
+        sys.stdin.isatty = lambda: False
+        called = []
+        orig_chooser = wrencode.choose_backend_interactive
+        wrencode.choose_backend_interactive = lambda: called.append(True)
+        try:
+            wrencode.resolve_configuration()
+            self.assertEqual(called, [])
+            self.assertEqual(wrencode.BACKEND, "anthropic")
+        finally:
+            sys.stdin.isatty = orig_isatty
+            wrencode.choose_backend_interactive = orig_chooser
+            if saved_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = saved_key
+
     def test_non_interactive_no_config_raises_system_exit(self):
         # Point to an empty tmpdir (no config.json) and make stdin non-tty
         wrencode.CONFIG_FILE = pathlib.Path(self._tmp) / "config.json"
