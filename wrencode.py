@@ -289,11 +289,19 @@ def loader_display(step: int) -> str:
 
 
 def colors_enabled() -> bool:
-    """Return True when ANSI styling should be applied."""
-    if os.environ.get("NO_COLOR") is not None:
+    """Return True when ANSI styling should be applied.
+
+    Precedence mirrors CPython's private _colorize.can_colorize:
+    PYTHON_COLORS > NO_COLOR > FORCE_COLOR > TERM=dumb > isatty.
+    """
+    if (py_colors := os.environ.get("PYTHON_COLORS")) in {"0", "1"}:
+        return py_colors == "1"
+    if "NO_COLOR" in os.environ:
         return False
     if os.environ.get("FORCE_COLOR"):
         return True
+    if os.environ.get("TERM") == "dumb":
+        return False
     return sys.stdout.isatty()
 
 
