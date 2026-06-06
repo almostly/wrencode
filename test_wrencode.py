@@ -1374,6 +1374,10 @@ class TestBedrockBackend(unittest.TestCase):
         self.assertEqual(body["messages"][0]["content"], [{"text": "hi"}])  # str -> [{text}]
         self.assertIn("toolSpec", body["toolConfig"]["tools"][0])
         self.assertIn("Authorization", captured["headers"])
+        # The host is bedrock-runtime.*, but the SigV4 credential scope must name
+        # the signing service "bedrock" — AWS 403s on "bedrock-runtime" here.
+        self.assertIn("/us-east-1/bedrock/aws4_request", captured["headers"]["Authorization"])
+        self.assertNotIn("/bedrock-runtime/aws4_request", captured["headers"]["Authorization"])
         # The returned raw JSON parses back to text via the native path.
         self.assertEqual(json.loads(raw)["output"]["message"]["content"][0]["text"], "ok")
 

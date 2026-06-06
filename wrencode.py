@@ -126,7 +126,7 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
         # path. Auth is AWS SigV4 (not a bearer key), so credentials come from
         # the AWS environment, not saved config.
         "kind": "aws",
-        "model": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "label": "AWS Bedrock — any model via Converse (AWS credentials)",
     },
     "local": {
@@ -182,8 +182,9 @@ BACKEND_MODELS: dict[str, list[str]] = {
         # Any Converse-capable model id / inference profile. The "us." prefix is
         # a cross-region inference profile — match it to your AWS_REGION's geo,
         # or type a custom id. Mix of families since Converse is model-agnostic.
-        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "openai.gpt-oss-20b-1:0",
         "openai.gpt-oss-120b-1:0",
         "us.meta.llama3-3-70b-instruct-v1:0",
         "us.amazon.nova-pro-v1:0",
@@ -1720,7 +1721,8 @@ def _bedrock_converse_call(body: dict[str, Any]) -> Any:
     model_id = urllib.parse.quote(MODEL, safe="")
     url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
     raw = json.dumps(body).encode()
-    headers = _sigv4_signed_headers("POST", url, raw, "bedrock-runtime", region)
+    # The runtime host is bedrock-runtime.*, but the SigV4 signing service is "bedrock".
+    headers = _sigv4_signed_headers("POST", url, raw, "bedrock", region)
     return _http_post_raw(url, raw, headers)
 
 
