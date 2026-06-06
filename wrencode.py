@@ -63,7 +63,7 @@ from typing import Any, Callable, Optional
 # defaults at it before any request. Soft import keeps pip/uvx installs
 # dependency-free; setdefault preserves any user-provided override.
 try:
-    import certifi
+    import certifi  # ty: ignore[unresolved-import]
 
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
     os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
@@ -1780,7 +1780,7 @@ def get_response(
     # AWS Bedrock — model-agnostic Converse API (Claude, Llama, Nova, GPT-OSS…).
     if BACKEND == "bedrock":
         tools = _build_tool_schemas("converse")
-        body = {
+        body: dict[str, Any] = {
             "messages": [_to_converse_message(m) for m in messages],
             "system": [{"text": system_prompt}],
             "inferenceConfig": {"maxTokens": MAX_TOKENS, "temperature": 0.3},
@@ -1837,7 +1837,8 @@ def get_response(
 
     # Transformers (HuggingFace)
     if BACKEND == "transformers":
-        model, tokenizer = mlx_state  # type: ignore[misc]
+        assert mlx_state is not None  # load_model populates this for ML backends
+        model, tokenizer = mlx_state
         inputs = tokenizer.apply_chat_template(
             [{"role": "system", "content": system_prompt}] + flat,
             add_generation_prompt=True,
@@ -1861,7 +1862,8 @@ def get_response(
         return truncate_at_turn_leak(strip_gptoss_tokens(raw))
 
     # MLX (Apple Silicon)
-    model, tokenizer = mlx_state  # type: ignore[misc]
+    assert mlx_state is not None  # load_model populates this for ML backends
+    model, tokenizer = mlx_state
     chat: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
     for m in messages:
         if c := flatten_content(m["content"]):
@@ -2636,11 +2638,11 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "mlx":
         try:
             global load, stream_generate, make_sampler
-            from mlx_lm import load  # type: ignore[import-not-found]
-            from mlx_lm.generate import (
+            from mlx_lm import load  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
+            from mlx_lm.generate import (  # ty: ignore[unresolved-import]
                 stream_generate,  # type: ignore[import-not-found]
             )
-            from mlx_lm.sample_utils import (
+            from mlx_lm.sample_utils import (  # ty: ignore[unresolved-import]
                 make_sampler,  # type: ignore[import-not-found]
             )
         except ImportError:
@@ -2655,8 +2657,8 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "transformers":
         try:
             global torch, AutoModelForCausalLM, AutoTokenizer
-            import torch  # type: ignore[import-not-found]
-            from transformers import (  # type: ignore[import-not-found]
+            import torch  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
+            from transformers import (  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
                 AutoModelForCausalLM,
                 AutoTokenizer,
             )
