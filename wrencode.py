@@ -31,18 +31,20 @@ THE SOFTWARE.
 
 # flake8: noqa: E501, E203
 
-import contextlib
 import ast
-from dataclasses import dataclass
+import contextlib
+import datetime
 import getpass
 import glob as globlib
+import hashlib
+import hmac
 import json
 import os
 import pathlib
 import platform
 import re
-import shlex
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -50,7 +52,9 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 # The PyInstaller single-file binary ships no system CA trust store, so urllib's
@@ -59,7 +63,7 @@ from typing import Any, Callable, Optional
 # defaults at it before any request. Soft import keeps pip/uvx installs
 # dependency-free; setdefault preserves any user-provided override.
 try:
-    import certifi
+    import certifi  # ty: ignore[unresolved-import]
 
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
     os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
@@ -87,7 +91,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.1.4.7"
+WRENCODE_VERSION = "0.1.5"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
@@ -115,6 +119,15 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
         "key_env": "OPENROUTER_API_KEY",
         "api_base": "https://openrouter.ai/api/v1/chat/completions",
         "label": "OpenRouter — any model (API key)",
+    },
+    "bedrock": {
+        # AWS Bedrock via the model-agnostic Converse API — works across Claude,
+        # Llama, Nova, Mistral, OpenAI GPT-OSS, etc. through one request/parse
+        # path. Auth is AWS SigV4 (not a bearer key), so credentials come from
+        # the AWS environment, not saved config.
+        "kind": "aws",
+        "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "label": "AWS Bedrock — any model via Converse (AWS credentials)",
     },
     "local": {
         "kind": "local-proxy",
@@ -165,6 +178,23 @@ BACKEND_MODELS: dict[str, list[str]] = {
     "local": ["gpt-oss-20b"],
     "transformers": ["deburky/gpt-oss-claude-code"],
     "mlx": ["deburky/gpt-oss-claude-mlx"],
+    "bedrock": [
+        # Converse is model-agnostic, but wrencode is a TOOL-USING agent and
+        # tool-call support varies by family. Verified end-to-end on AWS (text +
+        # tool use): Claude and Amazon Nova — the recommended choices. The "us."
+        # prefix is a cross-region inference profile; match it to your AWS_REGION's
+        # geo, or type any custom Converse model id at the prompt.
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",  # verified (default)
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",  # verified
+        "us.amazon.nova-pro-v1:0",  # verified
+        # Experimental — chat works but tool use is unreliable, so the agent loop
+        # may stall: Llama emits no tool_use; GPT-OSS is flaky on tools.
+        "openai.gpt-oss-20b-1:0",
+        "us.meta.llama3-3-70b-instruct-v1:0",
+        # TODO: no verified tool-using non-Claude/Nova family yet. Mistral Large
+        # 2407 was dropped (invalid Bedrock model id); revisit if a Converse
+        # tool-capable Mistral/other id is confirmed.
+    ],
 }
 
 CUSTOM_MODEL_OPTION = "— type a custom model id —"
@@ -175,7 +205,16 @@ API_BACKENDS: frozenset[str] = frozenset(
 LOCAL_ML_BACKENDS: frozenset[str] = frozenset(
     name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "local-ml"
 )
-NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai"})
+# Backends whose responses use the Anthropic Messages format (content blocks,
+# tool_use, usage). Bedrock speaks the model-agnostic Converse API instead, so
+# it has its own format/parse path (see _bedrock_converse_call).
+ANTHROPIC_FORMAT_BACKENDS: frozenset[str] = frozenset({"anthropic"})
+# Backends that return JSON with native tool calls (vs. XML-in-text), parsed by
+# _parse_native_response. Bedrock/Converse is native too.
+NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai", "bedrock"})
+# Hosted backends reached over HTTP (vs. in-process local-ml weights). Bedrock
+# is kind "aws" so it isn't in API_BACKENDS, but it's still a network call.
+HOSTED_BACKENDS: frozenset[str] = API_BACKENDS | frozenset({"bedrock"})
 
 CONFIG_DIR = pathlib.Path(
     os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
@@ -188,6 +227,7 @@ BACKEND = ""
 MODEL = ""
 API_KEY = ""
 API_BASE = ""
+AWS_REGION = ""
 LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
 
 # Backend libraries are imported lazily inside load_model(); the rest of the
@@ -212,13 +252,20 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
     Precedence for each value: explicit environment variable > saved/chosen
     value > built-in default. Heavy backend imports are deferred to load_model().
     """
-    global BACKEND, MODEL, API_KEY, API_BASE, LOCAL_PORT
+    global BACKEND, MODEL, API_KEY, API_BASE, AWS_REGION, LOCAL_PORT
     spec = BACKEND_SPECS[backend]
     BACKEND = backend
     MODEL = os.environ.get("MODEL") or model or spec["model"]
     if spec["kind"] == "api":
         API_KEY = os.environ.get(spec["key_env"]) or api_key or ""
         API_BASE = spec["api_base"]
+    elif spec["kind"] == "aws":
+        # Bedrock: creds + region come from the AWS environment at request
+        # time (SigV4), so nothing is stored in API_KEY. API_BASE is built
+        # per-request from region + model id in _bedrock_converse_call().
+        AWS_REGION = _aws_region()
+        API_KEY = ""
+        API_BASE = ""
     elif backend == "ollama":
         base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
         API_KEY = "ollama"  # Ollama ignores the key; kept non-empty for the loader
@@ -273,7 +320,7 @@ def _loader_context_text() -> str:
     if MODEL and len(MODEL) > _LOADER_MODEL_MAX:
         keep = _LOADER_MODEL_MAX - 1
         head = max(8, keep // 2)
-        m = f"{MODEL[:head]}…{MODEL[-(keep - head):]}"
+        m = f"{MODEL[:head]}…{MODEL[-(keep - head) :]}"
     else:
         m = MODEL or "model"
     return f"{b} · {m} · waiting…"
@@ -289,11 +336,19 @@ def loader_display(step: int) -> str:
 
 
 def colors_enabled() -> bool:
-    """Return True when ANSI styling should be applied."""
-    if os.environ.get("NO_COLOR") is not None:
+    """Return True when ANSI styling should be applied.
+
+    Precedence mirrors CPython's private _colorize.can_colorize:
+    PYTHON_COLORS > NO_COLOR > FORCE_COLOR > TERM=dumb > isatty.
+    """
+    if (py_colors := os.environ.get("PYTHON_COLORS")) in {"0", "1"}:
+        return py_colors == "1"
+    if "NO_COLOR" in os.environ:
         return False
     if os.environ.get("FORCE_COLOR"):
         return True
+    if os.environ.get("TERM") == "dumb":
+        return False
     return sys.stdout.isatty()
 
 
@@ -472,7 +527,6 @@ def _read_user_input_interactive() -> str:
     return text
 
 
-
 def read_feedback_line() -> str:
     """Read decline feedback after choosing n in the approval picker."""
     if sys.stdin.isatty() and sys.stdout.isatty():
@@ -497,6 +551,7 @@ def read_user_input() -> str:
     if not line:
         raise EOFError
     return line.rstrip("\r\n").strip()
+
 
 # Set by confirm() when the user chooses "allow all" for the rest of the session.
 _SESSION_AUTO_APPROVE = False
@@ -535,7 +590,11 @@ def resolve_tool_path(raw: Any) -> pathlib.Path:
     p = pathlib.Path(str(raw).strip()).expanduser()
     root = workspace_root()
     p = p.resolve() if p.is_absolute() else (root / p).resolve()
-    if os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower() not in ("1", "true", "yes"):
+    if os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
         try:
             p.relative_to(root)
         except ValueError:
@@ -587,14 +646,10 @@ def read(args: dict[str, Any]) -> str:
     size = path.stat().st_size
     if size > MAX_READ_BYTES:
         return f"error: file too large ({size} bytes, max {MAX_READ_BYTES})"
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(
-        keepends=True
-    )
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
     offset = _optional_int(args, "offset", 0) or 0
     if not (0 <= offset <= len(lines)):
-        return (
-            f"error: offset {offset} out of range (file has {len(lines)} lines)"
-        )
+        return f"error: offset {offset} out of range (file has {len(lines)} lines)"
     limit_val = _optional_int(args, "limit")
     cap = min(
         limit_val
@@ -640,11 +695,7 @@ def edit(args: dict[str, Any]) -> str:
     count = text.count(old)
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times (use all=true)"
-    updated = (
-        text.replace(old, new)
-        if args.get("all")
-        else text.replace(old, new, 1)
-    )
+    updated = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
     if updated == text:
         return "error: edit produced no change"
     suffix = path.suffix.lower()
@@ -676,12 +727,9 @@ def glob(args: dict[str, Any]) -> str:
     files = [
         f
         for f in globlib.glob(str(base / pat), recursive=True)
-        if os.path.isfile(f)
-        and all(p not in _GLOB_SKIP for p in pathlib.Path(f).parts)
+        if os.path.isfile(f) and all(p not in _GLOB_SKIP for p in pathlib.Path(f).parts)
     ]
-    return (
-        "\n".join(sorted(files, key=os.path.getmtime, reverse=True)) or "none"
-    )
+    return "\n".join(sorted(files, key=os.path.getmtime, reverse=True)) or "none"
 
 
 def grep(args: dict[str, Any]) -> str:
@@ -1048,7 +1096,7 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
 # Message formatting
 # -----------------------------------------------------------------------------------------------
 def flatten_content(content: Any) -> str:
-    """Flatten Anthropic-style content list to plain string."""
+    """Flatten a content list to plain string (Anthropic or Bedrock Converse blocks)."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -1057,14 +1105,29 @@ def flatten_content(content: Any) -> str:
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "text":
+        btype = block.get("type")
+        if btype == "text":
             parts.append(block["text"])
-        elif block.get("type") == "tool_use":
+        elif btype == "tool_use":
             parts.append(
                 f'<tool_call>{{"tool": "{block["name"]}", "args": {json.dumps(block["input"])}}}</tool_call>'
             )
-        elif block.get("type") == "tool_result":
+        elif btype == "tool_result":
             parts.append(f"Tool result: {block.get('content', '')}")
+        # Bedrock Converse blocks have no "type" key.
+        elif "text" in block:
+            parts.append(block["text"])
+        elif "toolUse" in block:
+            tu = block["toolUse"]
+            parts.append(
+                f'<tool_call>{{"tool": "{tu.get("name", "")}", "args": {json.dumps(tu.get("input", {}))}}}</tool_call>'
+            )
+        elif "toolResult" in block:
+            tr = block["toolResult"]
+            txt = " ".join(
+                c.get("text", "") for c in tr.get("content", []) if isinstance(c, dict)
+            )
+            parts.append(f"Tool result: {txt}")
     return "\n".join(parts)
 
 
@@ -1123,7 +1186,6 @@ def print_agent_message(text: str) -> None:
     for line in render_markdown(text).split("\n"):
         print(f"{AGENT_TEXT}{line}{RESET}")
     print()
-
 
 
 @contextlib.contextmanager
@@ -1207,7 +1269,6 @@ def _tool_call_complete(text: str) -> int:
     return last
 
 
-
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse all <tool_call> blocks from model output into structured dicts.
 
@@ -1234,7 +1295,14 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                 payload = obj if obj.get("tool") in TOOLS else None
                 pos = rel_end
                 if payload:
-                    calls.append({"type": "tool_use", "id": f"call_{len(calls)}", "name": payload["tool"], "input": payload.get("args", {})})
+                    calls.append(
+                        {
+                            "type": "tool_use",
+                            "id": f"call_{len(calls)}",
+                            "name": payload["tool"],
+                            "input": payload.get("args", {}),
+                        }
+                    )
                 continue
         if close != -1 and close > brace:
             payload = None
@@ -1271,7 +1339,7 @@ _TYPE_MAP: dict[str, str] = {
 
 
 def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
-    """Build tool definitions for 'anthropic' or 'openai' format from the TOOLS registry."""
+    """Build tool definitions for 'anthropic', 'converse', or 'openai' format."""
     out = []
     for name, (desc, params, _) in TOOLS.items():
         props = {k: {"type": _TYPE_MAP.get(v, "string")} for k, v in params.items()}
@@ -1279,13 +1347,30 @@ def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
         schema = {"type": "object", "properties": props, "required": req}
         if fmt == "anthropic":
             out.append({"name": name, "description": desc, "input_schema": schema})
+        elif fmt == "converse":
+            out.append({"toolSpec": {
+                "name": name, "description": desc, "inputSchema": {"json": schema},
+            }})
         else:
-            out.append({"type": "function", "function": {"name": name, "description": desc, "parameters": schema}})
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": desc,
+                        "parameters": schema,
+                    },
+                }
+            )
     return out
 
 
 def _anthropic_headers() -> dict[str, str]:
-    return {"Content-Type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01"}
+    return {
+        "Content-Type": "application/json",
+        "x-api-key": API_KEY,
+        "anthropic-version": "2023-06-01",
+    }
 
 
 def _openai_headers() -> dict[str, str]:
@@ -1299,7 +1384,10 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
     `write`), so callers need to know to raise MAX_TOKENS rather than silently
     treating an empty operation as success.
     """
-    if BACKEND == "anthropic":
+    if BACKEND == "bedrock":
+        truncated = data.get("stopReason") == "max_tokens"
+        out_tokens = data.get("usage", {}).get("outputTokens")
+    elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
         truncated = data.get("stop_reason") == "max_tokens"
         out_tokens = data.get("usage", {}).get("output_tokens")
     else:
@@ -1324,7 +1412,13 @@ def _log_usage_debug(data: dict[str, Any]) -> None:
     if not os.environ.get("WRENCODE_DEBUG"):
         return
     u = data.get("usage", {})
-    if BACKEND == "anthropic":
+    if BACKEND == "bedrock":
+        print(
+            f"{DIM}usage: in={u.get('inputTokens')} out={u.get('outputTokens')}{RESET}",
+            file=sys.stderr,
+        )
+        return
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
         print(
             f"{DIM}usage: in={u.get('input_tokens')} out={u.get('output_tokens')} "
             f"cache_write={u.get('cache_creation_input_tokens', 0)} "
@@ -1339,15 +1433,25 @@ def _log_usage_debug(data: dict[str, Any]) -> None:
 
 
 def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]:
-    """Parse a native (Anthropic / OpenAI) API response into display text and tool calls."""
+    """Parse a native (Anthropic / Bedrock Converse / OpenAI) response into text + tool calls."""
     _warn_if_truncated(data)
     _log_usage_debug(data)
-    if BACKEND == "anthropic":
+    if BACKEND == "bedrock":
+        blocks = data.get("output", {}).get("message", {}).get("content", [])
+        text = "\n".join(b["text"] for b in blocks if "text" in b).strip()
+        calls = [
+            ToolCall(b["toolUse"]["toolUseId"], b["toolUse"]["name"],
+                     b["toolUse"].get("input", {}))
+            for b in blocks if "toolUse" in b
+        ]
+        return text, calls
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
         blocks = data.get("content", [])
         text = "\n".join(b["text"] for b in blocks if b.get("type") == "text").strip()
         calls = [
             ToolCall(b["id"], b["name"], b.get("input", {}))
-            for b in blocks if b.get("type") == "tool_use"
+            for b in blocks
+            if b.get("type") == "tool_use"
         ]
         return text, calls
     msg = data["choices"][0]["message"]
@@ -1355,9 +1459,13 @@ def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]
     calls = []
     for tc in msg.get("tool_calls") or []:
         with contextlib.suppress(Exception):
-            calls.append(ToolCall(
-                tc["id"], tc["function"]["name"], json.loads(tc["function"]["arguments"])
-            ))
+            calls.append(
+                ToolCall(
+                    tc["id"],
+                    tc["function"]["name"],
+                    json.loads(tc["function"]["arguments"]),
+                )
+            )
     return text, calls
 
 
@@ -1385,7 +1493,10 @@ def _parse_response(
     text = re.sub(
         r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
     ).strip()
-    calls = [ToolCall(tc["id"], tc["name"], tc["input"]) for tc in parse_tool_calls(response_text)]
+    calls = [
+        ToolCall(tc["id"], tc["name"], tc["input"])
+        for tc in parse_tool_calls(response_text)
+    ]
     return text, calls, None
 
 
@@ -1396,16 +1507,22 @@ def _append_assistant(
     raw_data: Any,
 ) -> None:
     """Append the assistant turn to message history in the correct format."""
-    if BACKEND == "anthropic":
+    if BACKEND == "bedrock":
+        content = raw_data.get("output", {}).get("message", {}).get("content", [])
+        # Keep only text + toolUse blocks; echoing other block types (e.g.
+        # reasoningContent) back into the next Converse request can 400.
+        kept = [b for b in content if "text" in b or "toolUse" in b]
+        messages.append({"role": "assistant", "content": kept})
+    elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
         messages.append({"role": "assistant", "content": raw_data.get("content", [])})
     elif BACKEND == "openai":
         messages.append(raw_data["choices"][0]["message"])  # preserve tool_calls
     else:  # XML path
-        blocks: list[dict[str, Any]] = (
-            [{"type": "text", "text": text}] if text else []
-        )
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
         for tc in tool_calls:
-            blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input})
+            blocks.append(
+                {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input}
+            )
         messages.append({"role": "assistant", "content": blocks})
 
 
@@ -1416,30 +1533,210 @@ def _append_tool_results(
     """Append tool results to message history in the correct format."""
     if BACKEND == "openai":
         messages.extend(
-            {"role": "tool", "tool_call_id": tc.id, "content": r}
-            for tc, r in results
+            {"role": "tool", "tool_call_id": tc.id, "content": r} for tc, r in results
         )
+    elif BACKEND == "bedrock":
+        messages.append({
+            "role": "user",
+            "content": [
+                {"toolResult": {
+                    "toolUseId": tc.id,
+                    "content": [{"text": r}],
+                    "status": "success",
+                }}
+                for tc, r in results
+            ],
+        })
     else:  # anthropic + XML path both use tool_result blocks
-        messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tc.id, "content": r}
-            for tc, r in results
-        ]})
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tc.id, "content": r}
+                    for tc, r in results
+                ],
+            }
+        )
 
 
 # -----------------------------------------------------------------------------------------------
 # HTTP helper
 # -----------------------------------------------------------------------------------------------
-def _http_post(
-    url: str, payload: dict[str, Any], headers: dict[str, str]
-) -> Any:
-    """POST a JSON payload to a URL and return the parsed response."""
-    data = json.dumps(payload).encode()
+def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
+    """POST pre-encoded bytes to a URL and return the parsed JSON response."""
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as e:
         raise Exception(f"HTTP {e.code}: {e.read().decode()}") from e
+
+
+def _http_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> Any:
+    """POST a JSON payload to a URL and return the parsed response."""
+    return _http_post_raw(url, json.dumps(payload).encode(), headers)
+
+
+# -----------------------------------------------------------------------------------------------
+# AWS Bedrock: credentials + SigV4 request signing (stdlib only — no boto3)
+# -----------------------------------------------------------------------------------------------
+def _aws_region() -> str:
+    """Resolve the AWS region: env, then ~/.aws/config for the active profile, else us-east-1."""
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if region:
+        return region
+    with contextlib.suppress(Exception):
+        import configparser
+
+        cfg = configparser.ConfigParser()
+        cfg.read(os.path.expanduser("~/.aws/config"))
+        profile = os.environ.get("AWS_PROFILE", "default")
+        section = profile if profile == "default" else f"profile {profile}"
+        if cfg.has_option(section, "region"):
+            return cfg.get(section, "region")
+    return "us-east-1"
+
+
+def _aws_credentials() -> tuple[str, str, str]:
+    """Resolve (access_key, secret_key, session_token) from env, then ~/.aws/credentials."""
+    ak = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    sk = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    token = os.environ.get("AWS_SESSION_TOKEN", "")
+    if ak and sk:
+        return ak, sk, token
+    with contextlib.suppress(Exception):
+        import configparser
+
+        creds = configparser.ConfigParser()
+        creds.read(os.path.expanduser("~/.aws/credentials"))
+        profile = os.environ.get("AWS_PROFILE", "default")
+        if creds.has_section(profile):
+            ak = ak or creds.get(profile, "aws_access_key_id", fallback="")
+            sk = sk or creds.get(profile, "aws_secret_access_key", fallback="")
+            token = token or creds.get(profile, "aws_session_token", fallback="")
+    return ak, sk, token
+
+
+def _sigv4_authorization(
+    method: str,
+    canonical_uri: str,
+    canonical_qs: str,
+    headers: dict[str, str],
+    payload_hash: str,
+    service: str,
+    region: str,
+    amz_date: str,
+    access_key: str,
+    secret_key: str,
+) -> tuple[str, str]:
+    """Compute (Authorization header value, signed-headers list) for AWS SigV4.
+
+    `headers` keys must be lowercase. Pure stdlib hashlib/hmac — this is the
+    core algorithm, kept side-effect-free so it can be tested against AWS's
+    published signing vectors.
+    """
+    datestamp = amz_date[:8]
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
+    canonical_request = "\n".join(
+        [
+            method,
+            canonical_uri,
+            canonical_qs,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+
+    def _hmac(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode(), datestamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    auth = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return auth, signed_headers
+
+
+def _sigv4_signed_headers(
+    method: str, url: str, body: bytes, service: str, region: str
+) -> dict[str, str]:
+    """Build the full set of SigV4-signed request headers for a Bedrock call."""
+    access_key, secret_key, token = _aws_credentials()
+    if not (access_key and secret_key):
+        raise Exception(
+            "AWS credentials not found — set AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY (and AWS_REGION)."
+        )
+    parsed = urllib.parse.urlsplit(url)
+    payload_hash = hashlib.sha256(body).hexdigest()
+    amz_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # SigV4 canonical URI: non-S3 services double-encode the (already
+    # percent-encoded) path — a Bedrock model id's ':' goes %3A -> %253A.
+    # Re-quoting the wire path encodes the '%' signs while leaving '/' intact.
+    canonical_uri = urllib.parse.quote(parsed.path or "/", safe="/~")
+    sign_these = {
+        "host": parsed.netloc,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    if token:
+        sign_these["x-amz-security-token"] = token
+    auth, _ = _sigv4_authorization(
+        method,
+        canonical_uri,
+        parsed.query,
+        sign_these,
+        payload_hash,
+        service,
+        region,
+        amz_date,
+        access_key,
+        secret_key,
+    )
+    headers = {
+        "Content-Type": "application/json",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Content-Sha256": payload_hash,
+        "Authorization": auth,
+    }
+    if token:
+        headers["X-Amz-Security-Token"] = token
+    return headers
+
+
+def _bedrock_converse_call(body: dict[str, Any]) -> Any:
+    """POST a Bedrock Converse body to the signed /converse endpoint, return JSON."""
+    region = _aws_region()
+    model_id = urllib.parse.quote(MODEL, safe="")
+    url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
+    raw = json.dumps(body).encode()
+    # The runtime host is bedrock-runtime.*, but the SigV4 signing service is "bedrock".
+    headers = _sigv4_signed_headers("POST", url, raw, "bedrock", region)
+    return _http_post_raw(url, raw, headers)
+
+
+def _to_converse_message(m: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a stored message to Converse shape (string content -> [{text}])."""
+    content = m["content"]
+    if isinstance(content, str):
+        content = [{"text": content}]
+    return {"role": m["role"], "content": content}
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1452,8 +1749,7 @@ def get_response(
 ) -> str:
     """Generate a response from the configured backend given the message history."""
     flat = [
-        {"role": m["role"], "content": flatten_content(m["content"])}
-        for m in messages
+        {"role": m["role"], "content": flatten_content(m["content"])} for m in messages
     ]
 
     # OpenAI - native function calling
@@ -1462,8 +1758,7 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}]
-                + messages,
+                "messages": [{"role": "system", "content": system_prompt}] + messages,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
                 "tools": _build_tool_schemas("openai"),
@@ -1479,8 +1774,7 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}]
-                + flat,
+                "messages": [{"role": "system", "content": system_prompt}] + flat,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
             },
@@ -1488,12 +1782,25 @@ def get_response(
         )
         return str(data["choices"][0]["message"]["content"])
 
-    # Anthropic - native tool use API
-    if BACKEND == "anthropic":
-        # Prompt caching: mark the (large, static) system block + tool schemas as
-        # ephemeral. Anthropic caches everything up to and including each marker
-        # for ~5 minutes; subsequent turns in the same session read at ~10% of
-        # normal input cost. Two breakpoints out of the four allowed per request.
+    # AWS Bedrock — model-agnostic Converse API (Claude, Llama, Nova, GPT-OSS…).
+    if BACKEND == "bedrock":
+        tools = _build_tool_schemas("converse")
+        body: dict[str, Any] = {
+            "messages": [_to_converse_message(m) for m in messages],
+            "system": [{"text": system_prompt}],
+            "inferenceConfig": {"maxTokens": MAX_TOKENS, "temperature": 0.3},
+        }
+        if tools:
+            body["toolConfig"] = {"tools": tools}
+        data = _bedrock_converse_call(body)
+        return json.dumps(data)  # return raw for agent loop to parse natively
+
+    # Anthropic native tool use API.
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+        # Prompt caching: mark the (large, static) system block + last tool
+        # schema as ephemeral. Anthropic caches everything up to each marker
+        # for ~5 minutes; subsequent turns read at ~10% of normal input cost.
+        # Two breakpoints of the four allowed per request.
         tools = _build_tool_schemas("anthropic")
         if tools:
             tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
@@ -1501,8 +1808,13 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "system": [{"type": "text", "text": system_prompt,
-                            "cache_control": {"type": "ephemeral"}}],
+                "system": [
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 "messages": messages,
                 "max_tokens": MAX_TOKENS,
                 "tools": tools,
@@ -1524,15 +1836,14 @@ def get_response(
             _anthropic_headers(),
         )
         text = "".join(
-            b["text"]
-            for b in data.get("content", [])
-            if b.get("type") == "text"
+            b["text"] for b in data.get("content", []) if b.get("type") == "text"
         )
         return strip_gptoss_tokens(text)
 
     # Transformers (HuggingFace)
     if BACKEND == "transformers":
-        model, tokenizer = mlx_state  # type: ignore[misc]
+        assert mlx_state is not None  # load_model populates this for ML backends
+        model, tokenizer = mlx_state
         inputs = tokenizer.apply_chat_template(
             [{"role": "system", "content": system_prompt}] + flat,
             add_generation_prompt=True,
@@ -1556,7 +1867,8 @@ def get_response(
         return truncate_at_turn_leak(strip_gptoss_tokens(raw))
 
     # MLX (Apple Silicon)
-    model, tokenizer = mlx_state  # type: ignore[misc]
+    assert mlx_state is not None  # load_model populates this for ML backends
+    model, tokenizer = mlx_state
     chat: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
     for m in messages:
         if c := flatten_content(m["content"]):
@@ -1564,9 +1876,7 @@ def get_response(
     prompt = tokenizer.apply_chat_template(
         chat, tokenize=False, add_generation_prompt=True
     )
-    sampler = make_sampler(
-        temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1
-    )
+    sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
     out = ""
     for chunk in stream_generate(
         model, tokenizer, prompt=prompt, max_tokens=MAX_TOKENS, sampler=sampler
@@ -1621,32 +1931,51 @@ def compact_messages(
         f"{m['role']}: {flatten_content(m['content'])}\n" for m in messages
     )
 
-    if BACKEND in API_BACKENDS:
+    if BACKEND in HOSTED_BACKENDS:
         prompt = (
             "Summarize this conversation in 3-5 concise bullet points, "
             "preserving any file paths, code decisions, or unresolved tasks:\n\n"
             + history_text
         )
-        if BACKEND == "anthropic":
-            data = _http_post(API_BASE, {
-                "model": MODEL,
-                "system": "You are a helpful assistant.",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 512,
-            }, _anthropic_headers())
+        if BACKEND == "bedrock":
+            data = _bedrock_converse_call({
+                "messages": [{"role": "user", "content": [{"text": prompt}]}],
+                "system": [{"text": "You are a helpful assistant."}],
+                "inferenceConfig": {"maxTokens": 512},
+            })
+            summary = "\n".join(
+                b["text"]
+                for b in data.get("output", {}).get("message", {}).get("content", [])
+                if "text" in b
+            ).strip()
+        elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+            data = _http_post(
+                API_BASE,
+                {
+                    "model": MODEL,
+                    "system": "You are a helpful assistant.",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 512,
+                },
+                _anthropic_headers(),
+            )
             summary = "\n".join(
                 b["text"] for b in data.get("content", []) if b.get("type") == "text"
             ).strip()
         else:  # openai / openrouter
-            data = _http_post(API_BASE, {
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": 512,
-                "temperature": 0.3,
-            }, _openai_headers())
+            data = _http_post(
+                API_BASE,
+                {
+                    "model": MODEL,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": 512,
+                    "temperature": 0.3,
+                },
+                _openai_headers(),
+            )
             summary = (data["choices"][0]["message"].get("content") or "").strip()
     else:
         # MLX / Transformers path
@@ -1661,9 +1990,7 @@ def compact_messages(
             tokenize=False,
             add_generation_prompt=True,
         )
-        sampler = make_sampler(
-            temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1
-        )
+        sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
         summary = "".join(
             c.text
             for c in stream_generate(
@@ -1704,7 +2031,8 @@ def build_system_prompt() -> str:
     ws = workspace_root()
     path_rule = (
         "Paths are not restricted to the workspace."
-        if os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower() in ("1", "true", "yes")
+        if os.environ.get("WRENCODE_UNRESTRICTED_PATHS", "").lower()
+        in ("1", "true", "yes")
         else "Relative paths resolve under the workspace. Absolute paths must stay inside it."
     )
     return f"""You are a helpful coding assistant with tools to interact with the file system.
@@ -1744,7 +2072,9 @@ def _track_error(
     if result.startswith("error:"):
         count = count + 1 if result == last else 1
         if count >= TOOL_ERROR_REPEAT_LIMIT:
-            print(f"{YELLOW}Stopping: repeated identical tool error {count} times.{RESET}")
+            print(
+                f"{YELLOW}Stopping: repeated identical tool error {count} times.{RESET}"
+            )
             return result, count, True
         return result, count, False
     return None, 0, False
@@ -1788,8 +2118,8 @@ def run_agent_turn(
                 result = run_tool(tc.name, tc.input)
                 print_tool_result(result)
                 results.append((tc, result))
-                last_tool_error, repeated_tool_error_count, stop = (
-                    _track_error(result, last_tool_error, repeated_tool_error_count)
+                last_tool_error, repeated_tool_error_count, stop = _track_error(
+                    result, last_tool_error, repeated_tool_error_count
                 )
                 if stop:
                     break
@@ -1827,7 +2157,7 @@ def handle_slash_command(
         print_system("Cleared")
         return "handled", _MLX_UNCHANGED
     if cmd == "/compact":
-        if BACKEND in API_BACKENDS or (BACKEND in LOCAL_ML_BACKENDS and mlx_state):
+        if BACKEND in HOSTED_BACKENDS or (BACKEND in LOCAL_ML_BACKENDS and mlx_state):
             print_system("Compacting history...")
             model, tokenizer = mlx_state or (None, None)
             before = len(messages)
@@ -1835,9 +2165,7 @@ def handle_slash_command(
             save_history(messages)
             print_system(f"Compacted {before} → {len(messages)} messages")
         else:
-            print(
-                f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}"
-            )
+            print(f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}")
         return "handled", _MLX_UNCHANGED
     if cmd in {"/backend", "/configure"}:
         return "handled", switch_backend_runtime()
@@ -1846,9 +2174,7 @@ def handle_slash_command(
         return "handled", switch_model_runtime(model_id)
     if cmd == "/help":
         print_system("/c — clear  /compact — summarize  /q — quit")
-        print_system(
-            "/backend — switch backend (↑↓)  /model — switch model (↑↓)"
-        )
+        print_system("/backend — switch backend (↑↓)  /model — switch model (↑↓)")
         print_system("/model <id> — set model directly  /configure — same as /backend")
         return "handled", _MLX_UNCHANGED
     return None, _MLX_UNCHANGED
@@ -1893,13 +2219,18 @@ def available_backends() -> list[str]:
     limited to Apple Silicon.
     """
     return [
-        name for name, spec in BACKEND_SPECS.items()
+        name
+        for name, spec in BACKEND_SPECS.items()
         if not (
-            spec["kind"] == "local-ml" and (
+            spec["kind"] == "local-ml"
+            and (
                 is_frozen()
-                or (name == "mlx" and not (
-                    platform.system() == "Darwin" and platform.machine() == "arm64"
-                ))
+                or (
+                    name == "mlx"
+                    and not (
+                        platform.system() == "Darwin" and platform.machine() == "arm64"
+                    )
+                )
             )
         )
     ]
@@ -1944,8 +2275,10 @@ def fetch_openrouter_models() -> list[str]:
                 if isinstance(cached, list) and cached:
                     return [str(m) for m in cached]
 
-    key = os.environ.get("OPENROUTER_API_KEY") or API_KEY or load_config().get(
-        "api_key", ""
+    key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or API_KEY
+        or load_config().get("api_key", "")
     )
     if not key:
         return list(BACKEND_MODELS.get("openrouter", []))
@@ -2009,6 +2342,17 @@ def _prompt_api_key_if_needed(
 ) -> None:
     """Prompt for an API key when switching to a hosted backend."""
     spec = BACKEND_SPECS[backend]
+    if spec["kind"] == "aws":
+        # Bedrock uses AWS environment credentials, not a saved key.
+        ak, sk, _ = _aws_credentials()
+        if ak and sk:
+            print_system(f"✓ Using AWS credentials from environment @ {_aws_region()}")
+        else:
+            print(
+                f"{YELLOW}Bedrock uses your AWS credentials — set AWS_ACCESS_KEY_ID, "
+                f"AWS_SECRET_ACCESS_KEY, and AWS_REGION.{RESET}"
+            )
+        return
     if spec["kind"] != "api":
         return
     key_env = spec["key_env"]
@@ -2028,9 +2372,7 @@ def _prompt_api_key_if_needed(
         cfg["api_key"] = saved_key
         print_system(f"✓ Keeping saved {key_env}")
     else:
-        print(
-            f"{YELLOW}No key entered — set {key_env} or re-run with /backend.{RESET}"
-        )
+        print(f"{YELLOW}No key entered — set {key_env} or re-run with /backend.{RESET}")
 
 
 def persist_backend_choice(cfg: dict[str, str]) -> None:
@@ -2052,6 +2394,26 @@ def verify_api_key() -> tuple[str, str]:
     backends and missing keys short-circuit to "ok"/"invalid" without a call.
     """
     spec = BACKEND_SPECS[BACKEND]
+    if spec["kind"] == "aws":
+        # Probe Bedrock's control plane (ListFoundationModels) with a signed
+        # GET: confirms the AWS creds + region work without invoking a model.
+        ak, sk, _ = _aws_credentials()
+        if not (ak and sk):
+            return ("invalid", "no AWS credentials")
+        region = _aws_region()
+        url = f"https://bedrock.{region}.amazonaws.com/foundation-models"
+        try:
+            headers = _sigv4_signed_headers("GET", url, b"", "bedrock", region)
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read(1)
+            return ("ok", "")
+        except urllib.error.HTTPError as err:
+            if err.code in (401, 403):
+                return ("invalid", f"HTTP {err.code}")
+            return ("unknown", f"HTTP {err.code}")
+        except Exception as err:
+            return ("unknown", str(err))
     if spec["kind"] != "api":
         return ("ok", "")
     if not API_KEY:
@@ -2143,8 +2505,7 @@ def switch_backend_runtime() -> Any:
     existing = load_config()
     names = available_backends()
     labels = [
-        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]"
-        for n in names
+        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]" for n in names
     ]
     initial = names.index(BACKEND) if BACKEND in names else 0
     idx = pick_from_list("Choose backend", names, labels=labels, initial_index=initial)
@@ -2170,13 +2531,10 @@ def choose_backend_interactive() -> None:
     existing = load_config()
     names = available_backends()
     labels = [
-        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]"
-        for n in names
+        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]" for n in names
     ]
     if not is_frozen():
-        print_system(
-            "Local model backends need mlx-lm or transformers installed."
-        )
+        print_system("Local model backends need mlx-lm or transformers installed.")
         print()
 
     idx = pick_from_list("Choose backend", names, labels=labels, initial_index=0)
@@ -2196,22 +2554,29 @@ def choose_backend_interactive() -> None:
     persist_backend_choice(cfg)
     print_system(f"✓ Saved backend choice to {CONFIG_FILE}")
 
-    # Verify the key actually works before declaring the backend ready, so a
-    # typo or revoked key surfaces here instead of mid-chat. Re-prompt on a
-    # hard rejection; don't block on a transient network failure.
+    # Verify the credential actually works before declaring the backend ready,
+    # so a typo/revoked key (or missing AWS creds) surfaces here instead of
+    # mid-chat. Re-prompt API keys on a hard rejection; Bedrock creds come from
+    # the environment, so there's nothing to re-prompt. Don't block on a
+    # transient network failure.
+    cred_name = spec.get("key_env", "AWS credentials")
     for attempt in range(3):
         state, detail = verify_api_key()
         if state == "ok":
             print_system(f"✓ {choice}:{MODEL} ready")
             return
         if state == "unknown":
-            print(f"{YELLOW}⚠ Couldn't verify {spec['key_env']} ({detail}).{RESET}")
+            print(f"{YELLOW}⚠ Couldn't verify {cred_name} ({detail}).{RESET}")
             return
-        print(f"{RED}✗ {spec['key_env']} was rejected ({detail}).{RESET}")
-        if not sys.stdin.isatty() or attempt == 2:
+        print(f"{RED}✗ {cred_name} was rejected ({detail}).{RESET}")
+        if spec["kind"] != "api" or not sys.stdin.isatty() or attempt == 2:
+            if spec["kind"] == "aws":
+                print(
+                    f"{DIM}Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (and AWS_REGION) and re-run.{RESET}"
+                )
             return
         newkey = getpass.getpass(
-            f"{BLUE}❯{RESET} re-enter {spec['key_env']} (input hidden): "
+            f"{BLUE}❯{RESET} re-enter {cred_name} (input hidden): "
         ).strip()
         if not newkey:
             return
@@ -2226,9 +2591,7 @@ def resolve_configuration() -> None:
     if env_backend:
         if env_backend not in BACKEND_SPECS:
             valid = ", ".join(BACKEND_SPECS)
-            print(
-                f"{RED}Unknown BACKEND '{env_backend}'.{RESET} Valid: {valid}"
-            )
+            print(f"{RED}Unknown BACKEND '{env_backend}'.{RESET} Valid: {valid}")
             raise SystemExit(1)
         apply_backend(env_backend)
         return
@@ -2280,14 +2643,16 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "mlx":
         try:
             global load, stream_generate, make_sampler
-            from mlx_lm import load  # type: ignore[import-not-found]
-            from mlx_lm.generate import stream_generate  # type: ignore[import-not-found]
-            from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
+            from mlx_lm import load  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
+            from mlx_lm.generate import (  # ty: ignore[unresolved-import]
+                stream_generate,  # type: ignore[import-not-found]
+            )
+            from mlx_lm.sample_utils import (  # ty: ignore[unresolved-import]
+                make_sampler,  # type: ignore[import-not-found]
+            )
         except ImportError:
             print(f"{RED}MLX backend needs mlx-lm:{RESET} pip install mlx-lm")
-            print(
-                f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}"
-            )
+            print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
             raise SystemExit(1)
         print(f"{YELLOW}Loading model...{RESET}")
         model, tokenizer = load(MODEL)
@@ -2297,8 +2662,8 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "transformers":
         try:
             global torch, AutoModelForCausalLM, AutoTokenizer
-            import torch  # type: ignore[import-not-found]
-            from transformers import (  # type: ignore[import-not-found]
+            import torch  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
+            from transformers import (  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
                 AutoModelForCausalLM,
                 AutoTokenizer,
             )
@@ -2307,9 +2672,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
                 f"{RED}transformers backend needs:{RESET} "
                 "pip install transformers torch"
             )
-            print(
-                f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}"
-            )
+            print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
             raise SystemExit(1)
         print(f"{YELLOW}Loading model via transformers...{RESET}")
         _device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -2329,10 +2692,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
         base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
         try:
             with urllib.request.urlopen(f"{base}/api/tags", timeout=3) as r:
-                installed = {
-                    m.get("name", "")
-                    for m in json.load(r).get("models", [])
-                }
+                installed = {m.get("name", "") for m in json.load(r).get("models", [])}
             want = MODEL if ":" in MODEL else f"{MODEL}:latest"
             if not (
                 MODEL in installed
@@ -2347,6 +2707,18 @@ def load_model() -> Optional[tuple[Any, Any]]:
                 f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
             )
         print_system(f"{BACKEND} ({MODEL})")
+        return None
+    # Bedrock — uses AWS environment credentials (SigV4), not an API key.
+    if BACKEND == "bedrock":
+        ak, sk, _ = _aws_credentials()
+        if not (ak and sk):
+            print(f"{RED}AWS credentials not found.{RESET}")
+            print(
+                f"{DIM}Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and "
+                f"AWS_REGION) — Bedrock uses your AWS environment.{RESET}"
+            )
+            raise SystemExit(1)
+        print_system(f"bedrock ({MODEL}) @ {_aws_region()}")
         return None
     # Hosted API backends — all require a key.
     if not API_KEY:
@@ -2420,9 +2792,7 @@ def main() -> None:
     if "--yes" in args or "--auto-approve" in args:
         os.environ["WRENCODE_AUTO_APPROVE"] = "1"
 
-    os.environ.setdefault(
-        "WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve())
-    )
+    os.environ.setdefault("WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve()))
     resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title

@@ -32,6 +32,7 @@ YELLOW = "\033[33m"
 def strip_ansi(s: str) -> str:
     """Remove ANSI escape sequences from a string."""
     import re
+
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
@@ -39,7 +40,6 @@ def strip_ansi(s: str) -> str:
 # Render markdown
 # ---------------------------------------------------------------------------
 class TestRenderMarkdown(unittest.TestCase):
-
     def test_bold(self):
         result = wrencode.render_markdown("**hello**")
         self.assertIn(BOLD, result)
@@ -98,9 +98,9 @@ class TestRenderMarkdown(unittest.TestCase):
 # Message blocks & confirm
 # ---------------------------------------------------------------------------
 class TestMessageBlocks(unittest.TestCase):
-
     def test_print_agent_message_uses_muted_grey_no_label(self):
         import io
+
         buf = io.StringIO()
         with mock.patch("sys.stdout", buf):
             wrencode.print_agent_message("**done**")
@@ -113,6 +113,7 @@ class TestMessageBlocks(unittest.TestCase):
 
     def test_print_tool_action_has_no_background(self):
         import io
+
         buf = io.StringIO()
         with mock.patch("sys.stdout", buf):
             wrencode.print_tool_action("read", {"path": "foo.py"})
@@ -127,9 +128,7 @@ class TestMessageBlocks(unittest.TestCase):
 
         buf = io.StringIO()
         with mock.patch("sys.stdout", buf):
-            wrencode.print_tool_action(
-                "write", {"path": "/tmp/x.txt", "content": ""}
-            )
+            wrencode.print_tool_action("write", {"path": "/tmp/x.txt", "content": ""})
         plain = strip_ansi(buf.getvalue()).lower()
         self.assertIn("write", plain)
         self.assertNotIn("write write", plain)
@@ -138,8 +137,9 @@ class TestMessageBlocks(unittest.TestCase):
         import io
 
         buf = io.StringIO()
-        with mock.patch("sys.stdout", buf), mock.patch.object(
-            wrencode, "colors_enabled", return_value=True
+        with (
+            mock.patch("sys.stdout", buf),
+            mock.patch.object(wrencode, "colors_enabled", return_value=True),
         ):
             wrencode.print_system("Cleared")
         out = buf.getvalue()
@@ -148,8 +148,9 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn("Cleared", strip_ansi(out))
 
     def test_context_loader_frame(self):
-        with mock.patch.object(wrencode, "BACKEND", "anthropic"), mock.patch.object(
-            wrencode, "MODEL", "claude-sonnet-4-20250514"
+        with (
+            mock.patch.object(wrencode, "BACKEND", "anthropic"),
+            mock.patch.object(wrencode, "MODEL", "claude-sonnet-4-20250514"),
         ):
             plain = wrencode.loader_display(0)
             self.assertIn("anthropic", strip_ansi(plain))
@@ -182,14 +183,14 @@ class TestMessageBlocks(unittest.TestCase):
     def test_read_user_input_fallback(self):
         import io
 
-        with mock.patch("sys.stdin", io.StringIO("hello\n")), mock.patch.object(
-            wrencode, "colors_enabled", return_value=False
+        with (
+            mock.patch("sys.stdin", io.StringIO("hello\n")),
+            mock.patch.object(wrencode, "colors_enabled", return_value=False),
         ):
             self.assertEqual(wrencode.read_user_input(), "hello")
 
 
 class TestConfirm(unittest.TestCase):
-
     def setUp(self):
         self._orig_auto = os.environ.get("WRENCODE_AUTO_APPROVE")
         self._orig_session = wrencode._SESSION_AUTO_APPROVE
@@ -208,7 +209,10 @@ class TestConfirm(unittest.TestCase):
         import io
 
         buf = io.StringIO()
-        with mock.patch("sys.stdout", buf), mock.patch("builtins.input", return_value=""):
+        with (
+            mock.patch("sys.stdout", buf),
+            mock.patch("builtins.input", return_value=""),
+        ):
             wrencode.confirm("write")
         plain = strip_ansi(buf.getvalue())
         self.assertNotIn("PosixPath", plain)
@@ -225,15 +229,19 @@ class TestConfirm(unittest.TestCase):
         self.assertTrue(wrencode._SESSION_AUTO_APPROVE)
 
     def test_decline_collects_feedback(self):
-        with mock.patch("builtins.input", return_value="n"), mock.patch.object(
-            wrencode, "read_feedback_line", return_value="use edit instead"
+        with (
+            mock.patch("builtins.input", return_value="n"),
+            mock.patch.object(
+                wrencode, "read_feedback_line", return_value="use edit instead"
+            ),
         ):
             result = wrencode.confirm("write")
         self.assertEqual(result, "cancelled: user declined — use edit instead")
 
     def test_decline_without_feedback(self):
-        with mock.patch("builtins.input", return_value="n"), mock.patch.object(
-            wrencode, "read_feedback_line", return_value=""
+        with (
+            mock.patch("builtins.input", return_value="n"),
+            mock.patch.object(wrencode, "read_feedback_line", return_value=""),
         ):
             result = wrencode.confirm("write")
         self.assertEqual(result, "cancelled: user declined without instructions")
@@ -249,8 +257,8 @@ class TestConfirm(unittest.TestCase):
                 "cancelled: user interrupted",
             )
 
-class TestChooseBackendInteractive(unittest.TestCase):
 
+class TestChooseBackendInteractive(unittest.TestCase):
     def setUp(self):
         self._orig_config_file = wrencode.CONFIG_FILE
         self._orig_anthropic_key = os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -264,6 +272,7 @@ class TestChooseBackendInteractive(unittest.TestCase):
         elif "ANTHROPIC_API_KEY" in os.environ:
             del os.environ["ANTHROPIC_API_KEY"]
         import shutil
+
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_reconfigure_preserves_saved_api_key(self):
@@ -274,10 +283,15 @@ class TestChooseBackendInteractive(unittest.TestCase):
                 "api_key": "sk-secret",
             }
         )
-        with mock.patch.object(wrencode, "pick_from_list", return_value=0), mock.patch.object(
-            wrencode, "pick_model_interactive",
-            return_value="claude-haiku-4-5-20251001",
-        ), mock.patch("getpass.getpass", return_value=""):
+        with (
+            mock.patch.object(wrencode, "pick_from_list", return_value=0),
+            mock.patch.object(
+                wrencode,
+                "pick_model_interactive",
+                return_value="claude-haiku-4-5-20251001",
+            ),
+            mock.patch("getpass.getpass", return_value=""),
+        ):
             wrencode.choose_backend_interactive()
         saved = json.loads(wrencode.CONFIG_FILE.read_text())
         self.assertEqual(saved["api_key"], "sk-secret")
@@ -285,7 +299,6 @@ class TestChooseBackendInteractive(unittest.TestCase):
 
 
 class TestToolArgs(unittest.TestCase):
-
     def test_bash_accepts_command_alias(self):
         args = wrencode.normalize_tool_args("bash", {"command": "echo hi"})
         self.assertEqual(args["cmd"], "echo hi")
@@ -311,7 +324,6 @@ class TestToolArgs(unittest.TestCase):
 
 
 class TestModelPicker(unittest.TestCase):
-
     def test_list_models_includes_current_and_custom(self):
         wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
         models = wrencode.list_models_for_backend("anthropic")
@@ -343,6 +355,7 @@ class TestModelPicker(unittest.TestCase):
             elif "ANTHROPIC_API_KEY" in os.environ:
                 del os.environ["ANTHROPIC_API_KEY"]
             import shutil
+
             shutil.rmtree(self._tmp, ignore_errors=True)
 
 
@@ -350,7 +363,6 @@ class TestModelPicker(unittest.TestCase):
 # Highlight Code
 # ---------------------------------------------------------------------------
 class TestHighlightCode(unittest.TestCase):
-
     def test_keyword_is_blue(self):
         result = wrencode._highlight_code("def foo():")
         self.assertIn(BLUE, result)
@@ -371,7 +383,7 @@ class TestHighlightCode(unittest.TestCase):
 
     def test_multiple_tokens(self):
         result = wrencode._highlight_code('if x == "ok": return True')
-        self.assertIn(BLUE, result)   # 'if', 'return', 'True' → blue
+        self.assertIn(BLUE, result)  # 'if', 'return', 'True' → blue
         self.assertIn(GREEN, result)  # "ok" → green
 
     def test_no_tokens_unchanged(self):
@@ -384,7 +396,6 @@ class TestHighlightCode(unittest.TestCase):
 # Strip GPT OSS tokens
 # ---------------------------------------------------------------------------
 class TestStripGptossTokens(unittest.TestCase):
-
     def test_strips_channel_prefix(self):
         text = "<|channel|>final<|message|>actual content"
         self.assertEqual(wrencode.strip_gptoss_tokens(text), "actual content")
@@ -410,7 +421,6 @@ class TestStripGptossTokens(unittest.TestCase):
 # Truncate at turn leak
 # ---------------------------------------------------------------------------
 class TestTruncateAtTurnLeak(unittest.TestCase):
-
     def test_truncates_at_user_marker(self):
         result = wrencode.truncate_at_turn_leak("Hello\nUser: leaked text")
         self.assertEqual(result, "Hello")
@@ -442,7 +452,6 @@ class TestTruncateAtTurnLeak(unittest.TestCase):
 # Complete Tool Call
 # ---------------------------------------------------------------------------
 class TestToolCallComplete(unittest.TestCase):
-
     def test_complete_with_end_tag(self):
         text = '<tool_call>{"tool": "read", "args": {"path": "foo.py"}}</tool_call>'
         end = wrencode._tool_call_complete(text)
@@ -469,7 +478,9 @@ class TestToolCallComplete(unittest.TestCase):
 
     def test_nested_braces(self):
         # args value contains a JSON object itself
-        text = '<tool_call>{"tool": "write", "args": {"path": "f", "content": "{a: 1}"}}'
+        text = (
+            '<tool_call>{"tool": "write", "args": {"path": "f", "content": "{a: 1}"}}'
+        )
         end = wrencode._tool_call_complete(text)
         self.assertGreater(end, 0)
         self.assertEqual(text[end - 1], "}")
@@ -479,7 +490,6 @@ class TestToolCallComplete(unittest.TestCase):
 # Parse tool calls
 # ---------------------------------------------------------------------------
 class TestParseToolCalls(unittest.TestCase):
-
     def test_single_call_with_end_tag(self):
         text = '<tool_call>{"tool": "read", "args": {"path": "foo.py"}}</tool_call>'
         calls = wrencode.parse_tool_calls(text)
@@ -556,7 +566,6 @@ class TestParseToolCalls(unittest.TestCase):
 # Apply backend
 # ---------------------------------------------------------------------------
 class TestApplyBackend(unittest.TestCase):
-
     def setUp(self):
         # Save and clear any env vars that would affect tests
         self._saved_model = os.environ.pop("MODEL", None)
@@ -576,7 +585,9 @@ class TestApplyBackend(unittest.TestCase):
         wrencode.apply_backend("anthropic")
         self.assertEqual(wrencode.BACKEND, "anthropic")
         self.assertEqual(wrencode.MODEL, wrencode.BACKEND_SPECS["anthropic"]["model"])
-        self.assertEqual(wrencode.API_BASE, wrencode.BACKEND_SPECS["anthropic"]["api_base"])
+        self.assertEqual(
+            wrencode.API_BASE, wrencode.BACKEND_SPECS["anthropic"]["api_base"]
+        )
 
     def test_anthropic_model_override(self):
         wrencode.apply_backend("anthropic", model="claude-opus-4-5")
@@ -621,7 +632,6 @@ class TestApplyBackend(unittest.TestCase):
 # Resolve configuration
 # ---------------------------------------------------------------------------
 class TestResolveConfiguration(unittest.TestCase):
-
     def setUp(self):
         self._saved_backend = os.environ.pop("BACKEND", None)
         self._orig_config_file = wrencode.CONFIG_FILE
@@ -634,6 +644,7 @@ class TestResolveConfiguration(unittest.TestCase):
             del os.environ["BACKEND"]
         wrencode.CONFIG_FILE = self._orig_config_file
         import shutil
+
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_backend_env_var_wins(self):
@@ -735,7 +746,6 @@ class TestResolveConfiguration(unittest.TestCase):
 # File tools (read, write, edit, glob, grep) with workspace sandbox
 # ---------------------------------------------------------------------------
 class TestFileTools(unittest.TestCase):
-
     def setUp(self):
         # Resolve so macOS /var → /private/var symlinks don't cause startswith() mismatches
         self._tmp = str(pathlib.Path(tempfile.mkdtemp()).resolve())
@@ -748,6 +758,7 @@ class TestFileTools(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+
         shutil.rmtree(self._tmp, ignore_errors=True)
         if self._orig_workspace is not None:
             os.environ["WRENCODE_WORKSPACE"] = self._orig_workspace
@@ -761,7 +772,6 @@ class TestFileTools(unittest.TestCase):
             os.environ["WRENCODE_UNRESTRICTED_PATHS"] = self._orig_unrestricted
         elif "WRENCODE_UNRESTRICTED_PATHS" in os.environ:
             del os.environ["WRENCODE_UNRESTRICTED_PATHS"]
-
 
     def test_write_creates_file(self):
         result = wrencode.write({"path": "hello.txt", "content": "world"})
@@ -796,7 +806,6 @@ class TestFileTools(unittest.TestCase):
         result = wrencode.read({"path": "ghost.txt"})
         self.assertIn("error", result.lower())
 
-
     def test_edit_replaces_unique_string(self):
         wrencode.write({"path": "f.txt", "content": "hello world"})
         result = wrencode.edit({"path": "f.txt", "old": "hello", "new": "goodbye"})
@@ -819,7 +828,9 @@ class TestFileTools(unittest.TestCase):
 
     def test_edit_all_flag_replaces_all(self):
         wrencode.write({"path": "f.txt", "content": "foo foo foo"})
-        result = wrencode.edit({"path": "f.txt", "old": "foo", "new": "bar", "all": True})
+        result = wrencode.edit(
+            {"path": "f.txt", "old": "foo", "new": "bar", "all": True}
+        )
         self.assertEqual(result, "ok")
         read_back = strip_ansi(wrencode.read({"path": "f.txt"}))
         self.assertNotIn("foo", read_back)
@@ -827,7 +838,9 @@ class TestFileTools(unittest.TestCase):
 
     def test_edit_no_op_is_rejected(self):
         wrencode.write({"path": "f.txt", "content": "unchanged"})
-        result = wrencode.edit({"path": "f.txt", "old": "unchanged", "new": "unchanged"})
+        result = wrencode.edit(
+            {"path": "f.txt", "old": "unchanged", "new": "unchanged"}
+        )
         self.assertIn("error", result.lower())
         self.assertIn("no change", result.lower())
 
@@ -847,7 +860,6 @@ class TestFileTools(unittest.TestCase):
         result = wrencode.edit({"path": "nope.txt", "old": "x", "new": "y"})
         self.assertIn("error", result.lower())
 
-
     def test_glob_finds_matching_files(self):
         wrencode.write({"path": "a.py", "content": "x"})
         wrencode.write({"path": "b.py", "content": "y"})
@@ -865,7 +877,6 @@ class TestFileTools(unittest.TestCase):
         wrencode.write({"path": "sample.py", "content": "pass"})
         result = wrencode.glob({"pattern": "*.py"})
         self.assertIn("sample.py", result)
-
 
     def test_grep_finds_pattern(self):
         wrencode.write({"path": "code.py", "content": "# TODO: fix this\nx = 1"})
@@ -887,7 +898,6 @@ class TestFileTools(unittest.TestCase):
         result = wrencode.grep({"pat": "x", "path": "missing.py"})
         self.assertIn("error", result.lower())
         self.assertIn("not found", result.lower())
-
 
     def test_outside_workspace_is_rejected(self):
         with self.assertRaises(ValueError) as cm:
@@ -929,6 +939,7 @@ class TestAgentLoopSmoke(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+
         shutil.rmtree(self._tmp, ignore_errors=True)
         if self._orig_workspace is not None:
             os.environ["WRENCODE_WORKSPACE"] = self._orig_workspace
@@ -974,9 +985,7 @@ class TestAgentLoopSmoke(unittest.TestCase):
             block.get("text", "")
             for m in messages
             if m["role"] == "assistant"
-            for block in (
-                m["content"] if isinstance(m["content"], list) else []
-            )
+            for block in (m["content"] if isinstance(m["content"], list) else [])
             if block.get("type") == "text"
         ]
         self.assertTrue(
@@ -1041,7 +1050,6 @@ class TestAgentLoopSmoke(unittest.TestCase):
 # Additional helpers / edge cases
 # ---------------------------------------------------------------------------
 class TestFlattenContent(unittest.TestCase):
-
     def test_plain_string_unchanged(self):
         self.assertEqual(wrencode.flatten_content("hello"), "hello")
 
@@ -1094,7 +1102,11 @@ class TestTruncationWarning(unittest.TestCase):
         self.assertIn("4096", out)
 
     def test_anthropic_silent_on_tool_use_stop_reason(self):
-        data = {"stop_reason": "tool_use", "usage": {"output_tokens": 500}, "content": []}
+        data = {
+            "stop_reason": "tool_use",
+            "usage": {"output_tokens": 500},
+            "content": [],
+        }
         with mock.patch.object(wrencode, "BACKEND", "anthropic"):
             out = self._capture_stderr(wrencode._warn_if_truncated, data)
         self.assertEqual(out, "")
@@ -1124,11 +1136,15 @@ class TestAnthropicPromptCache(unittest.TestCase):
                 "usage": {"input_tokens": 1, "output_tokens": 1},
             }
 
-        with mock.patch.object(wrencode, "BACKEND", "anthropic"), \
-             mock.patch.object(wrencode, "MODEL", "claude-sonnet-4-6"), \
-             mock.patch.object(wrencode, "API_KEY", "test-key"), \
-             mock.patch.object(wrencode, "API_BASE", "https://api.anthropic.com/v1/messages"), \
-             mock.patch.object(wrencode, "_http_post", fake_post):
+        with (
+            mock.patch.object(wrencode, "BACKEND", "anthropic"),
+            mock.patch.object(wrencode, "MODEL", "claude-sonnet-4-6"),
+            mock.patch.object(wrencode, "API_KEY", "test-key"),
+            mock.patch.object(
+                wrencode, "API_BASE", "https://api.anthropic.com/v1/messages"
+            ),
+            mock.patch.object(wrencode, "_http_post", fake_post),
+        ):
             wrencode.get_response(
                 messages=[{"role": "user", "content": "hi"}],
                 system_prompt="you are a test",
@@ -1170,7 +1186,6 @@ class TestCertifiTrustStore(unittest.TestCase):
 
 
 class TestRunTool(unittest.TestCase):
-
     def setUp(self):
         self._tmp = str(pathlib.Path(tempfile.mkdtemp()).resolve())
         self._orig_workspace = os.environ.get("WRENCODE_WORKSPACE")
@@ -1180,6 +1195,7 @@ class TestRunTool(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+
         shutil.rmtree(self._tmp, ignore_errors=True)
         if self._orig_workspace is not None:
             os.environ["WRENCODE_WORKSPACE"] = self._orig_workspace
@@ -1204,6 +1220,190 @@ class TestRunTool(unittest.TestCase):
         wrencode.write({"path": "big.txt", "content": big_content})
         result = wrencode.run_tool("read", {"path": "big.txt"})
         self.assertIn("truncated", result)
+
+
+# ---------------------------------------------------------------------------
+# AWS Bedrock backend (SigV4 signing, request shape, credential resolution)
+# ---------------------------------------------------------------------------
+class TestBedrockSigV4(unittest.TestCase):
+    # Fixed inputs; the expected signature was cross-validated against
+    # botocore's SigV4Auth (the reference AWS SDK implementation) at runtime.
+    AK = "AKIDEXAMPLE"
+    SK = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+    AMZ = "20150830T123600Z"
+
+    def test_sigv4_signature_matches_known_vector(self):
+        import hashlib
+        import urllib.parse
+
+        body = b'{"max_tokens":16}'
+        host = "bedrock-runtime.us-east-1.amazonaws.com"
+        wire = (
+            "/model/"
+            + urllib.parse.quote("us.anthropic.claude-3-5-haiku-20241022-v1:0", safe="")
+            + "/invoke"
+        )
+        canonical_uri = urllib.parse.quote(wire, safe="/~")
+        payload_hash = hashlib.sha256(body).hexdigest()
+        headers = {
+            "host": host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": self.AMZ,
+        }
+        auth, signed = wrencode._sigv4_authorization(
+            "POST",
+            canonical_uri,
+            "",
+            headers,
+            payload_hash,
+            "bedrock-runtime",
+            "us-east-1",
+            self.AMZ,
+            self.AK,
+            self.SK,
+        )
+        self.assertEqual(signed, "host;x-amz-content-sha256;x-amz-date")
+        self.assertTrue(
+            auth.endswith(
+                "Signature=3ba9edc434e4059fc725fb046d32d62d8c482fdc79ad7e91543530225bc1764d"
+            )
+        )
+        self.assertIn(
+            f"Credential={self.AK}/20150830/us-east-1/bedrock-runtime/aws4_request",
+            auth,
+        )
+
+    def test_canonical_uri_double_encodes_colon(self):
+        # Non-S3 SigV4 double-encodes the path: a model id's ':' -> %253A.
+        import urllib.parse
+
+        wire = (
+            "/model/"
+            + urllib.parse.quote("us.anthropic.claude-3-5-haiku-20241022-v1:0", safe="")
+            + "/invoke"
+        )
+        canonical_uri = urllib.parse.quote(wire, safe="/~")
+        self.assertIn("%253A", canonical_uri)
+        self.assertNotIn("%3A0", canonical_uri)  # the single-encoded form is gone
+
+    def test_signed_headers_include_session_token_when_present(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AWS_ACCESS_KEY_ID": self.AK,
+                "AWS_SECRET_ACCESS_KEY": self.SK,
+                "AWS_SESSION_TOKEN": "tok123",
+                "AWS_REGION": "us-east-1",
+            },
+        ):
+            headers = wrencode._sigv4_signed_headers(
+                "POST",
+                "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke",
+                b"{}",
+                "bedrock-runtime",
+                "us-east-1",
+            )
+        self.assertEqual(headers["X-Amz-Security-Token"], "tok123")
+        self.assertIn("x-amz-security-token", headers["Authorization"])
+
+    def test_missing_credentials_raises(self):
+        # Mock the resolver empty — clearing env alone won't do it, since there's
+        # a ~/.aws/credentials fallback that may exist on the dev machine.
+        with mock.patch.object(wrencode, "_aws_credentials", return_value=("", "", "")):
+            with self.assertRaises(Exception):
+                wrencode._sigv4_signed_headers(
+                    "POST", "https://x/y", b"{}", "bedrock-runtime", "us-east-1"
+                )
+
+
+class TestBedrockBackend(unittest.TestCase):
+    def test_spec_is_aws_kind_with_no_key_env(self):
+        spec = wrencode.BACKEND_SPECS["bedrock"]
+        self.assertEqual(spec["kind"], "aws")
+        self.assertNotIn("key_env", spec)
+
+    def test_bedrock_is_native_and_hosted_but_not_anthropic_format(self):
+        # Bedrock uses the Converse format, so it must NOT be parsed as Anthropic.
+        self.assertNotIn("bedrock", wrencode.ANTHROPIC_FORMAT_BACKENDS)
+        self.assertIn("bedrock", wrencode.NATIVE_TOOL_BACKENDS)
+        self.assertIn("bedrock", wrencode.HOSTED_BACKENDS)
+        self.assertNotIn("bedrock", wrencode.API_BACKENDS)
+
+    def test_apply_backend_aws_sets_region_and_no_key(self):
+        with mock.patch.dict(os.environ, {"AWS_REGION": "eu-west-1"}, clear=False):
+            os.environ.pop("MODEL", None)
+            wrencode.apply_backend("bedrock")
+        self.assertEqual(wrencode.BACKEND, "bedrock")
+        self.assertEqual(wrencode.AWS_REGION, "eu-west-1")
+        self.assertEqual(wrencode.API_KEY, "")
+
+    def test_get_response_builds_converse_request(self):
+        # get_response should hit /converse with a Converse-shaped body:
+        # system as [{text}], inferenceConfig.maxTokens, toolConfig.tools[].toolSpec,
+        # string message content normalized to [{text}], and no anthropic_version.
+        captured = {}
+
+        def fake_post_raw(url, data, headers):
+            captured["url"] = url
+            captured["body"] = json.loads(data)
+            captured["headers"] = headers
+            return {"output": {"message": {"role": "assistant",
+                    "content": [{"text": "ok"}]}}, "stopReason": "end_turn"}
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AWS_ACCESS_KEY_ID": "AKIDEXAMPLE",
+                "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "AWS_REGION": "us-east-1",
+            },
+            clear=False,
+        ):
+            os.environ.pop("MODEL", None)
+            wrencode.apply_backend("bedrock", model="openai.gpt-oss-120b-1:0")
+            with mock.patch.object(wrencode, "_http_post_raw", fake_post_raw):
+                raw = wrencode.get_response(
+                    [{"role": "user", "content": "hi"}], "sys-prompt", None
+                )
+        body = captured["body"]
+        self.assertTrue(captured["url"].endswith("/converse"))
+        self.assertIn("bedrock-runtime.us-east-1.amazonaws.com", captured["url"])
+        self.assertNotIn("anthropic_version", body)
+        self.assertEqual(body["system"], [{"text": "sys-prompt"}])
+        self.assertEqual(body["inferenceConfig"]["maxTokens"], wrencode.MAX_TOKENS)
+        self.assertEqual(body["messages"][0]["content"], [{"text": "hi"}])  # str -> [{text}]
+        self.assertIn("toolSpec", body["toolConfig"]["tools"][0])
+        self.assertIn("Authorization", captured["headers"])
+        # The host is bedrock-runtime.*, but the SigV4 credential scope must name
+        # the signing service "bedrock" — AWS 403s on "bedrock-runtime" here.
+        self.assertIn("/us-east-1/bedrock/aws4_request", captured["headers"]["Authorization"])
+        self.assertNotIn("/bedrock-runtime/aws4_request", captured["headers"]["Authorization"])
+        # The returned raw JSON parses back to text via the native path.
+        self.assertEqual(json.loads(raw)["output"]["message"]["content"][0]["text"], "ok")
+
+    def test_bedrock_response_parse_and_append_roundtrip(self):
+        # Converse response -> parsed text + ToolCall, and the history append uses
+        # Converse blocks (assistant content + toolResult) so the next turn is valid.
+        with mock.patch.object(wrencode, "BACKEND", "bedrock"):
+            data = {"output": {"message": {"role": "assistant", "content": [
+                {"text": "let me read"},
+                {"toolUse": {"toolUseId": "tu1", "name": "read", "input": {"path": "x"}}},
+            ]}}, "stopReason": "tool_use", "usage": {"inputTokens": 5, "outputTokens": 7}}
+            text, calls = wrencode._parse_native_response(data)
+            self.assertEqual(text, "let me read")
+            self.assertEqual(calls[0].id, "tu1")
+            self.assertEqual(calls[0].name, "read")
+
+            msgs = []
+            wrencode._append_assistant(msgs, text, calls, data)
+            self.assertEqual(msgs[0]["role"], "assistant")
+            self.assertIn("toolUse", msgs[0]["content"][1])
+
+            wrencode._append_tool_results(msgs, [(calls[0], "file contents")])
+            tr = msgs[1]["content"][0]["toolResult"]
+            self.assertEqual(tr["toolUseId"], "tu1")
+            self.assertEqual(tr["content"], [{"text": "file contents"}])
+            self.assertEqual(tr["status"], "success")
 
 
 if __name__ == "__main__":
