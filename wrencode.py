@@ -2782,17 +2782,22 @@ def uninstall() -> None:
 SYNTH_EXTRACT_SYS = (
     "You analyze ONE coding-agent chat transcript and extract its substantive "
     "engineering content. Return ONLY a JSON object, no prose, with this exact "
-    'shape: {"decisions": [str], "problems_solved": [{"problem": str, '
-    '"resolution": str}], "files_touched": [str], "open_questions": [str]}. '
-    "Each item is one terse sentence. Decisions = choices made about how to "
-    "build or fix something; capture conclusions, not narration. Do NOT continue "
-    "the conversation — you are extracting from a finished log."
+    'shape: {"decisions": [{"subject": str, "conclusion": str}], '
+    '"problems_solved": [{"problem": str, "resolution": str}], '
+    '"files_touched": [str], "open_questions": [str]}. '
+    "A decision's `subject` is a short stable slug for WHAT was decided "
+    "('storage-format', 'auth-strategy') — never the answer; `conclusion` is the "
+    "chosen answer ('Iceberg'). Two chats deciding the same subject share the "
+    "same slug. Keep each value one terse phrase. Capture conclusions, not "
+    "narration. Do NOT continue the conversation — extract from a finished log."
 )
 SYNTH_RECONCILE_SYS = (
     "You MERGE structured facts from multiple coding-agent chats, like a semantic "
     "git merge. You are given a JSON array of per-chat fact sets, each tagged with "
-    "its chat id. Produce Markdown with EXACTLY these sections:\n\n"
-    "## Reinforced decisions\nDecisions ≥2 chats agree on; cite ids e.g. `(a1b2, c3d4)`.\n\n"
+    "its chat id. Align decisions by their `subject` slug: same subject + same "
+    "conclusion → reinforced; same subject + different conclusion → CONFLICT; a "
+    "subject only one chat has → unique. Produce Markdown with EXACTLY:\n\n"
+    "## Reinforced decisions\nSubjects ≥2 chats agree on; cite ids e.g. `(a1b2, c3d4)`.\n\n"
     "## Unique contributions\nDecisions/findings only one chat has; cite the source.\n\n"
     "## ⚠ Conflicts\nWhere chats CONTRADICT on the same entity (different root "
     "cause, reversed decision, incompatible approach). Show both sides with "
@@ -2804,8 +2809,9 @@ SYNTH_RECONCILE_SYS = (
 SYNTH_DIFF_SYS = (
     "You compare structured facts from multiple coding-agent chats and report ONLY "
     "where they DIVERGE, like `git diff`. Given a JSON array of per-chat fact sets "
-    "(each tagged with its chat id), produce Markdown with EXACTLY:\n\n"
-    "## ⚠ Conflicts\nDirect contradictions on the same entity (different root cause, "
+    "(each tagged with its chat id), align decisions by their `subject` slug (same "
+    "subject + different conclusion = a conflict). Produce Markdown with EXACTLY:\n\n"
+    "## ⚠ Conflicts\nDirect contradictions on the same subject/entity (different root cause, "
     "reversed decision, incompatible approach); show both sides and cite ids. If a "
     "later chat overrode an earlier one, mark it resolved and name the winner.\n\n"
     "## Only in one chat\nDecisions/findings present in just one chat, grouped by id.\n\n"
