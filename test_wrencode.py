@@ -1406,5 +1406,153 @@ class TestBedrockBackend(unittest.TestCase):
             self.assertEqual(tr["status"], "success")
 
 
+class TestSynthesize(unittest.TestCase):
+    """The /synthesize transcript-fusion pipeline."""
+
+    def _jsonl(self, *objs):
+        return "\n".join(json.dumps(o) for o in objs)
+
+    def test_normalize_claude_code_keeps_only_user_and_assistant_text(self):
+        raw = self._jsonl(
+            {"type": "mode", "mode": "default"},  # non-message line ignored
+            {"type": "user", "message": {"role": "user", "content": "fix the bug"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "thinking", "text": "hmm"},          # dropped
+                {"type": "text", "text": "Found it in foo.py"},
+                {"type": "tool_use", "name": "read", "input": {}},  # dropped
+            ]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "bytes"}]}},  # dropped (list)
+            {"type": "user", "message": {"role": "user",
+                                         "content": "<system-reminder>x"}},  # skipped
+        )
+        turns = wrencode._parse_claude_code_jsonl(raw)
+        self.assertEqual(turns, [
+            {"role": "user", "text": "fix the bug"},
+            {"role": "assistant", "text": "Found it in foo.py"},
+        ])
+
+    def test_normalize_rejects_non_jsonl(self):
+        self.assertIsNone(wrencode._parse_claude_code_jsonl("# just markdown\nhello"))
+
+    def test_generic_jsonl_adapter_sniffs_role_and_content(self):
+        # Codex/OpenAI-style: each line a flat {role, content} record, varied keys.
+        raw = self._jsonl(
+            {"role": "user", "content": "build X"},
+            {"sender": "ai", "text": "done, edited y.py"},
+            {"role": "system", "content": "ignored"},   # non-user/assistant dropped
+        )
+        self.assertEqual(wrencode._adapt_generic_jsonl(raw), [
+            {"role": "user", "text": "build X"},
+            {"role": "assistant", "text": "done, edited y.py"},
+        ])
+
+    def test_messages_json_adapter_handles_array_and_wrapper(self):
+        arr = json.dumps([{"role": "user", "content": "hi"},
+                          {"role": "assistant", "content": [{"text": "yo"}]}])
+        self.assertEqual(wrencode._adapt_messages_json(arr), [
+            {"role": "user", "text": "hi"},
+            {"role": "assistant", "text": "yo"},
+        ])
+        wrapped = json.dumps({"messages": [{"role": "user", "content": "hey"}]})
+        self.assertEqual(wrencode._adapt_messages_json(wrapped),
+                         [{"role": "user", "text": "hey"}])
+        self.assertIsNone(wrencode._adapt_messages_json('{"no": "messages"}'))
+
+    def test_coerce_text_flattens_blocks(self):
+        self.assertEqual(wrencode._coerce_text([{"text": "a"}, {"content": "b"}]), "a\nb")
+        self.assertEqual(wrencode._coerce_text("plain"), "plain")
+        self.assertEqual(wrencode._coerce_text({"text": "nested"}), "nested")
+
+    def test_normalize_reports_adapter_source(self):
+        cc = self._jsonl({"type": "user",
+                          "message": {"role": "user", "content": "hi"}})
+        generic = self._jsonl({"role": "user", "content": "hi"})
+        with tempfile.TemporaryDirectory() as d:
+            for name, raw, want in [("a.jsonl", cc, "claude-code"),
+                                    ("b.jsonl", generic, "jsonl")]:
+                p = pathlib.Path(d) / name
+                p.write_text(raw)
+                self.assertEqual(wrencode._synth_normalize(str(p))["source"], want)
+
+    def test_reconcile_dispatches_mode_to_system_prompt(self):
+        seen = {}
+
+        def fake(system, user, prefill=""):
+            seen["sys"] = system
+            return "doc"
+
+        with mock.patch.object(wrencode, "_synth_complete", side_effect=fake):
+            wrencode._synth_reconcile([{"chat": "a"}], mode="diff")
+            self.assertIs(seen["sys"], wrencode.SYNTH_DIFF_SYS)
+            wrencode._synth_reconcile([{"chat": "a"}], mode="log")
+            self.assertIs(seen["sys"], wrencode.SYNTH_LOG_SYS)
+            wrencode._synth_reconcile([{"chat": "a"}])
+            self.assertIs(seen["sys"], wrencode.SYNTH_RECONCILE_SYS)
+
+    def test_normalize_falls_back_to_text_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "notes.md"
+            p.write_text("# design\nplain prose")
+            chat = wrencode._synth_normalize(str(p))
+            self.assertEqual(chat["source"], "text")
+            self.assertEqual(chat["turns"][0]["role"], "user")
+
+    def test_json_slice_tolerates_surrounding_prose(self):
+        self.assertEqual(wrencode._json_slice('here: {"a": 1} done'), '{"a": 1}')
+        self.assertEqual(wrencode._json_slice("no json"), "no json")
+
+    def test_parse_selection_handles_numbers_ranges_and_all(self):
+        self.assertEqual(wrencode._parse_selection("all", 3), [0, 1, 2])
+        self.assertEqual(wrencode._parse_selection("1 3", 3), [0, 2])
+        self.assertEqual(wrencode._parse_selection("1-3", 5), [0, 1, 2])
+        self.assertEqual(wrencode._parse_selection("2,2,9", 3), [1])  # dedup + clamp
+        self.assertEqual(wrencode._parse_selection("nope", 3), [])
+
+    def test_extract_forces_json_and_tags_provenance(self):
+        chat = {"id": "abcd1234", "turns": [{"role": "user", "text": "hi"}]}
+        payload = '"decisions": ["use Converse"], "problems_solved": [], ' \
+                  '"files_touched": ["wrencode.py"], "open_questions": []}'
+        with mock.patch.object(wrencode, "_synth_complete",
+                               return_value="{" + payload) as m:
+            facts = wrencode._synth_extract(chat)
+        # extraction is forced via assistant prefill "{"
+        self.assertEqual(m.call_args.kwargs.get("prefill"), "{")
+        self.assertEqual(facts["chat"], "abcd1234")
+        self.assertEqual(facts["decisions"], ["use Converse"])
+
+    def test_extract_survives_unparseable_output(self):
+        chat = {"id": "ffff", "turns": [{"role": "user", "text": "hi"}]}
+        with mock.patch.object(wrencode, "_synth_complete",
+                               return_value="Let me continue the chat instead..."):
+            facts = wrencode._synth_extract(chat)
+        self.assertEqual(facts["chat"], "ffff")
+        self.assertEqual(facts["decisions"], [])
+        self.assertIn("_parse_error", facts)
+
+    def test_run_synthesize_writes_out_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = pathlib.Path(d) / "a.jsonl"
+            b = pathlib.Path(d) / "b.jsonl"
+            a.write_text(json.dumps(
+                {"type": "user", "message": {"role": "user", "content": "task A"}}))
+            b.write_text(json.dumps(
+                {"type": "user", "message": {"role": "user", "content": "task B"}}))
+            out = pathlib.Path(d) / "synthesis.md"
+            extract_json = ('{"decisions": ["d"], "problems_solved": [], '
+                            '"files_touched": [], "open_questions": []}')
+            # one extract call per file, then one reconcile call
+            with mock.patch.object(wrencode, "_synth_complete",
+                                   side_effect=[extract_json, extract_json,
+                                                "# SYNTHESIS\nmerged"]):
+                wrencode.run_synthesize([str(a), str(b)], out=str(out))
+            self.assertEqual(out.read_text(), "# SYNTHESIS\nmerged")
+
+    def test_run_synthesize_errors_when_no_transcripts(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit):
+                wrencode.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
+
+
 if __name__ == "__main__":
     unittest.main()
