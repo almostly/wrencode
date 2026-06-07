@@ -1348,9 +1348,15 @@ def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
         if fmt == "anthropic":
             out.append({"name": name, "description": desc, "input_schema": schema})
         elif fmt == "converse":
-            out.append({"toolSpec": {
-                "name": name, "description": desc, "inputSchema": {"json": schema},
-            }})
+            out.append(
+                {
+                    "toolSpec": {
+                        "name": name,
+                        "description": desc,
+                        "inputSchema": {"json": schema},
+                    }
+                }
+            )
         else:
             out.append(
                 {
@@ -1440,9 +1446,13 @@ def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]
         blocks = data.get("output", {}).get("message", {}).get("content", [])
         text = "\n".join(b["text"] for b in blocks if "text" in b).strip()
         calls = [
-            ToolCall(b["toolUse"]["toolUseId"], b["toolUse"]["name"],
-                     b["toolUse"].get("input", {}))
-            for b in blocks if "toolUse" in b
+            ToolCall(
+                b["toolUse"]["toolUseId"],
+                b["toolUse"]["name"],
+                b["toolUse"].get("input", {}),
+            )
+            for b in blocks
+            if "toolUse" in b
         ]
         return text, calls
     if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
@@ -1536,17 +1546,21 @@ def _append_tool_results(
             {"role": "tool", "tool_call_id": tc.id, "content": r} for tc, r in results
         )
     elif BACKEND == "bedrock":
-        messages.append({
-            "role": "user",
-            "content": [
-                {"toolResult": {
-                    "toolUseId": tc.id,
-                    "content": [{"text": r}],
-                    "status": "success",
-                }}
-                for tc, r in results
-            ],
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "toolResult": {
+                            "toolUseId": tc.id,
+                            "content": [{"text": r}],
+                            "status": "success",
+                        }
+                    }
+                    for tc, r in results
+                ],
+            }
+        )
     else:  # anthropic + XML path both use tool_result blocks
         messages.append(
             {
@@ -1938,11 +1952,13 @@ def compact_messages(
             + history_text
         )
         if BACKEND == "bedrock":
-            data = _bedrock_converse_call({
-                "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "system": [{"text": "You are a helpful assistant."}],
-                "inferenceConfig": {"maxTokens": 512},
-            })
+            data = _bedrock_converse_call(
+                {
+                    "messages": [{"role": "user", "content": [{"text": prompt}]}],
+                    "system": [{"text": "You are a helpful assistant."}],
+                    "inferenceConfig": {"maxTokens": 512},
+                }
+            )
             summary = "\n".join(
                 b["text"]
                 for b in data.get("output", {}).get("message", {}).get("content", [])
@@ -2643,7 +2659,9 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "mlx":
         try:
             global load, stream_generate, make_sampler
-            from mlx_lm import load  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
+            from mlx_lm import (  # ty: ignore[unresolved-import]
+                load,  # type: ignore[import-not-found]
+            )
             from mlx_lm.generate import (  # ty: ignore[unresolved-import]
                 stream_generate,  # type: ignore[import-not-found]
             )
@@ -2756,6 +2774,343 @@ def uninstall() -> None:
         print(f"{DIM}uvx cache:{RESET} uv cache clean wrencode")
 
 
+# -----------------------------------------------------------------------------------------------
+# synthesize — fuse multiple agent chat transcripts into one provenance-cited synthesis.
+# A semantic git-merge for chats: extract each chat's decisions, then reconcile them into
+# Reinforced (≥2 agree) / Unique / ⚠ Conflict, every claim carrying a chat-id citation.
+# -----------------------------------------------------------------------------------------------
+SYNTH_EXTRACT_SYS = (
+    "You analyze ONE coding-agent chat transcript and extract its substantive "
+    "engineering content. Return ONLY a JSON object, no prose, with this exact "
+    'shape: {"decisions": [str], "problems_solved": [{"problem": str, '
+    '"resolution": str}], "files_touched": [str], "open_questions": [str]}. '
+    "Each item is one terse sentence. Decisions = choices made about how to "
+    "build or fix something; capture conclusions, not narration. Do NOT continue "
+    "the conversation — you are extracting from a finished log."
+)
+SYNTH_RECONCILE_SYS = (
+    "You MERGE structured facts from multiple coding-agent chats, like a semantic "
+    "git merge. You are given a JSON array of per-chat fact sets, each tagged with "
+    "its chat id. Produce Markdown with EXACTLY these sections:\n\n"
+    "## Reinforced decisions\nDecisions ≥2 chats agree on; cite ids e.g. `(a1b2, c3d4)`.\n\n"
+    "## Unique contributions\nDecisions/findings only one chat has; cite the source.\n\n"
+    "## ⚠ Conflicts\nWhere chats CONTRADICT on the same entity (different root "
+    "cause, reversed decision, incompatible approach). Show both sides with "
+    "citations. If a later chat overrode an earlier conclusion, mark it resolved "
+    "and name the winner. If genuinely none, write 'None detected.'\n\n"
+    "## Open questions\nUnresolved items across all chats, cited.\n\n"
+    "Every claim MUST carry a chat-id citation. Never invent agreement."
+)
+
+
+def _synth_complete(system_prompt: str, user_text: str, prefill: str = "") -> str:
+    """One-shot completion via the configured backend, with NO agent tools attached.
+
+    `prefill` anchors the model to continue from given text (used to force JSON);
+    only the Anthropic-format and Bedrock backends honor it.
+    """
+    if BACKEND == "bedrock":
+        msgs: list[dict[str, Any]] = [
+            {"role": "user", "content": [{"text": user_text}]}
+        ]
+        if prefill:
+            msgs.append({"role": "assistant", "content": [{"text": prefill}]})
+        body = {
+            "messages": msgs,
+            "system": [{"text": system_prompt}],
+            "inferenceConfig": {"maxTokens": MAX_TOKENS, "temperature": 0.0},
+        }
+        text, _ = _parse_native_response(_bedrock_converse_call(body))
+        return (prefill + text).strip()
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+        amsgs: list[dict[str, Any]] = [{"role": "user", "content": user_text}]
+        if prefill:
+            amsgs.append({"role": "assistant", "content": prefill})
+        data = _http_post(
+            API_BASE,
+            {
+                "model": MODEL,
+                "system": system_prompt,
+                "messages": amsgs,
+                "max_tokens": MAX_TOKENS,
+            },
+            _anthropic_headers(),
+        )
+        text, _ = _parse_native_response(data)
+        return (prefill + text).strip()
+    if BACKEND == "openai":
+        data = _http_post(
+            API_BASE,
+            {
+                "model": MODEL,
+                "max_tokens": MAX_TOKENS,
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+            },
+            _openai_headers(),
+        )
+        text, _ = _parse_native_response(data)
+        return text.strip()
+    # ollama / openrouter / local / mlx / transformers attach no tools — reuse get_response.
+    raw = get_response(
+        [{"role": "user", "content": user_text}], system_prompt, _MLX_STATE
+    )
+    text, _calls, _data = _parse_response(raw)
+    return text.strip()
+
+
+def _parse_claude_code_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
+    """Extract user prompts + assistant text from a Claude Code JSONL log, or None.
+
+    Drops tool calls, tool results, and thinking — only the user↔assistant signal
+    survives. Returns None when the input isn't Claude Code JSONL.
+    """
+    turns: list[dict[str, str]] = []
+    looks_jsonl = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            return None  # a non-JSON line means this isn't a JSONL transcript
+        if not isinstance(o, dict) or "type" not in o:
+            return None
+        looks_jsonl = True
+        m = o.get("message")
+        if not isinstance(m, dict):
+            continue
+        role, content = o.get("type"), m.get("content")
+        if role == "user" and isinstance(content, str):
+            t = content.strip()
+            if t and not t.startswith("<"):  # skip injected/system-ish prompts
+                turns.append({"role": "user", "text": t})
+        elif role == "assistant" and isinstance(content, list):
+            text = "\n".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+            if text:
+                turns.append({"role": "assistant", "text": text})
+    return turns if looks_jsonl else None
+
+
+def _synth_normalize(path: str) -> dict[str, Any]:
+    """Load a transcript into the common {id, source, turns:[{role,text}]} shape."""
+    raw = pathlib.Path(path).read_text(errors="replace")
+    turns = _parse_claude_code_jsonl(raw)
+    source = "claude-code"
+    if turns is None:  # unknown format → treat the whole file as one block
+        turns = [{"role": "user", "text": raw}]
+        source = "text"
+    cid = pathlib.Path(path).stem[:8] or "chat"
+    return {"id": cid, "source": source, "turns": turns}
+
+
+def _synth_render(chat: dict[str, Any], max_chars: int = 110000) -> str:
+    """Flatten a normalized chat to a tagged transcript string, capped in size."""
+    s = "\n\n".join(f"[{t['role'].upper()}] {t['text']}" for t in chat["turns"])
+    return s[:max_chars]
+
+
+def _json_slice(s: str) -> str:
+    """Return the outermost {...} span of s (tolerates prose around the JSON)."""
+    i, j = s.find("{"), s.rfind("}")
+    return s[i : j + 1] if i != -1 and j > i else s
+
+
+def _synth_extract(chat: dict[str, Any]) -> dict[str, Any]:
+    """Extract one chat's structured facts, tagged with its chat id (provenance)."""
+    user = (
+        f"<transcript chat_id={chat['id']}>\n{_synth_render(chat)}\n</transcript>\n\n"
+        "Extract the JSON object described in your instructions from the transcript "
+        "above. Do NOT continue the conversation; output only JSON."
+    )
+    raw = _synth_complete(SYNTH_EXTRACT_SYS, user, prefill="{")
+    try:
+        facts = json.loads(_json_slice(raw))
+        if not isinstance(facts, dict):
+            raise ValueError("not an object")
+    except (json.JSONDecodeError, ValueError):
+        facts = {
+            "decisions": [],
+            "problems_solved": [],
+            "files_touched": [],
+            "open_questions": [],
+            "_parse_error": raw[:200],
+        }
+    facts["chat"] = chat["id"]
+    return facts
+
+
+def _synth_reconcile(fact_sets: list[dict[str, Any]]) -> str:
+    """Fuse all per-chat fact sets into one Markdown synthesis with citations."""
+    return _synth_complete(
+        SYNTH_RECONCILE_SYS,
+        "Fact sets to merge:\n\n" + json.dumps(fact_sets, indent=2),
+    )
+
+
+def _claude_project_dir() -> Optional[pathlib.Path]:
+    """Return this workspace's Claude Code transcript dir (~/.claude/projects/...) if any."""
+    cwd = os.environ.get("WRENCODE_WORKSPACE") or str(pathlib.Path.cwd().resolve())
+    encoded = cwd.replace("/", "-")  # Claude Code encodes the cwd path with dashes
+    d = pathlib.Path.home() / ".claude" / "projects" / encoded
+    return d if d.is_dir() else None
+
+
+def _discover_transcripts(dirs: list[str]) -> list[str]:
+    """Find *.jsonl transcripts in the given directories, newest first."""
+    found: list[str] = []
+    for d in dirs:
+        found += [str(x) for x in pathlib.Path(d).glob("*.jsonl")]
+    found.sort(key=lambda f: pathlib.Path(f).stat().st_mtime, reverse=True)
+    return found
+
+
+def _ago(seconds: float) -> str:
+    """Compact relative age: 5m, 3h, 2d."""
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def _first_user_prompt(path: str) -> str:
+    """Peek at a transcript's first real user prompt for use as a picker label."""
+    try:
+        with open(path) as fh:
+            for _ in range(400):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("type") == "user" and isinstance(o.get("message"), dict):
+                    c = o["message"].get("content")
+                    if isinstance(c, str):
+                        t = " ".join(c.split())
+                        if t and not t.startswith("<"):
+                            return t
+    except OSError:
+        pass
+    return "(no prompt found)"
+
+
+def _transcript_label(path: str) -> str:
+    """One-line picker label: id, size, age, first-prompt snippet."""
+    p = pathlib.Path(path)
+    size = p.stat().st_size
+    human = f"{size / 1024:.0f}K" if size < (1 << 20) else f"{size / (1 << 20):.1f}M"
+    age = _ago(time.time() - p.stat().st_mtime)
+    return f"{p.stem[:8]}  {human:>6}  {age:>4} ago  {_first_user_prompt(path)[:64]}"
+
+
+def _parse_selection(raw: str, n: int) -> list[int]:
+    """Parse '1 3 5', '1-3', '1,2', or 'all' into sorted 0-based indices within [1,n]."""
+    raw = raw.strip().lower()
+    if raw in {"all", "*", "a"}:
+        return list(range(n))
+    out: list[int] = []
+    for tok in raw.replace(",", " ").split():
+        a, sep, b = tok.partition("-")
+        if sep and a.isdigit() and b.isdigit():
+            out += range(int(a), int(b) + 1)
+        elif tok.isdigit():
+            out.append(int(tok))
+    return sorted({i - 1 for i in out if 1 <= i <= n})
+
+
+def _synth_pick(candidates: list[str]) -> list[str]:
+    """Show a numbered multi-select list and return the chosen transcript paths."""
+    print()
+    print_system(
+        "Select transcripts to synthesize (numbers, ranges like 1-3, or 'all'):"
+    )
+    print()
+    for i, path in enumerate(candidates, 1):
+        print("  " + str(i) + ". " + _transcript_label(path))
+    while True:
+        raw = input(f"{BLUE}❯{RESET} selection [all]: ").strip() or "all"
+        idx = _parse_selection(raw, len(candidates))
+        if idx:
+            return [candidates[i] for i in idx]
+        print(f"{RED}Enter numbers 1-{len(candidates)}, a range, or 'all'.{RESET}")
+
+
+def run_synthesize(
+    paths: list[str], out: Optional[str] = None, *, interactive: bool = True
+) -> None:
+    """Fuse agent chat transcripts into one synthesis (normalize → extract → reconcile).
+
+    Inputs may be explicit files, directories to scan, or nothing (defaults to this
+    project's Claude Code history). When scanning, an interactive picker lets the
+    user choose which transcripts to fuse; --all (interactive=False) takes them all.
+    """
+    global _MLX_STATE
+    file_args = [p for p in paths if pathlib.Path(p).is_file()]
+    dir_args = [p for p in paths if pathlib.Path(p).is_dir()]
+    for p in paths:
+        if p not in file_args and p not in dir_args:
+            print(f"{YELLOW}skip (not found): {p}{RESET}")
+
+    if file_args and not dir_args:
+        selected = file_args  # user named specific files — honor them as-is
+    else:
+        search = dir_args
+        if not search and not paths:  # only auto-discover when given nothing at all
+            default = _claude_project_dir()
+            if default:
+                search = [str(default)]
+                print_system(f"No paths given — listing transcripts in {default}")
+        candidates = list(dict.fromkeys(file_args + _discover_transcripts(search)))
+        if not candidates:
+            raise SystemExit(
+                "synthesize: no transcripts found — pass files or a directory, or "
+                "run from a project that has Claude Code chat history"
+            )
+        selected = (
+            _synth_pick(candidates)
+            if interactive and sys.stdin.isatty()
+            else candidates
+        )
+
+    if len(selected) == 1:
+        print(
+            f"{DIM}Only one transcript — degrades to a structured summary "
+            f"(fusion needs ≥2).{RESET}"
+        )
+    if BACKEND in LOCAL_ML_BACKENDS and _MLX_STATE is None:
+        _MLX_STATE = load_model()
+    fact_sets = []
+    for p in selected:
+        chat = _synth_normalize(p)
+        print_system(
+            f"normalize {chat['id']} ({chat['source']}): {len(chat['turns'])} turns"
+        )
+        facts = _synth_extract(chat)
+        print_system(
+            f"extract   {chat['id']}: {len(facts.get('decisions', []))} decisions, "
+            f"{len(facts.get('problems_solved', []))} problems"
+        )
+        fact_sets.append(facts)
+    print_system("reconcile: fusing…")
+    doc = _synth_reconcile(fact_sets)
+    if out:
+        pathlib.Path(out).write_text(doc)
+        print_system(f"✓ wrote synthesis to {out}")
+    else:
+        print("\n" + doc)
+
+
 def print_help() -> None:
     """Print CLI usage."""
     print("wrencode — a minimal agentic coding assistant\n")
@@ -2765,6 +3120,10 @@ def print_help() -> None:
     print("--uninstall   remove saved config and show how to delete wrencode")
     print("--version, -V print version and exit")
     print("--help, -h    show this help\n")
+    print("Subcommands:")
+    print("synthesize [files|dir]   fuse chat transcripts into one synthesis")
+    print("synthesize               (no args) pick from this project's chat history")
+    print("synthesize --out FILE    write the result to FILE; --all skips the picker\n")
     print("Slash commands: /backend /model /c /compact /q  (see /help in session)")
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
@@ -2791,6 +3150,22 @@ def main() -> None:
         return
     if "--yes" in args or "--auto-approve" in args:
         os.environ["WRENCODE_AUTO_APPROVE"] = "1"
+    if args and args[0] == "synthesize":
+        rest, out, paths, take_all = args[1:], None, [], False
+        i = 0
+        while i < len(rest):
+            if rest[i] in {"--out", "-o"} and i + 1 < len(rest):
+                out = rest[i + 1]
+                i += 2
+            elif rest[i] == "--all":
+                take_all = True
+                i += 1
+            else:
+                paths.append(rest[i])
+                i += 1
+        resolve_configuration()
+        run_synthesize(paths, out, interactive=not take_all)
+        return
 
     os.environ.setdefault("WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve()))
     resolve_configuration()
