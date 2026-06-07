@@ -2801,6 +2801,31 @@ SYNTH_RECONCILE_SYS = (
     "## Open questions\nUnresolved items across all chats, cited.\n\n"
     "Every claim MUST carry a chat-id citation. Never invent agreement."
 )
+SYNTH_DIFF_SYS = (
+    "You compare structured facts from multiple coding-agent chats and report ONLY "
+    "where they DIVERGE, like `git diff`. Given a JSON array of per-chat fact sets "
+    "(each tagged with its chat id), produce Markdown with EXACTLY:\n\n"
+    "## ⚠ Conflicts\nDirect contradictions on the same entity (different root cause, "
+    "reversed decision, incompatible approach); show both sides and cite ids. If a "
+    "later chat overrode an earlier one, mark it resolved and name the winner.\n\n"
+    "## Only in one chat\nDecisions/findings present in just one chat, grouped by id.\n\n"
+    "Omit everything the chats agree on. Every claim cites a chat id. If there is no "
+    "divergence at all, write 'No divergence — the chats agree.'"
+)
+SYNTH_LOG_SYS = (
+    "You build a CHRONOLOGICAL decision log from multiple coding-agent chats, like "
+    "`git log`. The JSON array of per-chat fact sets is ordered OLDEST→NEWEST. Emit a "
+    "single Markdown timeline, oldest first, one bullet per decision or resolved "
+    "problem:\n\n- **<chat id>** — <what was decided/resolved>\n\n"
+    "Keep the listed order within a chat. When a later chat reverses or supersedes an "
+    "earlier decision, add '↳ supersedes <id>: …'. Cite the chat id on every line. "
+    "End with '## Net state' summarizing where things landed."
+)
+SYNTH_MODES = {
+    "merge": SYNTH_RECONCILE_SYS,
+    "diff": SYNTH_DIFF_SYS,
+    "log": SYNTH_LOG_SYS,
+}
 
 
 def _synth_complete(system_prompt: str, user_text: str, prefill: str = "") -> str:
@@ -2900,12 +2925,127 @@ def _parse_claude_code_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
     return turns if looks_jsonl else None
 
 
+# Common key names different agents use for a message's role and its content. The
+# generic adapters sniff these so wrencode stays tool-agnostic (Codex, OpenAI-style
+# logs, ChatGPT exports, …) without a hand-written schema per tool.
+_ROLE_KEYS = ("role", "type", "sender", "author")
+_CONTENT_KEYS = ("content", "text", "message", "body", "parts")
+_USER_ROLES = {"user", "human", "prompt", "you"}
+_ASSISTANT_ROLES = {"assistant", "ai", "model", "bot", "agent", "gpt", "claude"}
+
+
+def _coerce_role(o: dict[str, Any]) -> Optional[str]:
+    """Map any of the common role fields onto 'user'/'assistant', else None."""
+    for k in _ROLE_KEYS:
+        v = o.get(k)
+        if isinstance(v, str):
+            r = v.lower()
+            if r in _USER_ROLES:
+                return "user"
+            if r in _ASSISTANT_ROLES:
+                return "assistant"
+    return None
+
+
+def _coerce_text(v: Any) -> str:
+    """Flatten a content value (str / list of blocks / nested dict) to plain text."""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, list):
+        parts = []
+        for b in v:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict):
+                t = b.get("text") or b.get("content") or b.get("value")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "\n".join(parts).strip()
+    if isinstance(v, dict):
+        return _coerce_text(v.get("text") or v.get("content") or "")
+    return ""
+
+
+def _record_to_turn(o: Any) -> Optional[dict[str, str]]:
+    """Convert one generic message record to a {role, text} turn, or None to skip."""
+    if not isinstance(o, dict):
+        return None
+    m = o.get("message") if isinstance(o.get("message"), dict) else o
+    role = _coerce_role(m) or _coerce_role(o)
+    if role not in {"user", "assistant"}:
+        return None
+    text = ""
+    for k in _CONTENT_KEYS:
+        if k in m:
+            text = _coerce_text(m[k])
+            if text:
+                break
+    if not text or (role == "user" and text.startswith("<")):
+        return None
+    return {"role": role, "text": text}
+
+
+def _adapt_generic_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
+    """Adapt a JSONL log where each line is a message-ish dict (Codex/OpenAI-style)."""
+    turns: list[dict[str, str]] = []
+    saw = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(o, dict):
+            return None
+        saw = True
+        t = _record_to_turn(o)
+        if t:
+            turns.append(t)
+    return turns if saw and turns else None
+
+
+def _adapt_messages_json(raw: str) -> Optional[list[dict[str, str]]]:
+    """Adapt a single JSON value: a list of messages or {messages|conversation:[…]}."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    seq: Any = None
+    if isinstance(data, list):
+        seq = data
+    elif isinstance(data, dict):
+        for k in ("messages", "conversation", "turns", "history", "chat"):
+            if isinstance(data.get(k), list):
+                seq = data[k]
+                break
+    if not isinstance(seq, list):
+        return None
+    turns = [t for t in (_record_to_turn(o) for o in seq) if t]
+    return turns or None
+
+
+# Tried in order; the precise Claude Code adapter wins before the generic sniffers
+# (it correctly drops thinking/tool blocks that the generic one would keep).
+SYNTH_ADAPTERS: list[tuple[str, Any]] = [
+    ("claude-code", _parse_claude_code_jsonl),
+    ("jsonl", _adapt_generic_jsonl),
+    ("messages-json", _adapt_messages_json),
+]
+
+
 def _synth_normalize(path: str) -> dict[str, Any]:
     """Load a transcript into the common {id, source, turns:[{role,text}]} shape."""
     raw = pathlib.Path(path).read_text(errors="replace")
-    turns = _parse_claude_code_jsonl(raw)
-    source = "claude-code"
-    if turns is None:  # unknown format → treat the whole file as one block
+    turns: Optional[list[dict[str, str]]] = None
+    source = "text"
+    for name, adapt in SYNTH_ADAPTERS:
+        turns = adapt(raw)
+        if turns:
+            source = name
+            break
+    if not turns:  # unknown format → treat the whole file as one block
         turns = [{"role": "user", "text": raw}]
         source = "text"
     cid = pathlib.Path(path).stem[:8] or "chat"
@@ -2948,11 +3088,11 @@ def _synth_extract(chat: dict[str, Any]) -> dict[str, Any]:
     return facts
 
 
-def _synth_reconcile(fact_sets: list[dict[str, Any]]) -> str:
-    """Fuse all per-chat fact sets into one Markdown synthesis with citations."""
+def _synth_reconcile(fact_sets: list[dict[str, Any]], mode: str = "merge") -> str:
+    """Fuse per-chat fact sets into Markdown — merge (default), diff, or log."""
     return _synth_complete(
-        SYNTH_RECONCILE_SYS,
-        "Fact sets to merge:\n\n" + json.dumps(fact_sets, indent=2),
+        SYNTH_MODES.get(mode, SYNTH_RECONCILE_SYS),
+        "Fact sets:\n\n" + json.dumps(fact_sets, indent=2),
     )
 
 
@@ -2990,16 +3130,16 @@ def _first_user_prompt(path: str) -> str:
                 line = fh.readline()
                 if not line:
                     break
+                line = line.strip()
+                if not line:
+                    continue
                 try:
                     o = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if o.get("type") == "user" and isinstance(o.get("message"), dict):
-                    c = o["message"].get("content")
-                    if isinstance(c, str):
-                        t = " ".join(c.split())
-                        if t and not t.startswith("<"):
-                            return t
+                turn = _record_to_turn(o)
+                if turn and turn["role"] == "user":
+                    return " ".join(turn["text"].split())
     except OSError:
         pass
     return "(no prompt found)"
@@ -3029,8 +3169,8 @@ def _parse_selection(raw: str, n: int) -> list[int]:
     return sorted({i - 1 for i in out if 1 <= i <= n})
 
 
-def _synth_pick(candidates: list[str]) -> list[str]:
-    """Show a numbered multi-select list and return the chosen transcript paths."""
+def _synth_pick_numbered(candidates: list[str]) -> list[str]:
+    """Fallback picker: numbered list, accepts numbers / ranges / 'all'."""
     print()
     print_system(
         "Select transcripts to synthesize (numbers, ranges like 1-3, or 'all'):"
@@ -3046,14 +3186,85 @@ def _synth_pick(candidates: list[str]) -> list[str]:
         print(f"{RED}Enter numbers 1-{len(candidates)}, a range, or 'all'.{RESET}")
 
 
+def _synth_pick_tty(candidates: list[str]) -> list[str]:
+    """Arrow-key checkbox picker: ↑/↓ move, space toggle, a all, enter confirm, esc cancel."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    labels = [_transcript_label(p) for p in candidates]
+    n = len(candidates)
+    selected = [True] * n  # default: everything on
+    cursor = 0
+    header = (
+        f"{BOLD}Select transcripts{RESET}  "
+        f"{DIM}↑/↓ move · space toggle · a all · enter confirm · esc cancel{RESET}"
+    )
+
+    def render(first: bool) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{n + 2}A")  # back to the top of the block
+        sys.stdout.write("\r\033[J" + header + "\r\n\r\n")
+        for i, lab in enumerate(labels):
+            box = "◉" if selected[i] else "○"
+            row = f"{'›' if i == cursor else ' '} {box} {lab}"
+            sys.stdout.write((f"{BOLD}{row}{RESET}" if i == cursor else row) + "\r\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        render(True)
+        while True:
+            key = _read_tty_key(fd)
+            if key == "up":
+                cursor = (cursor - 1) % n
+            elif key == "down":
+                cursor = (cursor + 1) % n
+            elif key == " ":
+                selected[cursor] = not selected[cursor]
+            elif key in ("a", "A"):
+                turn_on = not all(selected)
+                selected = [turn_on] * n
+            elif key == "enter":
+                break
+            elif key in ("esc", "ctrl_c", "ctrl_d"):
+                selected = [False] * n
+                break
+            render(False)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    print()
+    chosen = [candidates[i] for i, on in enumerate(selected) if on]
+    if not chosen:
+        raise SystemExit("synthesize: no transcripts selected")
+    return chosen
+
+
+def _synth_pick(candidates: list[str]) -> list[str]:
+    """Pick transcripts interactively — arrow-key checkboxes on a tty, else numbered."""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            return _synth_pick_tty(candidates)
+        except (ImportError, OSError):
+            pass
+    return _synth_pick_numbered(candidates)
+
+
 def run_synthesize(
-    paths: list[str], out: Optional[str] = None, *, interactive: bool = True
+    paths: list[str],
+    out: Optional[str] = None,
+    *,
+    interactive: bool = True,
+    mode: str = "merge",
 ) -> None:
     """Fuse agent chat transcripts into one synthesis (normalize → extract → reconcile).
 
     Inputs may be explicit files, directories to scan, or nothing (defaults to this
     project's Claude Code history). When scanning, an interactive picker lets the
     user choose which transcripts to fuse; --all (interactive=False) takes them all.
+    `mode` selects the output: 'merge' (full synthesis), 'diff' (divergences only),
+    or 'log' (chronological decision timeline).
     """
     global _MLX_STATE
     file_args = [p for p in paths if pathlib.Path(p).is_file()]
@@ -3088,6 +3299,8 @@ def run_synthesize(
             f"{DIM}Only one transcript — degrades to a structured summary "
             f"(fusion needs ≥2).{RESET}"
         )
+    if mode == "log":  # a timeline reads oldest → newest
+        selected = sorted(selected, key=lambda f: pathlib.Path(f).stat().st_mtime)
     if BACKEND in LOCAL_ML_BACKENDS and _MLX_STATE is None:
         _MLX_STATE = load_model()
     fact_sets = []
@@ -3102,8 +3315,8 @@ def run_synthesize(
             f"{len(facts.get('problems_solved', []))} problems"
         )
         fact_sets.append(facts)
-    print_system("reconcile: fusing…")
-    doc = _synth_reconcile(fact_sets)
+    print_system(f"reconcile ({mode}): fusing…")
+    doc = _synth_reconcile(fact_sets, mode)
     if out:
         pathlib.Path(out).write_text(doc)
         print_system(f"✓ wrote synthesis to {out}")
@@ -3123,6 +3336,7 @@ def print_help() -> None:
     print("Subcommands:")
     print("synthesize [files|dir]   fuse chat transcripts into one synthesis")
     print("synthesize               (no args) pick from this project's chat history")
+    print("synthesize diff|log ...  diff = divergences only; log = decision timeline")
     print("synthesize --out FILE    write the result to FILE; --all skips the picker\n")
     print("Slash commands: /backend /model /c /compact /q  (see /help in session)")
     print(
@@ -3152,6 +3366,9 @@ def main() -> None:
         os.environ["WRENCODE_AUTO_APPROVE"] = "1"
     if args and args[0] == "synthesize":
         rest, out, paths, take_all = args[1:], None, [], False
+        mode = "merge"
+        if rest and rest[0] in SYNTH_MODES:  # optional git-like submode keyword
+            mode, rest = rest[0], rest[1:]
         i = 0
         while i < len(rest):
             if rest[i] in {"--out", "-o"} and i + 1 < len(rest):
@@ -3164,7 +3381,7 @@ def main() -> None:
                 paths.append(rest[i])
                 i += 1
         resolve_configuration()
-        run_synthesize(paths, out, interactive=not take_all)
+        run_synthesize(paths, out, interactive=not take_all, mode=mode)
         return
 
     os.environ.setdefault("WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve()))
