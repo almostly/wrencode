@@ -179,16 +179,21 @@ BACKEND_MODELS: dict[str, list[str]] = {
     "transformers": ["deburky/gpt-oss-claude-code"],
     "mlx": ["deburky/gpt-oss-claude-mlx"],
     "bedrock": [
-        # Any Converse-capable model id / inference profile. The "us." prefix is
-        # a cross-region inference profile — match it to your AWS_REGION's geo,
-        # or type a custom id. Mix of families since Converse is model-agnostic.
-        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        # Converse is model-agnostic, but wrencode is a TOOL-USING agent and
+        # tool-call support varies by family. Verified end-to-end on AWS (text +
+        # tool use): Claude and Amazon Nova — the recommended choices. The "us."
+        # prefix is a cross-region inference profile; match it to your AWS_REGION's
+        # geo, or type any custom Converse model id at the prompt.
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",  # verified (default)
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",  # verified
+        "us.amazon.nova-pro-v1:0",  # verified
+        # Experimental — chat works but tool use is unreliable, so the agent loop
+        # may stall: Llama emits no tool_use; GPT-OSS is flaky on tools.
         "openai.gpt-oss-20b-1:0",
-        "openai.gpt-oss-120b-1:0",
         "us.meta.llama3-3-70b-instruct-v1:0",
-        "us.amazon.nova-pro-v1:0",
-        "mistral.mistral-large-2407-v1:0",
+        # TODO: no verified tool-using non-Claude/Nova family yet. Mistral Large
+        # 2407 was dropped (invalid Bedrock model id); revisit if a Converse
+        # tool-capable Mistral/other id is confirmed.
     ],
 }
 
