@@ -1435,6 +1435,61 @@ class TestSynthesize(unittest.TestCase):
     def test_normalize_rejects_non_jsonl(self):
         self.assertIsNone(wrencode._parse_claude_code_jsonl("# just markdown\nhello"))
 
+    def test_generic_jsonl_adapter_sniffs_role_and_content(self):
+        # Codex/OpenAI-style: each line a flat {role, content} record, varied keys.
+        raw = self._jsonl(
+            {"role": "user", "content": "build X"},
+            {"sender": "ai", "text": "done, edited y.py"},
+            {"role": "system", "content": "ignored"},   # non-user/assistant dropped
+        )
+        self.assertEqual(wrencode._adapt_generic_jsonl(raw), [
+            {"role": "user", "text": "build X"},
+            {"role": "assistant", "text": "done, edited y.py"},
+        ])
+
+    def test_messages_json_adapter_handles_array_and_wrapper(self):
+        arr = json.dumps([{"role": "user", "content": "hi"},
+                          {"role": "assistant", "content": [{"text": "yo"}]}])
+        self.assertEqual(wrencode._adapt_messages_json(arr), [
+            {"role": "user", "text": "hi"},
+            {"role": "assistant", "text": "yo"},
+        ])
+        wrapped = json.dumps({"messages": [{"role": "user", "content": "hey"}]})
+        self.assertEqual(wrencode._adapt_messages_json(wrapped),
+                         [{"role": "user", "text": "hey"}])
+        self.assertIsNone(wrencode._adapt_messages_json('{"no": "messages"}'))
+
+    def test_coerce_text_flattens_blocks(self):
+        self.assertEqual(wrencode._coerce_text([{"text": "a"}, {"content": "b"}]), "a\nb")
+        self.assertEqual(wrencode._coerce_text("plain"), "plain")
+        self.assertEqual(wrencode._coerce_text({"text": "nested"}), "nested")
+
+    def test_normalize_reports_adapter_source(self):
+        cc = self._jsonl({"type": "user",
+                          "message": {"role": "user", "content": "hi"}})
+        generic = self._jsonl({"role": "user", "content": "hi"})
+        with tempfile.TemporaryDirectory() as d:
+            for name, raw, want in [("a.jsonl", cc, "claude-code"),
+                                    ("b.jsonl", generic, "jsonl")]:
+                p = pathlib.Path(d) / name
+                p.write_text(raw)
+                self.assertEqual(wrencode._synth_normalize(str(p))["source"], want)
+
+    def test_reconcile_dispatches_mode_to_system_prompt(self):
+        seen = {}
+
+        def fake(system, user, prefill=""):
+            seen["sys"] = system
+            return "doc"
+
+        with mock.patch.object(wrencode, "_synth_complete", side_effect=fake):
+            wrencode._synth_reconcile([{"chat": "a"}], mode="diff")
+            self.assertIs(seen["sys"], wrencode.SYNTH_DIFF_SYS)
+            wrencode._synth_reconcile([{"chat": "a"}], mode="log")
+            self.assertIs(seen["sys"], wrencode.SYNTH_LOG_SYS)
+            wrencode._synth_reconcile([{"chat": "a"}])
+            self.assertIs(seen["sys"], wrencode.SYNTH_RECONCILE_SYS)
+
     def test_normalize_falls_back_to_text_source(self):
         with tempfile.TemporaryDirectory() as d:
             p = pathlib.Path(d) / "notes.md"
