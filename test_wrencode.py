@@ -814,6 +814,20 @@ class TestFileTools(unittest.TestCase):
         self.assertIn("goodbye", read_back)
         self.assertNotIn("hello", read_back)
 
+    def test_edit_preserves_indentation(self):
+        # `old` must match exactly: a stripped match anchor combined with an
+        # indented `new` would duplicate the leading whitespace (8 -> 16 spaces).
+        wrencode.write(
+            {"path": "f.py", "content": "def f(x):\n    if x:\n        return x\n"}
+        )
+        result = wrencode.edit(
+            {"path": "f.py", "old": "        return x", "new": "        return -x"}
+        )
+        self.assertEqual(result, "ok")
+        read_back = strip_ansi(wrencode.read({"path": "f.py"}))
+        self.assertIn("        return -x", read_back)
+        self.assertNotIn("                return", read_back)
+
     def test_edit_errors_on_missing_old_string(self):
         wrencode.write({"path": "f.txt", "content": "hello world"})
         result = wrencode.edit({"path": "f.txt", "old": "notfound", "new": "x"})
