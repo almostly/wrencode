@@ -91,7 +91,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.1.5"
+WRENCODE_VERSION = "0.1.5.1"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
@@ -683,7 +683,13 @@ def write(args: dict[str, Any]) -> str:
 def edit(args: dict[str, Any]) -> str:
     """Replace a unique string in a file with a new string."""
     path = resolve_tool_path(_require_str(args, "path"))
-    old = _require_str(args, "old")
+    # Don't strip `old`: it must match the file substring exactly, including
+    # leading/trailing whitespace. Stripping it (as _require_str does) lets the
+    # match start mid-indent while `new` carries its own indentation, which
+    # duplicates the original leading whitespace in the result.
+    old = str(args.get("old", ""))
+    if not old.strip():
+        raise ValueError("'old' is required and must be a non-empty string")
     new = str(args.get("new", ""))
     if not path.is_file():
         return f"error: not a file: {path}"
