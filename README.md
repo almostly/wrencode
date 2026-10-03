@@ -194,14 +194,21 @@ BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 wrencode.py
 BACKEND=local LOCAL_PORT=8082 python3 wrencode.py
 ```
 
-## Releasing binaries
+## Releasing
 
-Binaries are built automatically by GitHub Actions when you push a version tag:
+Versions and [`CHANGELOG.md`](CHANGELOG.md) are managed with
+[commitizen](https://commitizen-tools.github.io/commitizen/), so write commit
+messages as [conventional commits](https://www.conventionalcommits.org/)
+(`feat: ...`, `fix(edit): ...`, `refactor: ...`). To cut a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+uvx --from commitizen cz bump      # bumps WRENCODE_VERSION, updates CHANGELOG.md, tags
+git push origin main --tags
 ```
+
+Preview the next changelog entry with `uvx --from commitizen cz changelog --dry-run`.
+
+Binaries are built automatically by GitHub Actions when a version tag is pushed.
 
 This publishes release assets:
 - `wrencode-linux-x64`
