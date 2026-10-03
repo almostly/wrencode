@@ -2484,6 +2484,16 @@ class TestForgivingEdit(unittest.TestCase):
         self.assertNotIn("Closest match", result)
         self.assertIn("Re-read the file", result)
 
+    def test_wrong_file_points_to_the_right_one(self):
+        # Qwen3-8B's next failure: editing to_cents in cart.py; it lives in money.py.
+        (self._tmp / "shop").mkdir()
+        (self._tmp / "shop" / "money.py").write_text("import os\n\ndef to_cents(s: str) -> int:\n    return 0\n")
+        result = self.edit("def to_cents(s: str) -> int:\n    return int(float(s) * 100)", "x")
+        self.assertIn("isn't in cart.py but appears in shop/money.py:3", result)
+
+    def test_no_hint_when_nowhere_else(self):
+        self.assertNotIn("did you mean", self.edit("def missing_function():\n    pass", "x"))
+
     def test_reindented_result_still_syntax_checked(self):
         result = self.edit("return 0", "return (")
         self.assertIn("invalid Python", result)

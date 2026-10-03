@@ -786,7 +786,7 @@ def edit(args: dict[str, Any]) -> str:
     elif (shifted := _reindented_edit(text, old, new)) is not None:
         updated, note = shifted
     else:
-        return _not_found_error(text, old)
+        return _not_found_error(text, old) + _elsewhere_hint(path, old)
     if updated == text:
         return "error: edit produced no change"
     suffix = path.suffix.lower()
@@ -881,6 +881,39 @@ def _not_found_error(text: str, old: str) -> str:
         f"{j + 1:>5}| {lines[j]}" for j in range(best_i, min(len(lines), best_i + n))
     )
     return f"{msg} Closest match ({best:.0%} similar), lines {best_i + 1}-{best_i + n}:\n{shown}"
+
+
+def _elsewhere_hint(path: pathlib.Path, old: str) -> str:
+    """If old's first line appears in other workspace files, say where.
+
+    Catches edits aimed at the wrong file (e.g. a function that lives in a
+    sibling module). Only same-suffix files are scanned, at most 500 of them.
+    """
+    first = next((l.strip() for l in old.split("\n") if l.strip()), "")
+    if len(first) < 8:
+        return ""
+    root = workspace_root()
+    found: list[str] = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _GLOB_SKIP]
+        for name in filenames:
+            f = pathlib.Path(dirpath) / name
+            if f.suffix != path.suffix or f == path:
+                continue
+            scanned += 1
+            with contextlib.suppress(OSError):
+                for n, line in enumerate(f.read_text(errors="replace").split("\n"), 1):
+                    if line.strip() == first:
+                        found.append(f"{f.relative_to(root)}:{n}")
+                        break
+            if scanned >= 500 or len(found) >= 3:
+                break
+        if scanned >= 500 or len(found) >= 3:
+            break
+    if not found:
+        return ""
+    return f"\nNote: `{first}` isn't in {path.name} but appears in {', '.join(found)}; did you mean that file?"
 
 
 def glob(args: dict[str, Any]) -> str:
