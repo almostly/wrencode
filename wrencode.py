@@ -4,7 +4,7 @@
 A lightweight alternative to Claude Code in a single Python file.
 
 Supports multiple inference backends: local Apple Silicon via MLX,
-HuggingFace Transformers, Anthropic, OpenAI, OpenRouter, and local proxy.
+HuggingFace Transformers, Anthropic, OpenAI, OpenRouter, NanoGPT, and local proxy.
 Provides a tool-calling agent loop with file read/write/edit, glob, grep,
 and bash — enough to autonomously navigate and modify a codebase.
 
@@ -120,6 +120,13 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
         "api_base": "https://openrouter.ai/api/v1/chat/completions",
         "label": "OpenRouter — any model (API key)",
     },
+    "nanogpt": {
+        "kind": "api",
+        "model": "z-ai/glm-5.3-flash",
+        "key_env": "NANOGPT_API_KEY",
+        "api_base": "https://nano-gpt.com/api/v1/chat/completions",
+        "label": "NanoGPT — any model (API key)",
+    },
     "bedrock": {
         # AWS Bedrock via the model-agnostic Converse API — works across Claude,
         # Llama, Nova, Mistral, OpenAI GPT-OSS, etc. through one request/parse
@@ -152,7 +159,7 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
-# Curated model lists for arrow-key pickers (OpenRouter/Ollama are fetched live).
+# Curated model lists for arrow-key pickers (OpenRouter/NanoGPT/Ollama are fetched live).
 BACKEND_MODELS: dict[str, list[str]] = {
     "anthropic": [
         "claude-haiku-4-5-20251001",
@@ -174,6 +181,12 @@ BACKEND_MODELS: dict[str, list[str]] = {
         "openai/gpt-4o-mini",
         "google/gemini-flash-1.5",
         "meta-llama/llama-3.1-8b-instruct",
+    ],
+    "nanogpt": [
+        "z-ai/glm-5.3-flash",
+        "z-ai/glm-5.3",
+        "z-ai/glm-5.3-flash-uncensored",
+        "z-ai/glm-5.3-uncensored",
     ],
     "local": ["gpt-oss-20b"],
     "transformers": ["deburky/gpt-oss-claude-code"],
@@ -211,7 +224,13 @@ LOCAL_ML_BACKENDS: frozenset[str] = frozenset(
 ANTHROPIC_FORMAT_BACKENDS: frozenset[str] = frozenset({"anthropic"})
 # Backends that return JSON with native tool calls (vs. XML-in-text), parsed by
 # _parse_native_response. Bedrock/Converse is native too.
-NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai", "bedrock"})
+NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset(
+    {"anthropic", "openai", "nanogpt", "bedrock"}
+)
+# Native-tool backends speaking OpenAI chat completions (tool_calls / role "tool").
+# NanoGPT must use this path: its GLM models reserve <tool_call> as a template
+# token, so the XML-in-text tool prompt makes the upstream request fail (503).
+OPENAI_FORMAT_BACKENDS: frozenset[str] = frozenset({"openai", "nanogpt"})
 # Hosted backends reached over HTTP (vs. in-process local-ml weights). Bedrock
 # is kind "aws" so it isn't in API_BACKENDS, but it's still a network call.
 HOSTED_BACKENDS: frozenset[str] = API_BACKENDS | frozenset({"bedrock"})
@@ -221,6 +240,7 @@ CONFIG_DIR = pathlib.Path(
 ).expanduser()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OPENROUTER_MODELS_CACHE = CONFIG_DIR / "openrouter_models.json"
+NANOGPT_MODELS_CACHE = CONFIG_DIR / "nanogpt_models.json"
 
 # Populated by apply_backend() once configuration is resolved (see resolve_configuration).
 BACKEND = ""
@@ -1531,7 +1551,7 @@ def _append_assistant(
         messages.append({"role": "assistant", "content": kept})
     elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
         messages.append({"role": "assistant", "content": raw_data.get("content", [])})
-    elif BACKEND == "openai":
+    elif BACKEND in OPENAI_FORMAT_BACKENDS:
         messages.append(raw_data["choices"][0]["message"])  # preserve tool_calls
     else:  # XML path
         blocks: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
@@ -1547,7 +1567,7 @@ def _append_tool_results(
     results: list[tuple[ToolCall, str]],
 ) -> None:
     """Append tool results to message history in the correct format."""
-    if BACKEND == "openai":
+    if BACKEND in OPENAI_FORMAT_BACKENDS:
         messages.extend(
             {"role": "tool", "tool_call_id": tc.id, "content": r} for tc, r in results
         )
@@ -1759,6 +1779,107 @@ def _to_converse_message(m: dict[str, Any]) -> dict[str, Any]:
     return {"role": m["role"], "content": content}
 
 
+def _defang_tool_tags(text: str) -> str:
+    return text.replace("<tool_call>", "<tool-call>").replace("</tool_call>", "</tool-call>")
+
+
+def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coerce history into OpenAI chat format.
+
+    History is shared across backends (~/.wrencode/history.json), so turns saved by
+    Anthropic/Bedrock backends carry content-block lists that OpenAI-compatible APIs
+    reject. tool_use/toolUse blocks become assistant tool_calls and their results
+    become role "tool" messages; other blocks are flattened to text. Native OpenAI
+    turns pass through. Tool calls left without a result are dropped, since the API
+    requires every tool_call id to be answered. Literal <tool_call> tags left in text
+    (from XML-backend turns) are defanged: GLM models treat them as template tokens
+    and NanoGPT fails the request with a 503.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str) and "tool_call>" in content:
+            m = {**m, "content": _defang_tool_tags(content)}
+        if content is None or isinstance(content, str):
+            out.append(m)
+            continue
+        texts: list[str] = []
+        calls: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" or "toolUse" in block:
+                tu = block.get("toolUse", block)
+                calls.append(
+                    {
+                        "id": tu.get("id") or tu.get("toolUseId", ""),
+                        "type": "function",
+                        "function": {
+                            "name": tu.get("name", ""),
+                            "arguments": json.dumps(tu.get("input", {})),
+                        },
+                    }
+                )
+            elif block.get("type") == "tool_result" or "toolResult" in block:
+                tr = block.get("toolResult", block)
+                body = tr.get("content", "")
+                if not isinstance(body, str):
+                    body = flatten_content(body)
+                body = _defang_tool_tags(body)
+                results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_use_id") or tr.get("toolUseId", ""),
+                        "content": body,
+                    }
+                )
+            else:
+                texts.append(flatten_content([block]))
+        text = _defang_tool_tags("\n".join(t for t in texts if t))
+        if m["role"] == "assistant":
+            msg: dict[str, Any] = {"role": "assistant", "content": text}
+            if calls:
+                msg["tool_calls"] = calls
+            out.append(msg)
+        else:
+            out.extend(results)
+            if text:
+                out.append({"role": m["role"], "content": text})
+
+    # Keep only tool_calls answered by the tool messages directly after them, and
+    # only tool messages answering the assistant turn before them.
+    fixed: list[dict[str, Any]] = []
+    i = 0
+    while i < len(out):
+        m = out[i]
+        if m["role"] == "tool":  # orphan: no preceding assistant tool_calls
+            fixed.append({"role": "user", "content": f"Tool result: {m['content']}"})
+            i += 1
+            continue
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            while j < len(out) and out[j]["role"] == "tool":
+                j += 1
+            answered = {t["tool_call_id"] for t in out[i + 1 : j]}
+            calls = [c for c in m["tool_calls"] if c["id"] in answered]
+            kept = {c["id"] for c in calls}
+            msg = {k: v for k, v in m.items() if k != "tool_calls"}
+            if calls:
+                msg["tool_calls"] = calls
+            fixed.append(msg)
+            for t in out[i + 1 : j]:
+                if t["tool_call_id"] in kept:
+                    fixed.append(t)
+                else:
+                    fixed.append({"role": "user", "content": f"Tool result: {t['content']}"})
+            i = j
+            continue
+        fixed.append(m)
+        i += 1
+    return fixed
+
+
 # -----------------------------------------------------------------------------------------------
 # Inference
 # -----------------------------------------------------------------------------------------------
@@ -1773,12 +1894,13 @@ def get_response(
     ]
 
     # OpenAI - native function calling
-    if BACKEND == "openai":
+    if BACKEND in OPENAI_FORMAT_BACKENDS:
         data = _http_post(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}] + messages,
+                "messages": [{"role": "system", "content": system_prompt}]
+                + _to_openai_messages(messages),
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
                 "tools": _build_tool_schemas("openai"),
@@ -1984,7 +2106,7 @@ def compact_messages(
             summary = "\n".join(
                 b["text"] for b in data.get("content", []) if b.get("type") == "text"
             ).strip()
-        else:  # openai / openrouter
+        else:  # openai / openrouter / nanogpt
             data = _http_post(
                 API_BASE,
                 {
@@ -2057,12 +2179,23 @@ def build_system_prompt() -> str:
         in ("1", "true", "yes")
         else "Relative paths resolve under the workspace. Absolute paths must stay inside it."
     )
+    if BACKEND in OPENAI_FORMAT_BACKENDS:
+        # Tool schemas travel in the request's `tools` field; XML instructions here
+        # would compete with native calling (and break NanoGPT's GLM models).
+        tool_format = "Call tools through the native function-calling interface."
+    else:
+        tool_format = """To use a tool, format it EXACTLY like this:
+<tool_call>{"tool": "name", "args": {"key": "value"}}</tool_call>
+
+Examples:
+<tool_call>{"tool": "read", "args": {"path": "file.py", "offset": 0, "limit": 20}}</tool_call>
+<tool_call>{"tool": "glob", "args": {"pat": "*.py"}}</tool_call>"""
     return f"""You are a helpful coding assistant with tools to interact with the file system.
 Workspace root: {ws}
 Process cwd: {os.getcwd()}
 {path_rule}{git_context()}
 
-IMPORTANT: You MUST use tools by formatting them exactly as shown below.
+IMPORTANT: You MUST use the tools below for file operations.
 
 Available tools:
 - read(path, offset, limit): Read a file or list a directory
@@ -2073,12 +2206,7 @@ Available tools:
 - bash(cmd): Run a shell command
 - task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result
 
-To use a tool, format it EXACTLY like this:
-<tool_call>{{"tool": "name", "args": {{"key": "value"}}}}</tool_call>
-
-Examples:
-<tool_call>{{"tool": "read", "args": {{"path": "file.py", "offset": 0, "limit": 20}}}}</tool_call>
-<tool_call>{{"tool": "glob", "args": {{"pat": "*.py"}}}}</tool_call>
+{tool_format}
 
 When reading a file, always pass offset and limit. When you finish a task, summarize what you changed.
 CRITICAL: You MUST use tools for file operations. Never say you can't access files!"""
@@ -2287,40 +2415,60 @@ def pick_from_list(
         print(f"{RED}Enter a number between 1 and {len(options)}.{RESET}")
 
 
-def fetch_openrouter_models() -> list[str]:
-    """Fetch OpenRouter model ids, with a 24h local cache."""
-    if OPENROUTER_MODELS_CACHE.exists():
+def _fetch_hosted_models(
+    backend: str, url: str, cache: pathlib.Path, label: str
+) -> list[str]:
+    """Fetch an OpenAI-style /models list for a hosted backend, with a 24h local cache."""
+    fallback = list(BACKEND_MODELS.get(backend, []))
+    if cache.exists():
         with contextlib.suppress(Exception):
-            age = time.time() - OPENROUTER_MODELS_CACHE.stat().st_mtime
+            age = time.time() - cache.stat().st_mtime
             if age < 86400:
-                cached = json.loads(OPENROUTER_MODELS_CACHE.read_text())
+                cached = json.loads(cache.read_text())
                 if isinstance(cached, list) and cached:
                     return [str(m) for m in cached]
 
     key = (
-        os.environ.get("OPENROUTER_API_KEY")
-        or API_KEY
+        os.environ.get(BACKEND_SPECS[backend]["key_env"])
+        or (API_KEY if BACKEND == backend else "")
         or load_config().get("api_key", "")
     )
     if not key:
-        return list(BACKEND_MODELS.get("openrouter", []))
+        return fallback
 
     try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {key}"},
-        )
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
         ids = sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
         if ids:
-            OPENROUTER_MODELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            OPENROUTER_MODELS_CACHE.write_text(json.dumps(ids, indent=2))
-            os.chmod(OPENROUTER_MODELS_CACHE, 0o600)
-        return ids or list(BACKEND_MODELS.get("openrouter", []))
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(ids, indent=2))
+            os.chmod(cache, 0o600)
+        return ids or fallback
     except Exception as err:
-        print(f"{YELLOW}Could not fetch OpenRouter models: {err}{RESET}")
-        return list(BACKEND_MODELS.get("openrouter", []))
+        print(f"{YELLOW}Could not fetch {label} models: {err}{RESET}")
+        return fallback
+
+
+def fetch_openrouter_models() -> list[str]:
+    """Fetch OpenRouter model ids, with a 24h local cache."""
+    return _fetch_hosted_models(
+        "openrouter",
+        "https://openrouter.ai/api/v1/models",
+        OPENROUTER_MODELS_CACHE,
+        "OpenRouter",
+    )
+
+
+def fetch_nanogpt_models() -> list[str]:
+    """Fetch NanoGPT model ids, with a 24h local cache."""
+    return _fetch_hosted_models(
+        "nanogpt",
+        "https://nano-gpt.com/api/v1/models",
+        NANOGPT_MODELS_CACHE,
+        "NanoGPT",
+    )
 
 
 def fetch_ollama_models() -> list[str]:
@@ -2343,6 +2491,8 @@ def list_models_for_backend(backend: str) -> list[str]:
     spec = BACKEND_SPECS[backend]
     if backend == "openrouter":
         models = fetch_openrouter_models()
+    elif backend == "nanogpt":
+        models = fetch_nanogpt_models()
     elif backend == "ollama":
         models = fetch_ollama_models()
     else:
@@ -2441,14 +2591,16 @@ def verify_api_key() -> tuple[str, str]:
     if not API_KEY:
         return ("invalid", "no key")
     probes = {
-        "anthropic": ("https://api.anthropic.com/v1/models", _anthropic_headers()),
-        "openai": ("https://api.openai.com/v1/models", _openai_headers()),
-        "openrouter": ("https://openrouter.ai/api/v1/key", _openai_headers()),
+        "anthropic": ("https://api.anthropic.com/v1/models", _anthropic_headers(), "GET"),
+        "openai": ("https://api.openai.com/v1/models", _openai_headers(), "GET"),
+        "openrouter": ("https://openrouter.ai/api/v1/key", _openai_headers(), "GET"),
+        # NanoGPT's /models is public, so check the key against the balance endpoint.
+        "nanogpt": ("https://nano-gpt.com/api/check-balance", _openai_headers(), "POST"),
     }
     if BACKEND not in probes:
         return ("unknown", "")
-    url, headers = probes[BACKEND]
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    url, headers, method = probes[BACKEND]
+    req = urllib.request.Request(url, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read(1)
@@ -2875,7 +3027,7 @@ def _synth_complete(system_prompt: str, user_text: str, prefill: str = "") -> st
         )
         text, _ = _parse_native_response(data)
         return (prefill + text).strip()
-    if BACKEND == "openai":
+    if BACKEND in OPENAI_FORMAT_BACKENDS:
         data = _http_post(
             API_BASE,
             {

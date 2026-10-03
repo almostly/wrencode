@@ -1568,5 +1568,84 @@ class TestSynthesize(unittest.TestCase):
                 wrencode.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
 
 
+class TestNanoGPTBackend(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.get("NANOGPT_API_KEY")
+        os.environ["NANOGPT_API_KEY"] = "nano-test-key"
+        wrencode.apply_backend("nanogpt")
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("NANOGPT_API_KEY", None)
+        else:
+            os.environ["NANOGPT_API_KEY"] = self._env
+
+    def test_defaults(self):
+        self.assertEqual(wrencode.API_KEY, "nano-test-key")
+        self.assertEqual(
+            wrencode.API_BASE, "https://nano-gpt.com/api/v1/chat/completions"
+        )
+        self.assertIn("nanogpt", wrencode.NATIVE_TOOL_BACKENDS)
+
+    def test_system_prompt_has_no_xml_tool_tags(self):
+        # GLM models on NanoGPT 503 when <tool_call> appears in the prompt.
+        self.assertNotIn("<tool_call>", wrencode.build_system_prompt())
+
+    def test_anthropic_history_converted_to_openai_tool_calls(self):
+        history = [
+            {"role": "user", "content": "count lines"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "wc -l f"}},
+                    {"type": "tool_use", "id": "t2", "name": "bash", "input": {"cmd": "ls"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "3 f"}],
+            },
+        ]
+        out = wrencode._to_openai_messages(history)
+        self.assertEqual(out[0], {"role": "user", "content": "count lines"})
+        self.assertEqual(out[1]["content"], "Checking.")
+        # unanswered t2 is dropped so every tool_call id has a result
+        self.assertEqual([c["id"] for c in out[1]["tool_calls"]], ["t1"])
+        self.assertEqual(
+            json.loads(out[1]["tool_calls"][0]["function"]["arguments"]), {"cmd": "wc -l f"}
+        )
+        self.assertEqual(out[2], {"role": "tool", "tool_call_id": "t1", "content": "3 f"})
+        self.assertEqual(len(out), 3)
+
+    def test_xml_tool_tags_in_history_are_defanged(self):
+        history = [{"role": "assistant", "content": '<tool_call>{"tool": "ls"}</tool_call>'}]
+        out = wrencode._to_openai_messages(history)
+        self.assertNotIn("<tool_call>", out[0]["content"])
+        self.assertNotIn("</tool_call>", out[0]["content"])
+
+    def test_orphan_tool_result_becomes_user_text(self):
+        history = [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}],
+            }
+        ]
+        self.assertEqual(
+            wrencode._to_openai_messages(history),
+            [{"role": "user", "content": "Tool result: ok"}],
+        )
+
+    def test_native_openai_messages_pass_through(self):
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "a.py"},
+        ]
+        self.assertEqual(wrencode._to_openai_messages(history), history)
+
+
 if __name__ == "__main__":
     unittest.main()

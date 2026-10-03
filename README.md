@@ -24,6 +24,7 @@ saved choice, e.g. for CI.
 |`anthropic`   |Claude via Anthropic API                |binary + source       |
 |`openai`      |GPT models via OpenAI API               |binary + source       |
 |`openrouter`  |Any model via OpenRouter                |binary + source       |
+|`nanogpt`     |Any model via NanoGPT                   |binary + source       |
 |`ollama`      |Local models via a running `ollama serve`|binary + source     |
 |`local`       |Local proxy via Anthropic-compatible API|binary + source       |
 |`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
@@ -147,6 +148,12 @@ For OpenRouter:
 export OPENROUTER_API_KEY=your_key
 ```
 
+For NanoGPT:
+
+```bash
+export NANOGPT_API_KEY=your_key
+```
+
 For HuggingFace Transformers:
 
 ```bash
@@ -173,6 +180,9 @@ BACKEND=openai MODEL=gpt-4o python3 wrencode.py
 
 # OpenRouter
 BACKEND=openrouter MODEL=anthropic/claude-3-haiku python3 wrencode.py
+
+# NanoGPT
+BACKEND=nanogpt MODEL=z-ai/glm-5.3-flash-uncensored python3 wrencode.py
 
 # Ollama (needs `ollama serve` running and the model pulled)
 BACKEND=ollama MODEL=llama3.2 python3 wrencode.py
@@ -227,6 +237,7 @@ This publishes release assets:
 |`MAX_TOOL_OUTPUT_CHARS`      |`48000`                |Max tool output before truncation |
 |`GLOB_SKIP_DIRS`             |`.git,node_modules,...`|Directories to skip in glob       |
 |`OPENROUTER_API_KEY`         |-                      |OpenRouter API key                |
+|`NANOGPT_API_KEY`            |-                      |NanoGPT API key                   |
 |`OPENAI_API_KEY`             |-                      |OpenAI API key                    |
 |`ANTHROPIC_API_KEY`          |-                      |Anthropic API key                 |
 |`LOCAL_API_KEY`              |`local`                |Local proxy API key               |
