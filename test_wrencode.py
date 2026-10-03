@@ -2489,5 +2489,57 @@ class TestForgivingEdit(unittest.TestCase):
         self.assertIn("invalid Python", result)
 
 
+class TestRepeatedFailingCalls(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        (self._tmp / "f.py").write_text("x = 1\n")
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_interleaved_identical_failures_hint_then_stop(self):
+        bad = '<tool_call>{"tool": "edit", "args": {"path": "f.py", "old": "y = 2", "new": "y = 3"}}</tool_call>'
+        ok = '<tool_call>{"tool": "glob", "args": {"pat": "*.py"}}</tool_call>'
+        replies = iter([bad, ok] * 10)
+        msgs = [{"role": "user", "content": "go"}]
+        with mock.patch.object(wrencode, "get_response", lambda *a: next(replies)):
+            reason = wrencode.run_agent_turn(msgs, "sys", None)
+        self.assertEqual(reason, "tool_errors")
+        results = [
+            b["content"] for m in msgs if isinstance(m["content"], list)
+            for b in m["content"] if b.get("type") == "tool_result"
+        ]
+        edits = [r for r in results if r.startswith("error:")]
+        self.assertEqual(len(edits), wrencode.REPEATED_CALL_STOP)
+        self.assertNotIn("failed 2 times", edits[1])
+        self.assertIn("has now failed 3 times", edits[2])
+
+    def test_skipped_calls_still_get_results(self):
+        bad = '{"tool": "edit", "args": {"path": "f.py", "old": "nope", "new": "z"}}'
+        batch = f"<tool_call>{bad}</tool_call><tool_call>{bad}</tool_call><tool_call>" + \
+            '{"tool": "glob", "args": {"pat": "*"}}</tool_call>'
+        msgs = [{"role": "user", "content": "go"}]
+        with (
+            mock.patch.object(wrencode, "TOOL_ERROR_REPEAT_LIMIT", 2),
+            mock.patch.object(wrencode, "get_response", lambda *a: batch),
+        ):
+            self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "tool_errors")
+        ids_called = [b["id"] for b in msgs[1]["content"] if b.get("type") == "tool_use"]
+        ids_answered = [b["tool_use_id"] for b in msgs[2]["content"]]
+        self.assertEqual(ids_called, ids_answered)
+        self.assertTrue(msgs[2]["content"][-1]["content"].startswith("skipped"))
+
+
 if __name__ == "__main__":
     unittest.main()

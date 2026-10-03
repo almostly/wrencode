@@ -2653,6 +2653,13 @@ CRITICAL: You MUST use tools for file operations. Never say you can't access fil
 # Agentic loop
 # -----------------------------------------------------------------------------------------------
 MAX_TRUNCATION_RETRIES = 2
+# An identical failing tool call (same name and args) gets a hint on its 3rd
+# try and stops the turn on its 5th, even if other calls happen in between.
+REPEATED_CALL_HINT, REPEATED_CALL_STOP = 3, 5
+REPEATED_CALL_NOTE = (
+    "\n\n(This exact call has now failed {n} times. Repeating it won't work: "
+    "change approach, e.g. re-read the file and copy the text exactly.)"
+)
 RESPOND_NUDGE = (
     f"You haven't given your final answer. Call the {RESPOND_TOOL} tool with arguments "
     "matching its schema; a plain-text reply isn't accepted."
@@ -2698,6 +2705,7 @@ def run_agent_turn(
     retried_overflow = False
     truncations = 0
     respond_nudges = 0
+    failed_calls: dict[str, int] = {}
     try:
         while True:
             if max_iters and iters >= max_iters:
@@ -2753,13 +2761,27 @@ def run_agent_turn(
                 check_cancelled()
                 print_tool_action(tc.name, tc.input)
                 result = run_tool(tc.name, tc.input)
-                print_tool_result(result)
-                results.append((tc, result))
                 last_tool_error, repeated_tool_error_count, stop = _track_error(
                     result, last_tool_error, repeated_tool_error_count
                 )
+                if result.startswith("error:"):
+                    # Same failing call again, even with other calls in between?
+                    key = f"{tc.name}:{json.dumps(tc.input, sort_keys=True, default=str)}"
+                    failed_calls[key] = failed_calls.get(key, 0) + 1
+                    if failed_calls[key] >= REPEATED_CALL_STOP:
+                        print(
+                            f"{YELLOW}Stopping: the same failing {tc.name} call "
+                            f"was made {failed_calls[key]} times.{RESET}"
+                        )
+                        stop = True
+                    elif failed_calls[key] >= REPEATED_CALL_HINT:
+                        result += REPEATED_CALL_NOTE.format(n=failed_calls[key])
+                print_tool_result(result)
+                results.append((tc, result))
                 if stop:
                     break
+            # Every tool call needs a result, or the next request is rejected.
+            results += [(tc, "skipped: stopped after repeated errors") for tc in tool_calls[len(results) :]]
             _append_tool_results(messages, results)
             if stop:
                 return "tool_errors"
