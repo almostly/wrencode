@@ -2206,6 +2206,42 @@ class TestHttpRetry(unittest.TestCase):
             wrencode._http_post_raw("http://x", b"{}", {})
         self.assertEqual(op.call_count, wrencode.HTTP_RETRIES + 1)
 
+    def ok_response(self):
+        ok = mock.MagicMock()
+        ok.__enter__.return_value = io.BytesIO(b'{"ok": 1}')
+        return ok
+
+    def test_network_errors_are_retried(self):
+        import http.client
+        import urllib.error
+
+        for err in (
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            TimeoutError("The read operation timed out"),
+            urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")),
+            ConnectionResetError(54, "Connection reset by peer"),
+        ):
+            with (
+                mock.patch("urllib.request.urlopen", side_effect=[err, self.ok_response()]) as op,
+                mock.patch("time.sleep") as sleep,
+                mock.patch("sys.stderr", io.StringIO()) as stderr,
+            ):
+                self.assertEqual(wrencode._http_post_raw("http://x", b"{}", {}), {"ok": 1})
+            self.assertEqual(op.call_count, 2, err)
+            sleep.assert_called_once_with(2)
+            self.assertIn("Network error", stderr.getvalue())
+
+    def test_network_error_raised_after_retries(self):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")) as op,
+            mock.patch("time.sleep") as sleep,
+            mock.patch("sys.stderr", io.StringIO()),
+            self.assertRaisesRegex(TimeoutError, "timed out"),
+        ):
+            wrencode._http_post_raw("http://x", b"{}", {})
+        self.assertEqual(op.call_count, wrencode.HTTP_RETRIES + 1)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2, 4][: wrencode.HTTP_RETRIES])
+
     def test_client_errors_not_retried(self):
         with (
             mock.patch("urllib.request.urlopen", side_effect=self.http_error(400)) as op,
