@@ -1,3 +1,27 @@
+## 0.2.0 (2026-10-03)
+
+### Feat
+
+- --verify checks a headless run before calling it done
+- typed answers with --json-schema in headless mode
+- ANSI Shadow startup banner in a blue gradient
+- compact long sessions automatically
+- add openai-compatible backend for vLLM, llama.cpp, and Hugging Face
+- add headless -p/--print mode
+- load AGENTS.md project instructions into the system prompt
+- **nanogpt**: add NanoGPT backend with native OpenAI-format tool calls
+
+### Fix
+
+- resend garbled tool calls instead of treating them as the answer
+- **edit**: point to the file that has the text when it's the wrong one
+- stop on identical failing tool calls even when interleaved
+- **edit**: accept a uniformly shifted indent and show the closest match
+- **openai-compatible**: say when the server rejects the API key
+- recover when a response is cut off before acting
+- wait up to 600s for model responses and retry 429/5xx
+- report headless setup failures in the JSON result
+
 ## 0.1.5.1 (2026-06-08)
 
 ### Fix
