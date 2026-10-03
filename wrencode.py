@@ -32,6 +32,7 @@ THE SOFTWARE.
 # flake8: noqa: E501, E203
 
 import ast
+import difflib
 import contextlib
 import datetime
 import getpass
@@ -776,12 +777,16 @@ def edit(args: dict[str, Any]) -> str:
     if path.stat().st_size > MAX_READ_BYTES:
         return f"error: file too large (max {MAX_READ_BYTES} bytes)"
     text = path.read_text(encoding="utf-8", errors="replace")
-    if old not in text:
-        return "error: old_string not found"
-    count = text.count(old)
-    if not args.get("all") and count > 1:
-        return f"error: old_string appears {count} times (use all=true)"
-    updated = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+    note = ""
+    if old in text:
+        count = text.count(old)
+        if not args.get("all") and count > 1:
+            return f"error: 'old' appears {count} times (add context to make it unique, or use all=true)"
+        updated = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+    elif (shifted := _reindented_edit(text, old, new)) is not None:
+        updated, note = shifted
+    else:
+        return _not_found_error(text, old) + _elsewhere_hint(path, old)
     if updated == text:
         return "error: edit produced no change"
     suffix = path.suffix.lower()
@@ -799,7 +804,116 @@ def edit(args: dict[str, Any]) -> str:
     if approval != "ok":
         return approval
     path.write_text(updated, encoding="utf-8")
-    return "ok"
+    return f"ok ({note})" if note else "ok"
+
+
+def _indent(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _reindented_edit(text: str, old: str, new: str) -> Optional[tuple[str, str]]:
+    """Apply an edit whose `old` matches whole lines except for a uniform indent shift.
+
+    Models often drop or add one indentation level when quoting a block (e.g. a
+    method quoted at column 0). If exactly one block of lines matches after
+    shifting every non-blank line by the same amount, replace it and shift `new`
+    the same way. Returns (updated text, note) or None.
+    """
+    old_lines = old.strip("\n").split("\n")
+    lines = text.split("\n")
+    n = len(old_lines)
+    hits: list[tuple[int, str, str]] = []  # (start line, add, remove)
+    for i in range(len(lines) - n + 1):
+        add = remove = None
+        for fl, ol in zip(lines[i : i + n], old_lines):
+            if not ol.strip():
+                if fl.strip():
+                    break
+                continue
+            if fl.lstrip() != ol.lstrip():
+                break
+            fi, oi = _indent(fl), _indent(ol)
+            if fi.endswith(oi):  # file is indented deeper than `old`
+                shift = (fi[: len(fi) - len(oi)], "")
+            elif oi.endswith(fi):  # `old` is indented deeper than the file
+                shift = ("", oi[: len(oi) - len(fi)])
+            else:
+                break
+            if add is not None and shift != (add, remove):
+                break
+            add, remove = shift
+        else:
+            if add is not None and (add or remove):
+                hits.append((i, add, remove or ""))
+    if len(hits) != 1:
+        return None
+    i, add, remove = hits[0]
+    shifted = []
+    for line in new.strip("\n").split("\n"):
+        if not line.strip():
+            shifted.append(line)
+        elif remove and line.startswith(remove):
+            shifted.append(line[len(remove) :])
+        else:
+            shifted.append(add + line)
+    updated = "\n".join(lines[:i] + shifted + lines[i + n :])
+    how = f"added {len(add)}" if add else f"removed {len(remove)}"
+    return updated, f"matched lines {i + 1}-{i + n} after adjusting indentation ({how} chars)"
+
+
+def _not_found_error(text: str, old: str) -> str:
+    """Explain a failed match and show the closest block of lines in the file."""
+    msg = "error: 'old' text not found; it must match the file exactly, including indentation."
+    old_lines = old.strip("\n").split("\n")
+    lines = text.split("\n")
+    n = max(1, len(old_lines))
+    target = "\n".join(l.strip() for l in old_lines)
+    best, best_i = 0.0, -1
+    for i in range(max(1, len(lines) - n + 1)):
+        window = "\n".join(l.strip() for l in lines[i : i + n])
+        sm = difflib.SequenceMatcher(None, target, window)
+        if sm.real_quick_ratio() > best and sm.quick_ratio() > best:
+            if (r := sm.ratio()) > best:
+                best, best_i = r, i
+    if best < 0.5:
+        return msg + " Re-read the file and copy the text you want to replace."
+    shown = "\n".join(
+        f"{j + 1:>5}| {lines[j]}" for j in range(best_i, min(len(lines), best_i + n))
+    )
+    return f"{msg} Closest match ({best:.0%} similar), lines {best_i + 1}-{best_i + n}:\n{shown}"
+
+
+def _elsewhere_hint(path: pathlib.Path, old: str) -> str:
+    """If old's first line appears in other workspace files, say where.
+
+    Catches edits aimed at the wrong file (e.g. a function that lives in a
+    sibling module). Only same-suffix files are scanned, at most 500 of them.
+    """
+    first = next((l.strip() for l in old.split("\n") if l.strip()), "")
+    if len(first) < 8:
+        return ""
+    root = workspace_root()
+    found: list[str] = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _GLOB_SKIP]
+        for name in filenames:
+            f = pathlib.Path(dirpath) / name
+            if f.suffix != path.suffix or f == path:
+                continue
+            scanned += 1
+            with contextlib.suppress(OSError):
+                for n, line in enumerate(f.read_text(errors="replace").split("\n"), 1):
+                    if line.strip() == first:
+                        found.append(f"{f.relative_to(root)}:{n}")
+                        break
+            if scanned >= 500 or len(found) >= 3:
+                break
+        if scanned >= 500 or len(found) >= 3:
+            break
+    if not found:
+        return ""
+    return f"\nNote: `{first}` isn't in {path.name} but appears in {', '.join(found)}; did you mean that file?"
 
 
 def glob(args: dict[str, Any]) -> str:
@@ -2572,6 +2686,13 @@ CRITICAL: You MUST use tools for file operations. Never say you can't access fil
 # Agentic loop
 # -----------------------------------------------------------------------------------------------
 MAX_TRUNCATION_RETRIES = 2
+# An identical failing tool call (same name and args) gets a hint on its 3rd
+# try and stops the turn on its 5th, even if other calls happen in between.
+REPEATED_CALL_HINT, REPEATED_CALL_STOP = 3, 5
+REPEATED_CALL_NOTE = (
+    "\n\n(This exact call has now failed {n} times. Repeating it won't work: "
+    "change approach, e.g. re-read the file and copy the text exactly.)"
+)
 RESPOND_NUDGE = (
     f"You haven't given your final answer. Call the {RESPOND_TOOL} tool with arguments "
     "matching its schema; a plain-text reply isn't accepted."
@@ -2617,6 +2738,7 @@ def run_agent_turn(
     retried_overflow = False
     truncations = 0
     respond_nudges = 0
+    failed_calls: dict[str, int] = {}
     try:
         while True:
             if max_iters and iters >= max_iters:
@@ -2672,13 +2794,27 @@ def run_agent_turn(
                 check_cancelled()
                 print_tool_action(tc.name, tc.input)
                 result = run_tool(tc.name, tc.input)
-                print_tool_result(result)
-                results.append((tc, result))
                 last_tool_error, repeated_tool_error_count, stop = _track_error(
                     result, last_tool_error, repeated_tool_error_count
                 )
+                if result.startswith("error:"):
+                    # Same failing call again, even with other calls in between?
+                    key = f"{tc.name}:{json.dumps(tc.input, sort_keys=True, default=str)}"
+                    failed_calls[key] = failed_calls.get(key, 0) + 1
+                    if failed_calls[key] >= REPEATED_CALL_STOP:
+                        print(
+                            f"{YELLOW}Stopping: the same failing {tc.name} call "
+                            f"was made {failed_calls[key]} times.{RESET}"
+                        )
+                        stop = True
+                    elif failed_calls[key] >= REPEATED_CALL_HINT:
+                        result += REPEATED_CALL_NOTE.format(n=failed_calls[key])
+                print_tool_result(result)
+                results.append((tc, result))
                 if stop:
                     break
+            # Every tool call needs a result, or the next request is rejected.
+            results += [(tc, "skipped: stopped after repeated errors") for tc in tool_calls[len(results) :]]
             _append_tool_results(messages, results)
             if stop:
                 return "tool_errors"
@@ -3953,11 +4089,27 @@ def _arg_value(args: list[str], *names: str) -> Optional[str]:
     return None
 
 
+VERIFY_ATTEMPTS = 3
+
+
+def run_verify(cmd: str) -> tuple[bool, str]:
+    """Run the --verify command in the workspace; return (passed, output tail)."""
+    try:
+        r = subprocess.run(
+            cmd, shell=True, cwd=workspace_root(), capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out after 600s"
+    out = (r.stdout + r.stderr).strip()
+    return r.returncode == 0, f"exit code {r.returncode}\n{out[-4000:]}"
+
+
 def run_headless(
     prompt: str,
     output_format: str = "text",
     max_turns: int = 0,
     schema: Optional[dict[str, Any]] = None,
+    verify: str = "",
 ) -> int:
     """Run one prompt without the interactive UI and return the exit code (wrencode -p).
 
@@ -3965,6 +4117,8 @@ def run_headless(
     object with --output-format json. Saved history is neither loaded nor saved.
     Without --yes, writes and shell commands are declined rather than prompted.
     With a schema (--json-schema), the answer is a validated JSON value instead.
+    With verify (--verify), that command must pass once the agent says it's done;
+    on failure its output goes back to the agent, up to VERIFY_ATTEMPTS times.
     """
     global _HEADLESS, _MLX_STATE, _OUTPUT_SCHEMA
     _HEADLESS = True
@@ -3972,13 +4126,32 @@ def run_headless(
     _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     reason, error = "error", ""
+    verified: Optional[bool] = None
+    verify_output = ""
     with contextlib.redirect_stdout(sys.stderr):
         try:
             resolve_configuration()
             _MLX_STATE = load_model()
-            reason = run_agent_turn(
-                messages, build_system_prompt(), _MLX_STATE, max_iters=max_turns
-            )
+            system_prompt = build_system_prompt()
+            for attempt in range(VERIFY_ATTEMPTS if verify else 1):
+                reason = run_agent_turn(messages, system_prompt, _MLX_STATE, max_iters=max_turns)
+                if not verify or reason != "done":
+                    break
+                verified, verify_output = run_verify(verify)
+                print(f"{DIM}verify `{verify}`: {'passed' if verified else 'failed'}{RESET}")
+                if verified or attempt == VERIFY_ATTEMPTS - 1:
+                    break
+                _STRUCTURED_RESULT.clear()
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"You said you're done, but the check `{verify}` failed "
+                        f"({verify_output.splitlines()[0]}):\n\n{verify_output}\n\n"
+                        "Fix the problem, then finish with a summary.",
+                    }
+                )
+            if verified is False and reason == "done":
+                reason = "verify_failed"
         except SystemExit:  # setup failed (no backend, key, or model); reason is on stderr
             error = "configuration error (see stderr)"
         except Exception as err:  # noqa: BLE001 — reported in the result
@@ -3987,6 +4160,8 @@ def run_headless(
     texts = [flatten_content(m["content"]) for m in messages if m["role"] == "assistant"]
     result = texts[-1].strip() if texts else ""
     is_error = reason != "done" or (schema is not None and not _STRUCTURED_RESULT)
+    if verify and verified is None and reason == "done":  # never reached the check
+        is_error = True
     if output_format == "json":
         out: dict[str, Any] = {
             "result": result,
@@ -3998,6 +4173,10 @@ def run_headless(
         }
         if schema is not None:
             out["structured_output"] = _STRUCTURED_RESULT[0] if _STRUCTURED_RESULT else None
+        if verify:
+            out["verified"] = verified
+            if verified is False:
+                out["verify_output"] = verify_output
         if error:
             out["error"] = error
         print(json.dumps(out, ensure_ascii=False))
@@ -4019,6 +4198,7 @@ def print_help() -> None:
     print("--output-format F    with -p: text (default) or json")
     print("--max-turns N        with -p: cap tool-calling rounds")
     print("--json-schema S      with -p: answer as JSON matching schema S (file or inline)")
+    print("--verify CMD         with -p: CMD must pass when the agent finishes, else it retries")
     print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("--uninstall   remove saved config and show how to delete wrencode")
     print("--version, -V print version and exit")
@@ -4102,7 +4282,8 @@ def main() -> None:
             if not isinstance(schema, dict):
                 print(f"{RED}--json-schema must be a JSON object (a schema).{RESET}")
                 raise SystemExit(2)
-        raise SystemExit(run_headless(prompt, fmt, int(turns), schema))
+        verify = _arg_value(args, "--verify") or ""
+        raise SystemExit(run_headless(prompt, fmt, int(turns), schema, verify))
 
     resolve_configuration()
 

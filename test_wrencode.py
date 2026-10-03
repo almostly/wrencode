@@ -1834,7 +1834,7 @@ class TestHeadless(unittest.TestCase):
         ):
             wrencode.main()
         self.assertEqual(cm.exception.code, 0)
-        run.assert_called_once_with("fix it", "json", 3, None)
+        run.assert_called_once_with("fix it", "json", 3, None, "")
 
     def test_main_reads_piped_stdin(self):
         stdin = io.StringIO("from a pipe")
@@ -1845,7 +1845,7 @@ class TestHeadless(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             wrencode.main()
-        run.assert_called_once_with("from a pipe", "text", 0, None)
+        run.assert_called_once_with("from a pipe", "text", 0, None, "")
 
 
 class TestOpenAICompatibleBackend(unittest.TestCase):
@@ -2403,7 +2403,7 @@ class TestStructuredOutput(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 wrencode.main()
-            run.assert_called_once_with("x", "text", 0, self.SCHEMA)
+            run.assert_called_once_with("x", "text", 0, self.SCHEMA, "")
 
     def test_cli_bad_schema(self):
         with (
@@ -2413,6 +2413,210 @@ class TestStructuredOutput(unittest.TestCase):
         ):
             wrencode.main()
         self.assertEqual(cm.exception.code, 2)
+
+
+class TestForgivingEdit(unittest.TestCase):
+    CART = (
+        "class Cart:\n"
+        "    def remove(self, sku: str):\n"
+        "        del self.items[sku]\n"
+        "\n"
+        "    def subtotal(self) -> int:\n"
+        "        return 0\n"
+    )
+
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self._env = mock.patch.dict(
+            os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}
+        )
+        self._env.start()
+        self._out = mock.patch("sys.stdout", io.StringIO())
+        self._out.start()
+        (self._tmp / "cart.py").write_text(self.CART)
+
+    def tearDown(self):
+        import shutil
+
+        self._out.stop()
+        self._env.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def edit(self, old, new):
+        return wrencode.edit({"path": "cart.py", "old": old, "new": new})
+
+    def test_dedented_quote_is_reindented(self):
+        # The exact failure Qwen3-8B hit 22 times: a method quoted at column 0.
+        result = self.edit(
+            "def remove(self, sku: str):\n    del self.items[sku]",
+            "def remove(self, sku: str):\n    self.items.pop(sku, None)",
+        )
+        self.assertTrue(result.startswith("ok (matched lines 2-3"), result)
+        self.assertIn("added 4 chars", result)
+        text = (self._tmp / "cart.py").read_text()
+        self.assertIn("    def remove(self, sku: str):\n        self.items.pop(sku, None)\n", text)
+        self.assertIn("    def subtotal", text)
+
+    def test_over_indented_quote_is_dedented(self):
+        result = self.edit("            return 0", "            return 42")
+        self.assertIn("removed 4 chars", result)
+        self.assertIn("        return 42\n", (self._tmp / "cart.py").read_text())
+
+    def test_inconsistent_shift_is_rejected(self):
+        # def is 2 spaces short of the file, body 4 short: no single shift fits.
+        result = self.edit("  def remove(self, sku: str):\n    del self.items[sku]", "x")
+        self.assertTrue(result.startswith("error:"), result)
+        self.assertEqual((self._tmp / "cart.py").read_text(), self.CART)
+
+    def test_ambiguous_reindent_is_rejected(self):
+        (self._tmp / "cart.py").write_text("def a():\n    x = 1\n\ndef b():\n    x = 1\n")
+        result = self.edit("x = 1", "x = 2")
+        self.assertIn("appears 2 times", result)
+
+    def test_not_found_shows_closest_lines(self):
+        result = self.edit("def remove(self, sku):\n    del items[sku]", "x")
+        self.assertIn("Closest match", result)
+        self.assertIn("    2|     def remove(self, sku: str):", result)
+        self.assertIn("including indentation", result)
+
+    def test_unrelated_text_has_no_closest_match(self):
+        result = self.edit("import numpy as np", "x")
+        self.assertNotIn("Closest match", result)
+        self.assertIn("Re-read the file", result)
+
+    def test_wrong_file_points_to_the_right_one(self):
+        # Qwen3-8B's next failure: editing to_cents in cart.py; it lives in money.py.
+        (self._tmp / "shop").mkdir()
+        (self._tmp / "shop" / "money.py").write_text("import os\n\ndef to_cents(s: str) -> int:\n    return 0\n")
+        result = self.edit("def to_cents(s: str) -> int:\n    return int(float(s) * 100)", "x")
+        self.assertIn("isn't in cart.py but appears in shop/money.py:3", result)
+
+    def test_no_hint_when_nowhere_else(self):
+        self.assertNotIn("did you mean", self.edit("def missing_function():\n    pass", "x"))
+
+    def test_reindented_result_still_syntax_checked(self):
+        result = self.edit("return 0", "return (")
+        self.assertIn("invalid Python", result)
+
+
+class TestRepeatedFailingCalls(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        (self._tmp / "f.py").write_text("x = 1\n")
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_interleaved_identical_failures_hint_then_stop(self):
+        bad = '<tool_call>{"tool": "edit", "args": {"path": "f.py", "old": "y = 2", "new": "y = 3"}}</tool_call>'
+        ok = '<tool_call>{"tool": "glob", "args": {"pat": "*.py"}}</tool_call>'
+        replies = iter([bad, ok] * 10)
+        msgs = [{"role": "user", "content": "go"}]
+        with mock.patch.object(wrencode, "get_response", lambda *a: next(replies)):
+            reason = wrencode.run_agent_turn(msgs, "sys", None)
+        self.assertEqual(reason, "tool_errors")
+        results = [
+            b["content"] for m in msgs if isinstance(m["content"], list)
+            for b in m["content"] if b.get("type") == "tool_result"
+        ]
+        edits = [r for r in results if r.startswith("error:")]
+        self.assertEqual(len(edits), wrencode.REPEATED_CALL_STOP)
+        self.assertNotIn("failed 2 times", edits[1])
+        self.assertIn("has now failed 3 times", edits[2])
+
+    def test_skipped_calls_still_get_results(self):
+        bad = '{"tool": "edit", "args": {"path": "f.py", "old": "nope", "new": "z"}}'
+        batch = f"<tool_call>{bad}</tool_call><tool_call>{bad}</tool_call><tool_call>" + \
+            '{"tool": "glob", "args": {"pat": "*"}}</tool_call>'
+        msgs = [{"role": "user", "content": "go"}]
+        with (
+            mock.patch.object(wrencode, "TOOL_ERROR_REPEAT_LIMIT", 2),
+            mock.patch.object(wrencode, "get_response", lambda *a: batch),
+        ):
+            self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "tool_errors")
+        ids_called = [b["id"] for b in msgs[1]["content"] if b.get("type") == "tool_use"]
+        ids_answered = [b["tool_use_id"] for b in msgs[2]["content"]]
+        self.assertEqual(ids_called, ids_answered)
+        self.assertTrue(msgs[2]["content"][-1]["content"].startswith("skipped"))
+
+
+class TestVerify(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.object(wrencode, "resolve_configuration", lambda: None),
+            mock.patch.object(wrencode, "load_model", lambda: None),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch.object(wrencode, "_OUTPUT_SCHEMA", None),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def headless(self, replies, verify):
+        replies = iter(replies)
+        prompts = []
+
+        def get_response(messages, *a):
+            prompts.append(messages[-1]["content"])
+            return next(replies)
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(wrencode, "get_response", get_response),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            code = wrencode.run_headless("make ok.txt", "json", 0, None, verify)
+        return code, json.loads(out.getvalue()), prompts
+
+    def test_false_done_is_sent_back_then_fixed(self):
+        write = '<tool_call>{"tool": "write", "args": {"path": "ok.txt", "content": "y"}}</tool_call>'
+        code, data, prompts = self.headless(["All done!", write, "Now really done."], "test -f ok.txt")
+        self.assertEqual((code, data["verified"], data["stop_reason"]), (0, True, "done"))
+        self.assertIn("the check `test -f ok.txt` failed (exit code 1)", prompts[1])
+
+    def test_gives_up_after_attempts(self):
+        code, data, _ = self.headless(["done"] * 3, "echo nope; exit 3")
+        self.assertEqual((code, data["verified"], data["stop_reason"]), (1, False, "verify_failed"))
+        self.assertIn("exit code 3", data["verify_output"])
+        self.assertIn("nope", data["verify_output"])
+
+    def test_passes_first_time(self):
+        code, data, prompts = self.headless(["done"], "true")
+        self.assertEqual((code, data["verified"], len(prompts)), (0, True, 1))
+
+    def test_no_verify_field_without_flag(self):
+        _, data, _ = self.headless(["done"], "")
+        self.assertNotIn("verified", data)
+
+    def test_cli_flag(self):
+        with (
+            mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--verify", "make test"]),
+            mock.patch.object(wrencode, "run_headless", return_value=0) as run,
+            self.assertRaises(SystemExit),
+        ):
+            wrencode.main()
+        run.assert_called_once_with("x", "text", 0, None, "make test")
 
 
 if __name__ == "__main__":
