@@ -1,6 +1,6 @@
 # 🐦 WrenCode
 
-A minimal agentic coding assistant in a single Python file.
+A minimal agent harness for coding, in a single Python file.
 
 Named after Harold Wren - the alias of a genius who built a superintelligent AI and operated quietly in the background.
 
@@ -8,9 +8,9 @@ Named after Harold Wren - the alias of a genius who built a superintelligent AI 
 
 ## What it is
 
-WrenCode is a lightweight alternative to Claude Code. It runs a tool-calling agent loop locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
+WrenCode is a coding agent harness: everything around the model that turns it into an agent. It runs the tool-calling loop, executes tools, builds the system prompt, and manages context, locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
 
-Where Claude Code is the batteries-included tool, WrenCode is the **"understand and own your agent" tool**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
+Where Claude Code is the batteries-included harness, WrenCode is the **"understand and own your agent" harness**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
 
 ## Backends
 
@@ -24,7 +24,9 @@ saved choice, e.g. for CI.
 |`anthropic`   |Claude via Anthropic API                |binary + source       |
 |`openai`      |GPT models via OpenAI API               |binary + source       |
 |`openrouter`  |Any model via OpenRouter                |binary + source       |
+|`nanogpt`     |Any model via NanoGPT                   |binary + source       |
 |`ollama`      |Local models via a running `ollama serve`|binary + source     |
+|`openai-compatible`|vLLM, llama.cpp, Hugging Face, any OpenAI-compatible server|binary + source|
 |`local`       |Local proxy via Anthropic-compatible API|binary + source       |
 |`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
 |`mlx`         |Apple Silicon via MLX                   |source install, macOS |
@@ -37,6 +39,27 @@ The default local models are
 (transformers) and
 [`deburky/gpt-oss-claude-mlx`](https://huggingface.co/deburky/gpt-oss-claude-mlx)
 (MLX) — override either with `MODEL=...`.
+
+### OpenAI-compatible servers
+
+`openai-compatible` talks to any server that implements OpenAI chat completions,
+using native tool calls. Point it at the server with `OPENAI_COMPATIBLE_BASE_URL`
+(default `http://localhost:8000/v1`). If the server serves exactly one model,
+WrenCode uses it; otherwise set `MODEL`.
+
+```bash
+# vLLM (tool calling needs these flags; pick the parser for your model)
+vllm serve Qwen/Qwen2.5-Coder-7B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
+BACKEND=openai-compatible wrencode
+
+# llama.cpp (--jinja enables tool calling)
+llama-server -m qwen2.5-coder-7b-instruct-q4_k_m.gguf --jinja --port 8080
+BACKEND=openai-compatible OPENAI_COMPATIBLE_BASE_URL=http://localhost:8080/v1 wrencode
+
+# Hugging Face Inference Providers
+BACKEND=openai-compatible OPENAI_COMPATIBLE_BASE_URL=https://router.huggingface.co/v1 \
+  OPENAI_COMPATIBLE_API_KEY=$HF_TOKEN MODEL=Qwen/Qwen2.5-Coder-32B-Instruct wrencode
+```
 
 ## Tools
 
@@ -59,6 +82,37 @@ parent's context only grows by the returned summary — useful for context-heavy
 subtasks. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
 each subagent round is bounded. For autonomous subagent runs, enable
 `--yes` / `WRENCODE_AUTO_APPROVE` so sub-tool calls don't block on confirmation.
+
+## Project instructions (AGENTS.md)
+
+WrenCode reads [`AGENTS.md`](https://agents.md) files and adds them to the
+system prompt, so conventions you've written for other agents apply here too.
+It looks in `~/.wrencode/`, then in every directory from the git root down to
+the workspace (outside a git repo, only the workspace). A directory without an
+`AGENTS.md` falls back to `CLAUDE.md`. Files closer to the workspace come later
+and take precedence. The total is capped at 32,000 characters, and the files
+loaded are listed at startup.
+
+## Headless mode
+
+`-p` / `--print` runs a single prompt without the interactive UI, for scripts,
+CI, and evals:
+
+```bash
+wrencode -p "Why is test_parse failing?"
+git diff | wrencode -p "Review this diff"             # prompt from stdin
+wrencode --yes -p "Fix the lint errors" --max-turns 20
+wrencode -p "List the TODOs" --output-format json | jq -r .result
+```
+
+- stdout carries only the final answer (or one JSON object with
+  `--output-format json`: `result`, `is_error`, `stop_reason`, `num_turns`,
+  `backend`, `model`); progress and tool output go to stderr.
+- Each run starts from a fresh history and doesn't touch the saved one.
+- Without `--yes`, writes and shell commands are declined (the model is told
+  why) instead of waiting for approval. Read-only tools always work.
+- The exit code is `0` when the agent finishes, `1` if it errors, hits
+  `--max-turns`, or stops on repeated tool errors, and `2` for bad arguments.
 
 ## Installation
 
@@ -147,6 +201,12 @@ For OpenRouter:
 export OPENROUTER_API_KEY=your_key
 ```
 
+For NanoGPT:
+
+```bash
+export NANOGPT_API_KEY=your_key
+```
+
 For HuggingFace Transformers:
 
 ```bash
@@ -174,6 +234,9 @@ BACKEND=openai MODEL=gpt-4o python3 wrencode.py
 # OpenRouter
 BACKEND=openrouter MODEL=anthropic/claude-3-haiku python3 wrencode.py
 
+# NanoGPT
+BACKEND=nanogpt MODEL=z-ai/glm-5.3-flash-uncensored python3 wrencode.py
+
 # Ollama (needs `ollama serve` running and the model pulled)
 BACKEND=ollama MODEL=llama3.2 python3 wrencode.py
 
@@ -184,14 +247,21 @@ BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 wrencode.py
 BACKEND=local LOCAL_PORT=8082 python3 wrencode.py
 ```
 
-## Releasing binaries
+## Releasing
 
-Binaries are built automatically by GitHub Actions when you push a version tag:
+Versions and [`CHANGELOG.md`](CHANGELOG.md) are managed with
+[commitizen](https://commitizen-tools.github.io/commitizen/), so write commit
+messages as [conventional commits](https://www.conventionalcommits.org/)
+(`feat: ...`, `fix(edit): ...`, `refactor: ...`). To cut a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+uvx --from commitizen cz bump      # bumps WRENCODE_VERSION, updates CHANGELOG.md, tags
+git push origin main --tags
 ```
+
+Preview the next changelog entry with `uvx --from commitizen cz changelog --dry-run`.
+
+Binaries are built automatically by GitHub Actions when a version tag is pushed.
 
 This publishes release assets:
 - `wrencode-linux-x64`
@@ -227,11 +297,14 @@ This publishes release assets:
 |`MAX_TOOL_OUTPUT_CHARS`      |`48000`                |Max tool output before truncation |
 |`GLOB_SKIP_DIRS`             |`.git,node_modules,...`|Directories to skip in glob       |
 |`OPENROUTER_API_KEY`         |-                      |OpenRouter API key                |
+|`NANOGPT_API_KEY`            |-                      |NanoGPT API key                   |
 |`OPENAI_API_KEY`             |-                      |OpenAI API key                    |
 |`ANTHROPIC_API_KEY`          |-                      |Anthropic API key                 |
 |`LOCAL_API_KEY`              |`local`                |Local proxy API key               |
 |`LOCAL_PORT`                 |`8082`                 |Local proxy port                  |
 |`OLLAMA_HOST`                |`http://localhost:11434`|Ollama server base URL           |
+|`OPENAI_COMPATIBLE_BASE_URL` |`http://localhost:8000/v1`|OpenAI-compatible server base URL|
+|`OPENAI_COMPATIBLE_API_KEY`  |-                      |Key for that server, if it needs one|
 
 ## History
 
