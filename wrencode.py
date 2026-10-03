@@ -1451,6 +1451,15 @@ def _openai_headers() -> dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
 
+def _is_truncated(data: dict[str, Any]) -> bool:
+    """Return True if a native API response stopped at max_tokens."""
+    if BACKEND == "bedrock":
+        return data.get("stopReason") == "max_tokens"
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+        return data.get("stop_reason") == "max_tokens"
+    return (data.get("choices") or [{}])[0].get("finish_reason") == "length"
+
+
 def _warn_if_truncated(data: dict[str, Any]) -> None:
     """Print a stderr warning if the API truncated the response at max_tokens.
 
@@ -1458,17 +1467,9 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
     `write`), so callers need to know to raise MAX_TOKENS rather than silently
     treating an empty operation as success.
     """
-    if BACKEND == "bedrock":
-        truncated = data.get("stopReason") == "max_tokens"
-        out_tokens = data.get("usage", {}).get("outputTokens")
-    elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        truncated = data.get("stop_reason") == "max_tokens"
-        out_tokens = data.get("usage", {}).get("output_tokens")
-    else:
-        finish = (data.get("choices") or [{}])[0].get("finish_reason")
-        truncated = finish == "length"
-        out_tokens = data.get("usage", {}).get("completion_tokens")
-    if truncated:
+    u = data.get("usage", {})
+    out_tokens = u.get("outputTokens", u.get("output_tokens", u.get("completion_tokens")))
+    if _is_truncated(data):
         print(
             f"{YELLOW}Warning: response truncated at MAX_TOKENS={MAX_TOKENS} "
             f"(output_tokens={out_tokens}). Tool calls may be incomplete — "
@@ -2412,6 +2413,14 @@ CRITICAL: You MUST use tools for file operations. Never say you can't access fil
 # -----------------------------------------------------------------------------------------------
 # Agentic loop
 # -----------------------------------------------------------------------------------------------
+MAX_TRUNCATION_RETRIES = 2
+TRUNCATION_NUDGE = (
+    "Your last response hit the output token limit before you called a tool or "
+    "finished, so nothing happened. Continue in smaller steps: keep any reasoning "
+    "brief, and create or edit one file per tool call."
+)
+
+
 def _track_error(
     result: str, last: Optional[str], count: int
 ) -> tuple[Optional[str], int, bool]:
@@ -2437,12 +2446,13 @@ def run_agent_turn(
 
     max_iters > 0 caps the tool-calling rounds (used to bound subagents);
     0 means unlimited, preserving the interactive default. Returns why the turn
-    ended: "done", "max_turns", "tool_errors", or "cancelled".
+    ended: "done", "max_turns", "max_tokens", "tool_errors", or "cancelled".
     """
     iters = 0
     last_tool_error: Optional[str] = None
     repeated_tool_error_count = 0
     retried_overflow = False
+    truncations = 0
     try:
         while True:
             if max_iters and iters >= max_iters:
@@ -2471,6 +2481,17 @@ def run_agent_turn(
             display_text, tool_calls, raw_data = _parse_response(response_text)
             if display_text:
                 print_agent_message(display_text)
+            if not tool_calls and raw_data is not None and _is_truncated(raw_data):
+                # Cut off before acting (often spent on reasoning): nudge, don't stop.
+                truncations += 1
+                if truncations > MAX_TRUNCATION_RETRIES:
+                    return "max_tokens"
+                messages.append(
+                    {"role": "assistant", "content": display_text or "(cut off)"}
+                )
+                messages.append({"role": "user", "content": TRUNCATION_NUDGE})
+                continue
+            truncations = 0
             _append_assistant(messages, display_text, tool_calls, raw_data)
             if not tool_calls:
                 return "done"

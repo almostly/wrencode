@@ -2198,5 +2198,51 @@ class TestHttpRetry(unittest.TestCase):
         self.assertEqual(op.call_count, 1)
 
 
+class TestTruncationRecovery(unittest.TestCase):
+    def setUp(self):
+        self._patches = [
+            mock.patch.object(wrencode, "BACKEND", "nanogpt"),
+            mock.patch("sys.stdout", io.StringIO()),
+            mock.patch("sys.stderr", io.StringIO()),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    @staticmethod
+    def reply(content, finish):
+        return json.dumps({"choices": [{"message": {"role": "assistant", "content": content},
+                                        "finish_reason": finish}]})
+
+    def test_nudges_after_empty_truncation(self):
+        replies = iter([self.reply("", "length"), self.reply("All done.", "stop")])
+        msgs = [{"role": "user", "content": "build it"}]
+        with mock.patch.object(wrencode, "get_response", lambda *a: next(replies)):
+            self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "done")
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "user", "assistant"])
+        self.assertEqual(msgs[2]["content"], wrencode.TRUNCATION_NUDGE)
+        self.assertEqual(msgs[-1]["content"], "All done.")
+        self.assertEqual(wrencode._to_openai_messages(msgs), msgs)
+
+    def test_gives_up_after_repeated_truncation(self):
+        with mock.patch.object(
+            wrencode, "get_response", lambda *a: self.reply("", "length")
+        ) as _:
+            msgs = [{"role": "user", "content": "x"}]
+            reason = wrencode.run_agent_turn(msgs, "sys", None)
+        self.assertEqual(reason, "max_tokens")
+        self.assertEqual(msgs.count({"role": "user", "content": wrencode.TRUNCATION_NUDGE}),
+                         wrencode.MAX_TRUNCATION_RETRIES)
+
+    def test_normal_stop_unaffected(self):
+        with mock.patch.object(wrencode, "get_response", lambda *a: self.reply("hi", "stop")):
+            msgs = [{"role": "user", "content": "x"}]
+            self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "done")
+        self.assertEqual(len(msgs), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
