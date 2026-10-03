@@ -1834,7 +1834,7 @@ class TestHeadless(unittest.TestCase):
         ):
             wrencode.main()
         self.assertEqual(cm.exception.code, 0)
-        run.assert_called_once_with("fix it", "json", 3, None)
+        run.assert_called_once_with("fix it", "json", 3, None, "")
 
     def test_main_reads_piped_stdin(self):
         stdin = io.StringIO("from a pipe")
@@ -1845,7 +1845,7 @@ class TestHeadless(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             wrencode.main()
-        run.assert_called_once_with("from a pipe", "text", 0, None)
+        run.assert_called_once_with("from a pipe", "text", 0, None, "")
 
 
 class TestOpenAICompatibleBackend(unittest.TestCase):
@@ -2403,7 +2403,7 @@ class TestStructuredOutput(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 wrencode.main()
-            run.assert_called_once_with("x", "text", 0, self.SCHEMA)
+            run.assert_called_once_with("x", "text", 0, self.SCHEMA, "")
 
     def test_cli_bad_schema(self):
         with (
@@ -2539,6 +2539,74 @@ class TestRepeatedFailingCalls(unittest.TestCase):
         ids_answered = [b["tool_use_id"] for b in msgs[2]["content"]]
         self.assertEqual(ids_called, ids_answered)
         self.assertTrue(msgs[2]["content"][-1]["content"].startswith("skipped"))
+
+
+class TestVerify(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.object(wrencode, "resolve_configuration", lambda: None),
+            mock.patch.object(wrencode, "load_model", lambda: None),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch.object(wrencode, "_OUTPUT_SCHEMA", None),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def headless(self, replies, verify):
+        replies = iter(replies)
+        prompts = []
+
+        def get_response(messages, *a):
+            prompts.append(messages[-1]["content"])
+            return next(replies)
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(wrencode, "get_response", get_response),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            code = wrencode.run_headless("make ok.txt", "json", 0, None, verify)
+        return code, json.loads(out.getvalue()), prompts
+
+    def test_false_done_is_sent_back_then_fixed(self):
+        write = '<tool_call>{"tool": "write", "args": {"path": "ok.txt", "content": "y"}}</tool_call>'
+        code, data, prompts = self.headless(["All done!", write, "Now really done."], "test -f ok.txt")
+        self.assertEqual((code, data["verified"], data["stop_reason"]), (0, True, "done"))
+        self.assertIn("the check `test -f ok.txt` failed (exit code 1)", prompts[1])
+
+    def test_gives_up_after_attempts(self):
+        code, data, _ = self.headless(["done"] * 3, "echo nope; exit 3")
+        self.assertEqual((code, data["verified"], data["stop_reason"]), (1, False, "verify_failed"))
+        self.assertIn("exit code 3", data["verify_output"])
+        self.assertIn("nope", data["verify_output"])
+
+    def test_passes_first_time(self):
+        code, data, prompts = self.headless(["done"], "true")
+        self.assertEqual((code, data["verified"], len(prompts)), (0, True, 1))
+
+    def test_no_verify_field_without_flag(self):
+        _, data, _ = self.headless(["done"], "")
+        self.assertNotIn("verified", data)
+
+    def test_cli_flag(self):
+        with (
+            mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--verify", "make test"]),
+            mock.patch.object(wrencode, "run_headless", return_value=0) as run,
+            self.assertRaises(SystemExit),
+        ):
+            wrencode.main()
+        run.assert_called_once_with("x", "text", 0, None, "make test")
 
 
 if __name__ == "__main__":

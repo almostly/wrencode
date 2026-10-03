@@ -4056,11 +4056,27 @@ def _arg_value(args: list[str], *names: str) -> Optional[str]:
     return None
 
 
+VERIFY_ATTEMPTS = 3
+
+
+def run_verify(cmd: str) -> tuple[bool, str]:
+    """Run the --verify command in the workspace; return (passed, output tail)."""
+    try:
+        r = subprocess.run(
+            cmd, shell=True, cwd=workspace_root(), capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out after 600s"
+    out = (r.stdout + r.stderr).strip()
+    return r.returncode == 0, f"exit code {r.returncode}\n{out[-4000:]}"
+
+
 def run_headless(
     prompt: str,
     output_format: str = "text",
     max_turns: int = 0,
     schema: Optional[dict[str, Any]] = None,
+    verify: str = "",
 ) -> int:
     """Run one prompt without the interactive UI and return the exit code (wrencode -p).
 
@@ -4068,6 +4084,8 @@ def run_headless(
     object with --output-format json. Saved history is neither loaded nor saved.
     Without --yes, writes and shell commands are declined rather than prompted.
     With a schema (--json-schema), the answer is a validated JSON value instead.
+    With verify (--verify), that command must pass once the agent says it's done;
+    on failure its output goes back to the agent, up to VERIFY_ATTEMPTS times.
     """
     global _HEADLESS, _MLX_STATE, _OUTPUT_SCHEMA
     _HEADLESS = True
@@ -4075,13 +4093,32 @@ def run_headless(
     _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     reason, error = "error", ""
+    verified: Optional[bool] = None
+    verify_output = ""
     with contextlib.redirect_stdout(sys.stderr):
         try:
             resolve_configuration()
             _MLX_STATE = load_model()
-            reason = run_agent_turn(
-                messages, build_system_prompt(), _MLX_STATE, max_iters=max_turns
-            )
+            system_prompt = build_system_prompt()
+            for attempt in range(VERIFY_ATTEMPTS if verify else 1):
+                reason = run_agent_turn(messages, system_prompt, _MLX_STATE, max_iters=max_turns)
+                if not verify or reason != "done":
+                    break
+                verified, verify_output = run_verify(verify)
+                print(f"{DIM}verify `{verify}`: {'passed' if verified else 'failed'}{RESET}")
+                if verified or attempt == VERIFY_ATTEMPTS - 1:
+                    break
+                _STRUCTURED_RESULT.clear()
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"You said you're done, but the check `{verify}` failed "
+                        f"({verify_output.splitlines()[0]}):\n\n{verify_output}\n\n"
+                        "Fix the problem, then finish with a summary.",
+                    }
+                )
+            if verified is False and reason == "done":
+                reason = "verify_failed"
         except SystemExit:  # setup failed (no backend, key, or model); reason is on stderr
             error = "configuration error (see stderr)"
         except Exception as err:  # noqa: BLE001 — reported in the result
@@ -4090,6 +4127,8 @@ def run_headless(
     texts = [flatten_content(m["content"]) for m in messages if m["role"] == "assistant"]
     result = texts[-1].strip() if texts else ""
     is_error = reason != "done" or (schema is not None and not _STRUCTURED_RESULT)
+    if verify and verified is None and reason == "done":  # never reached the check
+        is_error = True
     if output_format == "json":
         out: dict[str, Any] = {
             "result": result,
@@ -4101,6 +4140,10 @@ def run_headless(
         }
         if schema is not None:
             out["structured_output"] = _STRUCTURED_RESULT[0] if _STRUCTURED_RESULT else None
+        if verify:
+            out["verified"] = verified
+            if verified is False:
+                out["verify_output"] = verify_output
         if error:
             out["error"] = error
         print(json.dumps(out, ensure_ascii=False))
@@ -4122,6 +4165,7 @@ def print_help() -> None:
     print("--output-format F    with -p: text (default) or json")
     print("--max-turns N        with -p: cap tool-calling rounds")
     print("--json-schema S      with -p: answer as JSON matching schema S (file or inline)")
+    print("--verify CMD         with -p: CMD must pass when the agent finishes, else it retries")
     print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("--uninstall   remove saved config and show how to delete wrencode")
     print("--version, -V print version and exit")
@@ -4205,7 +4249,8 @@ def main() -> None:
             if not isinstance(schema, dict):
                 print(f"{RED}--json-schema must be a JSON object (a schema).{RESET}")
                 raise SystemExit(2)
-        raise SystemExit(run_headless(prompt, fmt, int(turns), schema))
+        verify = _arg_value(args, "--verify") or ""
+        raise SystemExit(run_headless(prompt, fmt, int(turns), schema, verify))
 
     resolve_configuration()
 

@@ -106,6 +106,7 @@ wrencode -p "Why is test_parse failing?"
 git diff | wrencode -p "Review this diff"             # prompt from stdin
 wrencode --yes -p "Fix the lint errors" --max-turns 20
 wrencode -p "List the TODOs" --output-format json | jq -r .result
+wrencode --yes -p "Make the tests pass" --verify "python3 -m unittest -q"
 ```
 
 - stdout carries only the final answer (or one JSON object with
@@ -116,6 +117,11 @@ wrencode -p "List the TODOs" --output-format json | jq -r .result
   why) instead of waiting for approval. Read-only tools always work.
 - The exit code is `0` when the agent finishes, `1` if it errors, hits
   `--max-turns`, or stops on repeated tool errors, and `2` for bad arguments.
+- `--verify CMD` checks the agent's claim of being done: WrenCode runs `CMD`
+  in the workspace when the agent finishes, and if it fails, sends the output
+  back and lets the agent continue (up to 3 attempts in all). The result says
+  `verified: true/false`, and a final failure exits `1` with
+  `stop_reason: "verify_failed"`. `--max-turns` applies to each attempt.
 
 ### Structured output
 
