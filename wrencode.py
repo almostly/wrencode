@@ -621,12 +621,31 @@ class UserCancelled(Exception):
     """Raised when the user presses Escape or Ctrl+C during an agent turn."""
 
 
-WREN_BANNER = f"""{BRIGHT_CYAN}\u2588\u2588     \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588    \u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588
-\u2588\u2588     \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588      \u2588\u2588\u2588\u2588   \u2588\u2588 \u2588\u2588      \u2588\u2588    \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588
-\u2588\u2588  \u2588  \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588   \u2588\u2588 \u2588\u2588  \u2588\u2588 \u2588\u2588      \u2588\u2588    \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588\u2588\u2588\u2588
-\u2588\u2588 \u2588\u2588\u2588 \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588      \u2588\u2588  \u2588\u2588 \u2588\u2588 \u2588\u2588      \u2588\u2588    \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588
- \u2588\u2588\u2588 \u2588\u2588\u2588  \u2588\u2588   \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588\u2588 \u2588\u2588   \u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588
-{RESET}"""
+# "WRENCODE" in the ANSI Shadow figlet font. Block faces get a sky-to-deep-blue
+# gradient down the rows and the box-drawing shadow a darker blue (256-color).
+_BANNER_ROWS = (
+    "██╗    ██╗██████╗ ███████╗███╗   ██╗ ██████╗ ██████╗ ██████╗ ███████╗",
+    "██║    ██║██╔══██╗██╔════╝████╗  ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+    "██║ █╗ ██║██████╔╝█████╗  ██╔██╗ ██║██║     ██║   ██║██║  ██║█████╗",
+    "██║███╗██║██╔══██╗██╔══╝  ██║╚██╗██║██║     ██║   ██║██║  ██║██╔══╝",
+    "╚███╔███╔╝██║  ██║███████╗██║ ╚████║╚██████╗╚██████╔╝██████╔╝███████╗",
+    " ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
+)
+_BANNER_FACES = (117, 111, 75, 69, 33, 27)
+_BANNER_SHADOW = 25
+
+
+def render_banner(color: bool) -> str:
+    """Return the startup banner, colored when color is True."""
+    if not color:
+        return "\n".join(_BANNER_ROWS)
+    shade = f"\033[38;5;{_BANNER_SHADOW}m"
+    lines = []
+    for row, face in zip(_BANNER_ROWS, _BANNER_FACES):
+        tint = f"\033[38;5;{face}m"
+        runs = re.sub(r"█+|[^█ ]+", lambda m: (tint if m[0][0] == "█" else shade) + m[0], row)
+        lines.append(runs + RESET)
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------------------------
@@ -3909,7 +3928,7 @@ def main() -> None:
     resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
-    print(WREN_BANNER)
+    print(render_banner(colors_enabled()))
     print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}")
     mlx_state = load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
