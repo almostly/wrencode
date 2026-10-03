@@ -578,6 +578,8 @@ def read_user_input() -> str:
 
 # Set by confirm() when the user chooses "allow all" for the rest of the session.
 _SESSION_AUTO_APPROVE = False
+# Set by run_headless(): there's no one to ask, so confirm() declines instead of prompting.
+_HEADLESS = False
 
 # Escape (or Ctrl+C during a turn) sets this so the agent loop returns to the prompt.
 _CANCEL_REQUESTED = threading.Event()
@@ -897,6 +899,12 @@ def confirm(action: str = "") -> str:
         label = action or "action"
         print(f"{DIM}⚠ {label} [auto-approved]{RESET}")
         return "ok"
+    if _HEADLESS:
+        print(f"{DIM}⚠ {action or 'action'} [declined: headless without --yes]{RESET}")
+        return (
+            "cancelled: running headless without --yes, so this action can't be "
+            "approved. Do what you can without it and say what is left to do."
+        )
     print(f"{DIM}  Enter/y   approve once{RESET}")
     print(f"{DIM}  a         allow all for this session{RESET}")
     print(f"{DIM}  n         decline{RESET}")
@@ -2278,11 +2286,12 @@ def run_agent_turn(
     system_prompt: str,
     mlx_state: Optional[tuple[Any, Any]],
     max_iters: int = 0,
-) -> None:
+) -> str:
     """Generate a response and execute any tool calls, repeating until no tools remain.
 
     max_iters > 0 caps the tool-calling rounds (used to bound subagents);
-    0 means unlimited, preserving the interactive default.
+    0 means unlimited, preserving the interactive default. Returns why the turn
+    ended: "done", "max_turns", "tool_errors", or "cancelled".
     """
     iters = 0
     last_tool_error: Optional[str] = None
@@ -2291,7 +2300,7 @@ def run_agent_turn(
         while True:
             if max_iters and iters >= max_iters:
                 print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
-                break
+                return "max_turns"
             iters += 1
             with thinking_spinner():
                 response_text = get_response_cancellable(
@@ -2302,7 +2311,7 @@ def run_agent_turn(
                 print_agent_message(display_text)
             _append_assistant(messages, display_text, tool_calls, raw_data)
             if not tool_calls:
-                break
+                return "done"
             results: list[tuple[ToolCall, str]] = []
             stop = False
             for tc in tool_calls:
@@ -2318,9 +2327,10 @@ def run_agent_turn(
                     break
             _append_tool_results(messages, results)
             if stop:
-                break
+                return "tool_errors"
     except (UserCancelled, KeyboardInterrupt):
         print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
+        return "cancelled"
     finally:
         _CANCEL_REQUESTED.clear()
         _LISTENER_STOP.set()
@@ -3531,11 +3541,68 @@ def run_synthesize(
         print("\n" + doc)
 
 
+def _arg_value(args: list[str], *names: str) -> Optional[str]:
+    """Return the value after the first of names in args (or --name=value), if any."""
+    for i, a in enumerate(args):
+        if a in names:
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            return None if nxt is None or (nxt.startswith("-") and nxt != "-") else nxt
+        for n in names:
+            if n.startswith("--") and a.startswith(n + "="):
+                return a.split("=", 1)[1]
+    return None
+
+
+def run_headless(prompt: str, output_format: str = "text", max_turns: int = 0) -> int:
+    """Run one prompt without the interactive UI and return the exit code (wrencode -p).
+
+    The UI goes to stderr so stdout carries only the final answer, or a JSON
+    object with --output-format json. Saved history is neither loaded nor saved.
+    Without --yes, writes and shell commands are declined rather than prompted.
+    """
+    global _HEADLESS, _MLX_STATE
+    _HEADLESS = True
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    reason, error = "error", ""
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            resolve_configuration()
+            _MLX_STATE = load_model()
+            reason = run_agent_turn(
+                messages, build_system_prompt(), _MLX_STATE, max_iters=max_turns
+            )
+        except Exception as err:  # noqa: BLE001 — reported in the result
+            error = str(err)
+            print(f"{RED}Error: {error}{RESET}")
+    texts = [flatten_content(m["content"]) for m in messages if m["role"] == "assistant"]
+    result = texts[-1].strip() if texts else ""
+    is_error = reason != "done"
+    if output_format == "json":
+        out: dict[str, Any] = {
+            "result": result,
+            "is_error": is_error,
+            "stop_reason": reason,
+            "num_turns": len(texts),
+            "backend": BACKEND,
+            "model": MODEL,
+        }
+        if error:
+            out["error"] = error
+        print(json.dumps(out, ensure_ascii=False))
+    elif result:
+        print(result)
+    return 1 if is_error else 0
+
+
 def print_help() -> None:
     """Print CLI usage."""
     print("wrencode — a minimal agent harness for coding\n")
     print("Usage: wrencode [options]\n")
     print("Options:")
+    print("-p, --print PROMPT   run one prompt headless and print the answer")
+    print("                     (PROMPT '-' or omitted with piped stdin reads stdin)")
+    print("--output-format F    with -p: text (default) or json")
+    print("--max-turns N        with -p: cap tool-calling rounds")
     print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("--uninstall   remove saved config and show how to delete wrencode")
     print("--version, -V print version and exit")
@@ -3592,6 +3659,24 @@ def main() -> None:
         return
 
     os.environ.setdefault("WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve()))
+    piped = not sys.stdin.isatty()
+    if {"-p", "--print"} & set(args) or any(a.startswith("--print=") for a in args):
+        prompt = _arg_value(args, "-p", "--print")
+        if prompt in {None, "-"}:
+            prompt = sys.stdin.read() if piped else ""
+        if not prompt.strip():
+            print(f"{RED}No prompt: pass -p \"...\" or pipe one on stdin.{RESET}")
+            raise SystemExit(2)
+        fmt = _arg_value(args, "--output-format") or "text"
+        if fmt not in {"text", "json"}:
+            print(f"{RED}--output-format must be text or json.{RESET}")
+            raise SystemExit(2)
+        turns = _arg_value(args, "--max-turns") or "0"
+        if not turns.isdigit():
+            print(f"{RED}--max-turns must be a non-negative integer.{RESET}")
+            raise SystemExit(2)
+        raise SystemExit(run_headless(prompt, fmt, int(turns)))
+
     resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title

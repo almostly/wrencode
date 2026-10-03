@@ -71,6 +71,27 @@ the workspace (outside a git repo, only the workspace). A directory without an
 and take precedence. The total is capped at 32,000 characters, and the files
 loaded are listed at startup.
 
+## Headless mode
+
+`-p` / `--print` runs a single prompt without the interactive UI, for scripts,
+CI, and evals:
+
+```bash
+wrencode -p "Why is test_parse failing?"
+git diff | wrencode -p "Review this diff"             # prompt from stdin
+wrencode --yes -p "Fix the lint errors" --max-turns 20
+wrencode -p "List the TODOs" --output-format json | jq -r .result
+```
+
+- stdout carries only the final answer (or one JSON object with
+  `--output-format json`: `result`, `is_error`, `stop_reason`, `num_turns`,
+  `backend`, `model`); progress and tool output go to stderr.
+- Each run starts from a fresh history and doesn't touch the saved one.
+- Without `--yes`, writes and shell commands are declined (the model is told
+  why) instead of waiting for approval. Read-only tools always work.
+- The exit code is `0` when the agent finishes, `1` if it errors, hits
+  `--max-turns`, or stops on repeated tool errors, and `2` for bad arguments.
+
 ## Installation
 
 ### Option 1: Standalone binary (recommended)

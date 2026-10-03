@@ -1709,5 +1709,129 @@ class TestAgentsMd(unittest.TestCase):
         self.assertNotIn("AGENTS.md", wrencode.build_system_prompt())
 
 
+class TestHeadless(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        env = {"WRENCODE_WORKSPACE": str(self._tmp)}
+        self._patches = [
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(wrencode, "resolve_configuration", lambda: None),
+            mock.patch.object(wrencode, "load_model", lambda: None),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+            mock.patch.object(wrencode, "MODEL", "llama3.2"),
+        ]
+        for p in self._patches:
+            p.start()
+        os.environ.pop("WRENCODE_AUTO_APPROVE", None)
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def run_headless(self, replies, *args):
+        replies = iter(replies)
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(wrencode, "get_response", lambda *a: next(replies)),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", err),
+        ):
+            code = wrencode.run_headless("do it", *args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_stdout_is_only_the_answer(self):
+        (self._tmp / "a.txt").write_text("hi")
+        code, out, err = self.run_headless(
+            ['<tool_call>{"tool": "read", "args": {"path": "a.txt"}}</tool_call>', "Done."]
+        )
+        self.assertEqual((code, out), (0, "Done.\n"))
+        self.assertIn("read a.txt", err)
+
+    def test_json_output(self):
+        code, out, _ = self.run_headless(["All good."], "json")
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["result"], "All good.")
+        self.assertFalse(data["is_error"])
+        self.assertEqual(data["stop_reason"], "done")
+        self.assertEqual((data["backend"], data["num_turns"]), ("ollama", 1))
+
+    def test_writes_declined_without_yes(self):
+        code, _, _ = self.run_headless(
+            [
+                '<tool_call>{"tool": "write", "args": {"path": "b.txt", "content": "x"}}</tool_call>',
+                "Couldn't write.",
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertFalse((self._tmp / "b.txt").exists())
+
+    def test_writes_allowed_with_yes(self):
+        os.environ["WRENCODE_AUTO_APPROVE"] = "1"
+        self.run_headless(
+            [
+                '<tool_call>{"tool": "write", "args": {"path": "b.txt", "content": "x"}}</tool_call>',
+                "Wrote it.",
+            ]
+        )
+        self.assertEqual((self._tmp / "b.txt").read_text(), "x")
+
+    def test_max_turns_is_an_error(self):
+        call = '<tool_call>{"tool": "glob", "args": {"pat": "*"}}</tool_call>'
+        code, out, _ = self.run_headless([call, call, call], "json", 2)
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(data["stop_reason"], "max_turns")
+        self.assertTrue(data["is_error"])
+
+    def test_backend_error_reported(self):
+        def boom(*a):
+            raise RuntimeError("HTTP 401")
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(wrencode, "get_response", boom),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            code = wrencode.run_headless("x", "json")
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["error"], data["stop_reason"]), (1, "HTTP 401", "error"))
+
+    def test_arg_value(self):
+        self.assertEqual(wrencode._arg_value(["-p", "hi"], "-p", "--print"), "hi")
+        self.assertEqual(wrencode._arg_value(["--print=hi"], "-p", "--print"), "hi")
+        self.assertEqual(wrencode._arg_value(["-p", "-"], "-p"), "-")
+        self.assertIsNone(wrencode._arg_value(["-p", "--yes"], "-p"))
+        self.assertIsNone(wrencode._arg_value(["-p"], "-p"))
+
+    def test_main_dispatch(self):
+        argv = ["wrencode", "--yes", "-p", "fix it", "--output-format", "json", "--max-turns", "3"]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(wrencode, "run_headless", return_value=0) as run,
+            mock.patch.dict(os.environ, {}),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            wrencode.main()
+        self.assertEqual(cm.exception.code, 0)
+        run.assert_called_once_with("fix it", "json", 3)
+
+    def test_main_reads_piped_stdin(self):
+        stdin = io.StringIO("from a pipe")
+        with (
+            mock.patch.object(sys, "argv", ["wrencode", "-p"]),
+            mock.patch("sys.stdin", stdin),
+            mock.patch.object(wrencode, "run_headless", return_value=0) as run,
+            self.assertRaises(SystemExit),
+        ):
+            wrencode.main()
+        run.assert_called_once_with("from a pipe", "text", 0)
+
+
 if __name__ == "__main__":
     unittest.main()
