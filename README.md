@@ -26,6 +26,7 @@ saved choice, e.g. for CI.
 |`openrouter`  |Any model via OpenRouter                |binary + source       |
 |`nanogpt`     |Any model via NanoGPT                   |binary + source       |
 |`ollama`      |Local models via a running `ollama serve`|binary + source     |
+|`openai-compatible`|vLLM, llama.cpp, Hugging Face, any OpenAI-compatible server|binary + source|
 |`local`       |Local proxy via Anthropic-compatible API|binary + source       |
 |`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
 |`mlx`         |Apple Silicon via MLX                   |source install, macOS |
@@ -38,6 +39,27 @@ The default local models are
 (transformers) and
 [`deburky/gpt-oss-claude-mlx`](https://huggingface.co/deburky/gpt-oss-claude-mlx)
 (MLX) — override either with `MODEL=...`.
+
+### OpenAI-compatible servers
+
+`openai-compatible` talks to any server that implements OpenAI chat completions,
+using native tool calls. Point it at the server with `OPENAI_COMPATIBLE_BASE_URL`
+(default `http://localhost:8000/v1`). If the server serves exactly one model,
+WrenCode uses it; otherwise set `MODEL`.
+
+```bash
+# vLLM (tool calling needs these flags; pick the parser for your model)
+vllm serve Qwen/Qwen2.5-Coder-7B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
+BACKEND=openai-compatible wrencode
+
+# llama.cpp (--jinja enables tool calling)
+llama-server -m qwen2.5-coder-7b-instruct-q4_k_m.gguf --jinja --port 8080
+BACKEND=openai-compatible OPENAI_COMPATIBLE_BASE_URL=http://localhost:8080/v1 wrencode
+
+# Hugging Face Inference Providers
+BACKEND=openai-compatible OPENAI_COMPATIBLE_BASE_URL=https://router.huggingface.co/v1 \
+  OPENAI_COMPATIBLE_API_KEY=$HF_TOKEN MODEL=Qwen/Qwen2.5-Coder-32B-Instruct wrencode
+```
 
 ## Tools
 
@@ -281,6 +303,8 @@ This publishes release assets:
 |`LOCAL_API_KEY`              |`local`                |Local proxy API key               |
 |`LOCAL_PORT`                 |`8082`                 |Local proxy port                  |
 |`OLLAMA_HOST`                |`http://localhost:11434`|Ollama server base URL           |
+|`OPENAI_COMPATIBLE_BASE_URL` |`http://localhost:8000/v1`|OpenAI-compatible server base URL|
+|`OPENAI_COMPATIBLE_API_KEY`  |-                      |Key for that server, if it needs one|
 
 ## History
 

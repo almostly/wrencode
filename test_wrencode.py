@@ -1848,5 +1848,135 @@ class TestHeadless(unittest.TestCase):
         run.assert_called_once_with("from a pipe", "text", 0)
 
 
+class TestOpenAICompatibleBackend(unittest.TestCase):
+    """Drive the backend against a stub OpenAI-compatible server (like vLLM/llama.cpp)."""
+
+    def setUp(self):
+        import http.server
+        import threading
+
+        self.requests = []
+        self.models = ["qwen2.5-coder"]
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                self._send({"data": [{"id": m} for m in test.models]})
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                test.requests.append((self.path, dict(self.headers), req))
+                if len(test.requests) == 1:
+                    msg = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "glob", "arguments": '{"pat": "*.txt"}'},
+                            }
+                        ],
+                    }
+                else:
+                    msg = {"role": "assistant", "content": "Found notes.txt."}
+                self._send({"choices": [{"message": msg, "finish_reason": "stop"}]})
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        (self._tmp / "notes.txt").write_text("x")
+        base = f"http://127.0.0.1:{self.server.server_port}/v1"
+        self._patches = [
+            mock.patch.dict(
+                os.environ,
+                {"OPENAI_COMPATIBLE_BASE_URL": base, "WRENCODE_WORKSPACE": str(self._tmp)},
+            ),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch.object(wrencode, "CONFIG_DIR", self._tmp / "config"),
+        ]
+        for p in self._patches:
+            p.start()
+        for var in ("MODEL", "OPENAI_COMPATIBLE_API_KEY"):
+            os.environ.pop(var, None)
+        self._saved = (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY, wrencode.API_BASE)
+
+    def tearDown(self):
+        import shutil
+
+        self.server.shutdown()
+        self.server.server_close()
+        for p in self._patches:
+            p.stop()
+        (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY, wrencode.API_BASE) = self._saved
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def headless(self):
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"BACKEND": "openai-compatible"}),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            code = wrencode.run_headless("find text files", "json")
+        return code, json.loads(out.getvalue())
+
+    def test_base_url_normalized(self):
+        with mock.patch.dict(
+            os.environ, {"OPENAI_COMPATIBLE_BASE_URL": "http://h:8080/v1/chat/completions/"}
+        ):
+            wrencode.apply_backend("openai-compatible")
+        self.assertEqual(wrencode.API_BASE, "http://h:8080/v1/chat/completions")
+        self.assertEqual(wrencode.API_KEY, "EMPTY")
+        self.assertIn("openai-compatible", wrencode.OPENAI_FORMAT_BACKENDS)
+
+    def test_end_to_end_native_tool_calls(self):
+        code, data = self.headless()
+        self.assertEqual(code, 0)
+        self.assertEqual(data["result"], "Found notes.txt.")
+        self.assertEqual(data["model"], "qwen2.5-coder")  # the server's only model
+        (path, headers, first), (_, _, second) = self.requests
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual(first["model"], "qwen2.5-coder")
+        self.assertIn("glob", [t["function"]["name"] for t in first["tools"]])
+        self.assertNotIn("<tool_call>", first["messages"][0]["content"])
+        tool_msg = second["messages"][-1]
+        self.assertEqual((tool_msg["role"], tool_msg["tool_call_id"]), ("tool", "c1"))
+        self.assertIn("notes.txt", tool_msg["content"])
+        self.assertEqual(headers["Authorization"], "Bearer EMPTY")
+
+    def test_api_key_sent(self):
+        with mock.patch.dict(os.environ, {"OPENAI_COMPATIBLE_API_KEY": "hf_abc"}):
+            self.headless()
+        self.assertEqual(self.requests[0][1]["Authorization"], "Bearer hf_abc")
+
+    def test_several_models_need_explicit_model(self):
+        self.models = ["a", "b"]
+        code, data = self.headless()
+        self.assertEqual((code, data["stop_reason"]), (1, "error"))
+        self.assertIn("configuration error", data["error"])
+        self.assertEqual(self.requests, [])
+        with mock.patch.dict(os.environ, {"MODEL": "b"}):
+            code, data = self.headless()
+        self.assertEqual((code, data["model"]), (0, "b"))
+
+    def test_lists_served_models(self):
+        self.models = ["m2", "m1"]
+        wrencode.apply_backend("openai-compatible")
+        self.assertEqual(wrencode.fetch_openai_compatible_models(), ["m1", "m2"])
+        self.assertIn("m1", wrencode.list_models_for_backend("openai-compatible"))
+
+
 if __name__ == "__main__":
     unittest.main()

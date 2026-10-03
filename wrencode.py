@@ -147,6 +147,16 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
         "model": "llama3.2",
         "label": "Ollama (local models via `ollama serve`)",
     },
+    "openai-compatible": {
+        # Any server speaking OpenAI chat completions: vLLM, llama.cpp's
+        # llama-server, Hugging Face Inference Providers, LM Studio, etc.
+        # URL from OPENAI_COMPATIBLE_BASE_URL; an empty model means "use the
+        # server's only model" (resolved in load_model).
+        "kind": "local-proxy",
+        "model": "",
+        "key_env": "OPENAI_COMPATIBLE_API_KEY",
+        "label": "OpenAI-compatible server (vLLM, llama.cpp, Hugging Face, ...)",
+    },
     "transformers": {
         "kind": "local-ml",
         "model": "deburky/gpt-oss-claude-code",
@@ -225,15 +235,20 @@ ANTHROPIC_FORMAT_BACKENDS: frozenset[str] = frozenset({"anthropic"})
 # Backends that return JSON with native tool calls (vs. XML-in-text), parsed by
 # _parse_native_response. Bedrock/Converse is native too.
 NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset(
-    {"anthropic", "openai", "nanogpt", "bedrock"}
+    {"anthropic", "openai", "nanogpt", "openai-compatible", "bedrock"}
 )
 # Native-tool backends speaking OpenAI chat completions (tool_calls / role "tool").
 # NanoGPT must use this path: its GLM models reserve <tool_call> as a template
 # token, so the XML-in-text tool prompt makes the upstream request fail (503).
-OPENAI_FORMAT_BACKENDS: frozenset[str] = frozenset({"openai", "nanogpt"})
+OPENAI_FORMAT_BACKENDS: frozenset[str] = frozenset(
+    {"openai", "nanogpt", "openai-compatible"}
+)
 # Hosted backends reached over HTTP (vs. in-process local-ml weights). Bedrock
-# is kind "aws" so it isn't in API_BACKENDS, but it's still a network call.
-HOSTED_BACKENDS: frozenset[str] = API_BACKENDS | frozenset({"bedrock"})
+# is kind "aws" so it isn't in API_BACKENDS, but it's still a network call, and
+# openai-compatible servers are often hosted (Hugging Face) or remote.
+HOSTED_BACKENDS: frozenset[str] = API_BACKENDS | frozenset(
+    {"bedrock", "openai-compatible"}
+)
 
 CONFIG_DIR = pathlib.Path(
     os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
@@ -269,6 +284,12 @@ _SUBAGENT_DEPTH = 0
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
 
 
+def _openai_compatible_base() -> str:
+    """Return the openai-compatible server's base URL (ending in /v1, usually)."""
+    base = os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "http://localhost:8000/v1")
+    return base.rstrip("/").removesuffix("/chat/completions")
+
+
 def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
     """Set the module-level backend globals from a backend name plus overrides.
 
@@ -293,6 +314,10 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
         base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
         API_KEY = "ollama"  # Ollama ignores the key; kept non-empty for the loader
         API_BASE = f"{base}/v1/chat/completions"
+    elif backend == "openai-compatible":
+        # vLLM and llama-server accept any key unless started with one.
+        API_KEY = os.environ.get(spec["key_env"]) or api_key or "EMPTY"
+        API_BASE = f"{_openai_compatible_base()}/chat/completions"
     elif backend == "local":
         LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
         API_KEY = os.environ.get("LOCAL_API_KEY") or api_key or "local"
@@ -2539,6 +2564,19 @@ def fetch_ollama_models() -> list[str]:
         return [BACKEND_SPECS["ollama"]["model"]]
 
 
+def fetch_openai_compatible_models() -> list[str]:
+    """Return the model ids an openai-compatible server serves (GET /models), or []."""
+    key = os.environ.get("OPENAI_COMPATIBLE_API_KEY", "")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        req = urllib.request.Request(f"{_openai_compatible_base()}/models", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.load(resp)
+        return sorted(m["id"] for m in data.get("data", []) if m.get("id"))
+    except Exception:
+        return []
+
+
 def list_models_for_backend(backend: str) -> list[str]:
     """Return selectable models for a backend (includes a custom-id option)."""
     spec = BACKEND_SPECS[backend]
@@ -2548,6 +2586,8 @@ def list_models_for_backend(backend: str) -> list[str]:
         models = fetch_nanogpt_models()
     elif backend == "ollama":
         models = fetch_ollama_models()
+    elif backend == "openai-compatible":
+        models = fetch_openai_compatible_models()
     else:
         models = list(BACKEND_MODELS.get(backend, [spec["model"]]))
 
@@ -2732,7 +2772,8 @@ def switch_backend_runtime() -> Any:
     existing = load_config()
     names = available_backends()
     labels = [
-        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]" for n in names
+        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model'] or 'server default'}]"
+        for n in names
     ]
     initial = names.index(BACKEND) if BACKEND in names else 0
     idx = pick_from_list("Choose backend", names, labels=labels, initial_index=initial)
@@ -2758,7 +2799,8 @@ def choose_backend_interactive() -> None:
     existing = load_config()
     names = available_backends()
     labels = [
-        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model']}]" for n in names
+        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model'] or 'server default'}]"
+        for n in names
     ]
     if not is_frozen():
         print_system("Local model backends need mlx-lm or transformers installed.")
@@ -2867,6 +2909,7 @@ def resolve_configuration() -> None:
 # -----------------------------------------------------------------------------------------------
 def load_model() -> Optional[tuple[Any, Any]]:
     """Load model for the current backend and return mlx_state (or None for API backends)."""
+    global MODEL
     if BACKEND == "mlx":
         try:
             global load, stream_generate, make_sampler
@@ -2936,6 +2979,20 @@ def load_model() -> Optional[tuple[Any, Any]]:
                 f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
             )
         print_system(f"{BACKEND} ({MODEL})")
+        return None
+    if BACKEND == "openai-compatible":
+        base = _openai_compatible_base()
+        served = fetch_openai_compatible_models()
+        if not served:
+            print(f"{YELLOW}⚠ Couldn't list models at {base} — is the server running?{RESET}")
+        elif not MODEL and len(served) == 1:
+            MODEL = served[0]
+        if not MODEL:
+            print(f"{RED}No model set for {base}.{RESET}")
+            if served:
+                print(f"{DIM}Set MODEL to one of: {', '.join(served[:10])}{RESET}")
+            raise SystemExit(1)
+        print_system(f"{BACKEND} ({MODEL}) @ {base}")
         return None
     # Bedrock — uses AWS environment credentials (SigV4), not an API key.
     if BACKEND == "bedrock":
