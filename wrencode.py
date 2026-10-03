@@ -331,6 +331,10 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
 # Constants & environment variables
 # -----------------------------------------------------------------------------------------------
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
+# Auto-compaction: once the estimated prompt passes COMPACT_AT of the model's
+# context window, older turns are summarized (0 disables it).
+CONTEXT_TOKENS = int(os.environ.get("WRENCODE_CONTEXT_TOKENS", "128000"))
+COMPACT_AT = float(os.environ.get("WRENCODE_COMPACT_AT", "0.75"))
 MAX_READ_BYTES = int(os.environ.get("MAX_READ_BYTES", str(4 * 1024 * 1024)))
 MAX_READ_LINES = int(os.environ.get("MAX_READ_LINES", "800"))
 GREP_MAX = int(os.environ.get("GREP_MAX_MATCHES", "80"))
@@ -2097,89 +2101,110 @@ def save_history(messages: list[dict[str, Any]]) -> None:
             json.dump(messages, f)
 
 
+def _summarize(prompt: str, mlx_state: Optional[tuple[Any, Any]], max_tokens: int) -> str:
+    """Send a one-off prompt to the current backend (no tools) and return its text."""
+    system = "You are a helpful assistant."
+    if BACKEND == "bedrock":
+        data = _bedrock_converse_call(
+            {
+                "messages": [{"role": "user", "content": [{"text": prompt}]}],
+                "system": [{"text": system}],
+                "inferenceConfig": {"maxTokens": max_tokens},
+            }
+        )
+        return "\n".join(
+            b["text"]
+            for b in data.get("output", {}).get("message", {}).get("content", [])
+            if "text" in b
+        ).strip()
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+        data = _http_post(
+            API_BASE,
+            {
+                "model": MODEL,
+                "system": system,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+            },
+            _anthropic_headers(),
+        )
+        return "\n".join(
+            b["text"] for b in data.get("content", []) if b.get("type") == "text"
+        ).strip()
+    if BACKEND in HOSTED_BACKENDS or BACKEND == "ollama":  # OpenAI chat format
+        data = _http_post(
+            API_BASE,
+            {
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+            },
+            _openai_headers(),
+        )
+        return (data["choices"][0]["message"].get("content") or "").strip()
+    if BACKEND in LOCAL_ML_BACKENDS and mlx_state:
+        model, tokenizer = mlx_state
+        chat = tokenizer.apply_chat_template(
+            [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
+        out = "".join(
+            c.text
+            for c in stream_generate(
+                model, tokenizer, prompt=chat, max_tokens=max_tokens, sampler=sampler
+            )
+        )
+        return out[len(chat) :].strip() if out.startswith(chat) else out.strip()
+    raise RuntimeError(f"summarizing isn't supported for backend '{BACKEND}'")
+
+
+def _transcript(messages: list[dict[str, Any]], budget_chars: int) -> str:
+    """Flatten messages into a plain transcript for summarizing.
+
+    Each message is capped at 2000 chars, and if the whole still exceeds
+    budget_chars the middle is cut, keeping the start (the task) and the end
+    (the current state). Tool tags are defanged for NanoGPT's GLM models.
+    """
+    lines = []
+    for m in messages:
+        text = flatten_content(m.get("content"))
+        for c in m.get("tool_calls") or []:
+            fn = c.get("function", {})
+            text += f"\n[tool call] {fn.get('name')}({fn.get('arguments')})"
+        if len(text) > 2000:
+            text = f"{text[:2000]} ...[{len(text) - 2000} chars cut]"
+        lines.append(f"{m['role']}: {text}")
+    out = _defang_tool_tags("\n".join(lines))
+    if len(out) > budget_chars:
+        head = budget_chars // 4
+        out = (
+            out[:head]
+            + "\n...[middle of the conversation omitted]...\n"
+            + out[-(budget_chars - head) :]
+        )
+    return out
+
+
 def compact_messages(
     messages: list[dict[str, Any]],
     model: Any,
     tokenizer: Any,
 ) -> list[dict[str, Any]]:
-    """Summarize conversation history to reduce context length."""
+    """Summarize conversation history to reduce context length (/compact)."""
     if not messages:
         return messages
-    history_text = "".join(
-        f"{m['role']}: {flatten_content(m['content'])}\n" for m in messages
+    prompt = (
+        "Summarize this conversation in 3-5 concise bullet points, "
+        "preserving any file paths, code decisions, or unresolved tasks:\n\n"
+        + _transcript(messages, CONTEXT_TOKENS * 2)
     )
-
-    if BACKEND in HOSTED_BACKENDS:
-        prompt = (
-            "Summarize this conversation in 3-5 concise bullet points, "
-            "preserving any file paths, code decisions, or unresolved tasks:\n\n"
-            + history_text
-        )
-        if BACKEND == "bedrock":
-            data = _bedrock_converse_call(
-                {
-                    "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                    "system": [{"text": "You are a helpful assistant."}],
-                    "inferenceConfig": {"maxTokens": 512},
-                }
-            )
-            summary = "\n".join(
-                b["text"]
-                for b in data.get("output", {}).get("message", {}).get("content", [])
-                if "text" in b
-            ).strip()
-        elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-            data = _http_post(
-                API_BASE,
-                {
-                    "model": MODEL,
-                    "system": "You are a helpful assistant.",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 512,
-                },
-                _anthropic_headers(),
-            )
-            summary = "\n".join(
-                b["text"] for b in data.get("content", []) if b.get("type") == "text"
-            ).strip()
-        else:  # openai / openrouter / nanogpt
-            data = _http_post(
-                API_BASE,
-                {
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 512,
-                    "temperature": 0.3,
-                },
-                _openai_headers(),
-            )
-            summary = (data["choices"][0]["message"].get("content") or "").strip()
-    else:
-        # MLX / Transformers path
-        prompt = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {
-                    "role": "user",
-                    "content": f"Summarize this conversation in 3-5 bullet points:\n\n{history_text}",
-                },
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
-        summary = "".join(
-            c.text
-            for c in stream_generate(
-                model, tokenizer, prompt=prompt, max_tokens=512, sampler=sampler
-            )
-        )
-        if summary.startswith(prompt):
-            summary = summary[len(prompt) :].strip()
-
+    summary = _summarize(prompt, (model, tokenizer) if model else None, 512)
     return [
         {"role": "user", "content": f"[Conversation summary]\n{summary}"},
         {
@@ -2187,6 +2212,88 @@ def compact_messages(
             "content": "Understood, I have the context from the summary.",
         },
     ]
+
+
+_CONTEXT_ERROR = re.compile(
+    r"context[_ ](length|size|window)|prompt is too long|input is too long"
+    r"|too many (input )?tokens|maximum context",
+    re.IGNORECASE,
+)
+
+
+def estimate_tokens(messages: list[dict[str, Any]], system_prompt: str) -> int:
+    """Rough prompt size: about 4 characters per token of the serialized request."""
+    chars = len(system_prompt) + sum(
+        len(json.dumps(m, ensure_ascii=False)) for m in messages
+    )
+    return chars // 4
+
+
+_COMPACTION_NOTE = "[Earlier conversation, compacted]"
+_REQUEST_MARK = "\n\nLatest user request, verbatim:\n"
+_CONTINUE_MARK = "\n\nContinue from where the conversation below leaves off."
+
+
+def _is_compaction_note(m: dict[str, Any]) -> bool:
+    return isinstance(m["content"], str) and m["content"].startswith(_COMPACTION_NOTE)
+
+
+def _latest_request(messages: list[dict[str, Any]]) -> str:
+    """Return the newest plain-text user message, unwrapping an earlier compaction note.
+
+    Tool results are never plain strings, so a string user message is either
+    something the user typed or a note from a previous compaction.
+    """
+    for m in reversed(messages):
+        if m["role"] != "user" or not isinstance(m["content"], str):
+            continue
+        if not _is_compaction_note(m):
+            return m["content"]
+        _, found, rest = m["content"].partition(_REQUEST_MARK)
+        return rest.removesuffix(_CONTINUE_MARK) if found else ""
+    return ""
+
+
+def auto_compact(
+    messages: list[dict[str, Any]], mlx_state: Optional[tuple[Any, Any]]
+) -> None:
+    """Summarize older messages in place, keeping recent ones verbatim.
+
+    Safe mid-turn: the kept tail starts at an assistant message, so tool calls
+    stay paired with their results, and the summary becomes the user message
+    before it. The tail is as long as fits in about a quarter of the window.
+    If the backend can't summarize, older messages are dropped with a note.
+    """
+    starts = [i for i, m in enumerate(messages) if i and m["role"] == "assistant"]
+    if not starts:
+        return
+    cut = starts[-1]
+    for i in reversed(starts):
+        if estimate_tokens(messages[i:], "") > CONTEXT_TOKENS // 4:
+            break
+        cut = i
+    head, tail = messages[:cut], messages[cut:]
+    if len(head) == 1 and _is_compaction_note(head[0]):
+        return  # only the previous summary is left to fold in; nothing gained
+    task = _latest_request(head)
+    prompt = (
+        "You are compacting the history of a coding agent's session so it can "
+        "continue the task with less context. Write a concise summary covering: "
+        "the user's request; files read, created, or changed and how; commands run "
+        "and their key results; decisions made; and what remains to do. Keep exact "
+        "file paths, names, and error messages.\n\n"
+        + _transcript(head, CONTEXT_TOKENS * 2)
+    )
+    try:
+        summary = _summarize(prompt, mlx_state, 1500)
+    except Exception as err:  # noqa: BLE001 — fall back to dropping history
+        summary = f"(Earlier messages were dropped to fit the context window: {err})"
+    note = f"{_COMPACTION_NOTE}\n{summary}"
+    if task:
+        note += f"{_REQUEST_MARK}{task}"
+    note += _CONTINUE_MARK
+    messages[:] = [{"role": "user", "content": note}, *tail]
+    print_system(f"⟳ Compacted {len(head)} older messages into a summary")
 
 
 # -----------------------------------------------------------------------------------------------
@@ -2321,16 +2428,32 @@ def run_agent_turn(
     iters = 0
     last_tool_error: Optional[str] = None
     repeated_tool_error_count = 0
+    retried_overflow = False
     try:
         while True:
             if max_iters and iters >= max_iters:
                 print(f"{YELLOW}(stopped after {max_iters} iterations){RESET}")
                 return "max_turns"
             iters += 1
-            with thinking_spinner():
-                response_text = get_response_cancellable(
-                    messages, system_prompt, mlx_state
-                )
+            if COMPACT_AT and estimate_tokens(messages, system_prompt) > (
+                CONTEXT_TOKENS * COMPACT_AT
+            ):
+                auto_compact(messages, mlx_state)
+            try:
+                with thinking_spinner():
+                    response_text = get_response_cancellable(
+                        messages, system_prompt, mlx_state
+                    )
+            except Exception as err:
+                # The window guess was too big: compact once and retry the round.
+                if retried_overflow or not _CONTEXT_ERROR.search(str(err)):
+                    raise
+                print_system("⟳ Context limit hit, compacting and retrying")
+                retried_overflow = True
+                auto_compact(messages, mlx_state)
+                iters -= 1
+                continue
+            retried_overflow = False
             display_text, tool_calls, raw_data = _parse_response(response_text)
             if display_text:
                 print_agent_message(display_text)
@@ -2385,7 +2508,9 @@ def handle_slash_command(
         print_system("Cleared")
         return "handled", _MLX_UNCHANGED
     if cmd == "/compact":
-        if BACKEND in HOSTED_BACKENDS or (BACKEND in LOCAL_ML_BACKENDS and mlx_state):
+        if BACKEND in HOSTED_BACKENDS or BACKEND == "ollama" or (
+            BACKEND in LOCAL_ML_BACKENDS and mlx_state
+        ):
             print_system("Compacting history...")
             model, tokenizer = mlx_state or (None, None)
             before = len(messages)

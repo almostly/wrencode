@@ -1978,5 +1978,187 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         self.assertIn("m1", wrencode.list_models_for_backend("openai-compatible"))
 
 
+class TestAutoCompact(unittest.TestCase):
+    def setUp(self):
+        self._patches = [
+            mock.patch.object(wrencode, "CONTEXT_TOKENS", 4000),
+            mock.patch.object(wrencode, "_summarize", return_value="SUMMARY"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def openai_history(self, rounds):
+        msgs = [{"role": "user", "content": "build the thing"}]
+        for i in range(rounds):
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": f"c{i}", "type": "function",
+                         "function": {"name": "read", "arguments": "{}"}}
+                    ],
+                }
+            )
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 1500})
+        return msgs
+
+    def test_keeps_tail_paired_and_task_verbatim(self):
+        msgs = self.openai_history(20)
+        wrencode.auto_compact(msgs, None)
+        note, first = msgs[0], msgs[1]
+        self.assertEqual(note["role"], "user")
+        self.assertIn("SUMMARY", note["content"])
+        self.assertIn("build the thing", note["content"])
+        self.assertEqual(first["role"], "assistant")
+        self.assertEqual(msgs[2]["tool_call_id"], first["tool_calls"][0]["id"])
+        self.assertEqual(msgs[-1]["tool_call_id"], "c19")
+        self.assertLess(len(msgs), 41)
+        self.assertLessEqual(wrencode.estimate_tokens(msgs[1:], ""), 1000)
+        self.assertEqual(wrencode._to_openai_messages(msgs), msgs)  # nothing orphaned
+
+    def test_anthropic_blocks_stay_paired(self):
+        msgs = [{"role": "user", "content": "go"}]
+        for i in range(12):
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "id": f"t{i}", "name": "read", "input": {}}]})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": "y" * 2000}]})
+        wrencode.auto_compact(msgs, None)
+        roles = [m["role"] for m in msgs]
+        self.assertEqual(roles[:2], ["user", "assistant"])
+        self.assertTrue(all(a != b for a, b in zip(roles, roles[1:])))  # alternates
+        self.assertEqual(
+            msgs[1]["content"][0]["id"], msgs[2]["content"][0]["tool_use_id"]
+        )
+
+    def test_request_survives_repeated_compaction(self):
+        msgs = self.openai_history(20)
+        wrencode.auto_compact(msgs, None)
+        msgs.extend(self.openai_history(20)[1:])
+        wrencode.auto_compact(msgs, None)
+        self.assertEqual(msgs[0]["content"].count("build the thing"), 1)
+        self.assertEqual(wrencode._latest_request(msgs[:1]), "build the thing")
+
+    def test_nothing_to_gain_is_a_noop(self):
+        msgs = self.openai_history(20)
+        wrencode.auto_compact(msgs, None)
+        msgs = msgs[:1] + msgs[-2:]
+        before = list(msgs)
+        wrencode.auto_compact(msgs, None)
+        self.assertEqual(msgs, before)
+
+    def test_summary_failure_drops_history_with_note(self):
+        msgs = self.openai_history(20)
+        with mock.patch.object(wrencode, "_summarize", side_effect=RuntimeError("nope")):
+            wrencode.auto_compact(msgs, None)
+        self.assertIn("dropped to fit the context window", msgs[0]["content"])
+        self.assertIn("build the thing", msgs[0]["content"])
+
+    def test_transcript_defangs_and_cuts_middle(self):
+        msgs = [{"role": "assistant", "content": '<tool_call>{"tool": "x"}</tool_call>'}]
+        msgs += [{"role": "user", "content": f"m{i} " + "z" * 1000} for i in range(50)]
+        out = wrencode._transcript(msgs, 5000)
+        self.assertNotIn("<tool_call>", out)
+        self.assertIn("middle of the conversation omitted", out)
+        self.assertIn("m49", out)
+        self.assertLess(len(out), 5200)
+
+
+class TestAutoCompactInLoop(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp)}),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+            mock.patch.object(wrencode, "CONTEXT_TOKENS", 4000),
+            mock.patch("sys.stdout", io.StringIO()),
+        ]
+        for p in self._patches:
+            p.start()
+        (self._tmp / "big.txt").write_text("w" * 3000)
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_compacts_when_over_threshold(self):
+        replies = iter(
+            ['<tool_call>{"tool": "read", "args": {"path": "big.txt"}}</tool_call>'] * 6
+            + ["done"]
+        )
+        msgs = [{"role": "user", "content": "read it a lot"}]
+        with (
+            mock.patch.object(wrencode, "get_response", lambda *a: next(replies)),
+            mock.patch.object(wrencode, "auto_compact", wraps=wrencode.auto_compact) as ac,
+            mock.patch.object(wrencode, "_summarize", return_value="S"),
+        ):
+            reason = wrencode.run_agent_turn(msgs, "sys", None)
+        self.assertEqual(reason, "done")
+        self.assertGreaterEqual(ac.call_count, 1)
+        self.assertTrue(msgs[0]["content"].startswith(wrencode._COMPACTION_NOTE))
+
+    def test_context_error_compacts_and_retries_once(self):
+        calls = []
+
+        def get_response(*a):
+            calls.append(1)
+            if len(calls) == 1:
+                raise Exception("HTTP 400: prompt is too long: 210000 tokens > 200000 maximum")
+            return "ok"
+
+        msgs = [{"role": "user", "content": "hi"}]
+        with (
+            mock.patch.object(wrencode, "get_response", get_response),
+            mock.patch.object(wrencode, "auto_compact") as ac,
+        ):
+            self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "done")
+        self.assertEqual((len(calls), ac.call_count), (2, 1))
+
+    def test_repeated_context_error_raises(self):
+        def get_response(*a):
+            raise Exception("HTTP 400: This model's maximum context length is 8192 tokens")
+
+        with (
+            mock.patch.object(wrencode, "get_response", get_response),
+            mock.patch.object(wrencode, "auto_compact"),
+            self.assertRaisesRegex(Exception, "maximum context length"),
+        ):
+            wrencode.run_agent_turn([{"role": "user", "content": "hi"}], "sys", None)
+
+    def test_other_errors_not_retried(self):
+        def get_response(*a):
+            raise Exception("HTTP 401: bad key")
+
+        with (
+            mock.patch.object(wrencode, "get_response", get_response),
+            mock.patch.object(wrencode, "auto_compact") as ac,
+            self.assertRaisesRegex(Exception, "HTTP 401"),
+        ):
+            wrencode.run_agent_turn([{"role": "user", "content": "hi"}], "sys", None)
+        ac.assert_not_called()
+
+    def test_disabled_with_zero(self):
+        replies = iter(
+            ['<tool_call>{"tool": "read", "args": {"path": "big.txt"}}</tool_call>'] * 6
+            + ["done"]
+        )
+        with (
+            mock.patch.object(wrencode, "COMPACT_AT", 0.0),
+            mock.patch.object(wrencode, "get_response", lambda *a: next(replies)),
+            mock.patch.object(wrencode, "auto_compact") as ac,
+        ):
+            wrencode.run_agent_turn([{"role": "user", "content": "x"}], "sys", None)
+        ac.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
