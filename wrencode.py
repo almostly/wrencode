@@ -240,6 +240,9 @@ CONFIG_DIR = pathlib.Path(
 ).expanduser()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OPENROUTER_MODELS_CACHE = CONFIG_DIR / "openrouter_models.json"
+# Project instruction files, in preference order per directory (see find_agents_files).
+AGENTS_FILES = ("AGENTS.md", "CLAUDE.md")
+MAX_AGENTS_MD_CHARS = 32_000
 NANOGPT_MODELS_CACHE = CONFIG_DIR / "nanogpt_models.json"
 
 # Populated by apply_backend() once configuration is resolved (see resolve_configuration).
@@ -2170,6 +2173,46 @@ def git_context() -> str:
     return ""
 
 
+def find_agents_files() -> list[pathlib.Path]:
+    """Return the instruction files that apply to the workspace, outermost first.
+
+    Looks in CONFIG_DIR (user-wide), then each directory from the git root down to
+    the workspace; outside a git repo only the workspace itself. Each directory
+    contributes AGENTS.md, or CLAUDE.md when it has no AGENTS.md. Nearer files come
+    later in the prompt, so they read as taking precedence.
+    """
+    ws = workspace_root()
+    chain = [ws, *ws.parents]
+    top = next((i for i, d in enumerate(chain) if (d / ".git").exists()), 0)
+    found: list[pathlib.Path] = []
+    for d in [CONFIG_DIR, *reversed(chain[: top + 1])]:
+        for name in AGENTS_FILES:
+            if (p := d / name).is_file():
+                found.append(p)
+                break
+    return found
+
+
+def agents_md_context() -> str:
+    """Return AGENTS.md contents for the system prompt, capped at MAX_AGENTS_MD_CHARS."""
+    parts: list[str] = []
+    budget = MAX_AGENTS_MD_CHARS
+    for p in find_agents_files():
+        with contextlib.suppress(OSError):
+            text = p.read_text(errors="replace").strip()[:budget]
+            if text:
+                budget -= len(text)
+                parts.append(f"--- {p} ---\n{text}")
+        if budget <= 0:
+            break
+    if not parts:
+        return ""
+    return (
+        "\n\nProject instructions from AGENTS.md files. Follow them; "
+        "later (nearer) files take precedence:\n\n" + "\n\n".join(parts)
+    )
+
+
 def build_system_prompt() -> str:
     """Build the system prompt with workspace context and tool definitions."""
     ws = workspace_root()
@@ -2209,7 +2252,7 @@ Available tools:
 {tool_format}
 
 When reading a file, always pass offset and limit. When you finish a task, summarize what you changed.
-CRITICAL: You MUST use tools for file operations. Never say you can't access files!"""
+CRITICAL: You MUST use tools for file operations. Never say you can't access files!{agents_md_context()}"""
 
 
 # -----------------------------------------------------------------------------------------------
@@ -3557,6 +3600,8 @@ def main() -> None:
     mlx_state = load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()
+    for path in find_agents_files():
+        print(f"{DIM}Loaded {path}{RESET}")
     messages = load_history()
     if messages:
         chats = sum(1 for m in messages if m.get("role") == "user")

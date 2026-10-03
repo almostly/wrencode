@@ -61,6 +61,16 @@ subtasks. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
 each subagent round is bounded. For autonomous subagent runs, enable
 `--yes` / `WRENCODE_AUTO_APPROVE` so sub-tool calls don't block on confirmation.
 
+## Project instructions (AGENTS.md)
+
+WrenCode reads [`AGENTS.md`](https://agents.md) files and adds them to the
+system prompt, so conventions you've written for other agents apply here too.
+It looks in `~/.wrencode/`, then in every directory from the git root down to
+the workspace (outside a git repo, only the workspace). A directory without an
+`AGENTS.md` falls back to `CLAUDE.md`. Files closer to the workspace come later
+and take precedence. The total is capped at 32,000 characters, and the files
+loaded are listed at startup.
+
 ## Installation
 
 ### Option 1: Standalone binary (recommended)

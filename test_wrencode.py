@@ -1647,5 +1647,67 @@ class TestNanoGPTBackend(unittest.TestCase):
         self.assertEqual(wrencode._to_openai_messages(history), history)
 
 
+class TestAgentsMd(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.repo = self._tmp / "repo"
+        self.ws = self.repo / "pkg"
+        self.ws.mkdir(parents=True)
+        (self.repo / ".git").mkdir()
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self.ws)}),
+            mock.patch.object(wrencode, "CONFIG_DIR", self._tmp / "config"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_git_root_down_to_workspace(self):
+        (self._tmp / "AGENTS.md").write_text("outside the repo")
+        (self.repo / "AGENTS.md").write_text("root rules")
+        (self.ws / "CLAUDE.md").write_text("pkg rules")
+        self.assertEqual(
+            wrencode.find_agents_files(),
+            [self.repo / "AGENTS.md", self.ws / "CLAUDE.md"],
+        )
+        ctx = wrencode.agents_md_context()
+        self.assertLess(ctx.index("root rules"), ctx.index("pkg rules"))
+        self.assertNotIn("outside the repo", ctx)
+
+    def test_agents_md_preferred_over_claude_md(self):
+        (self.ws / "AGENTS.md").write_text("agents")
+        (self.ws / "CLAUDE.md").write_text("claude")
+        self.assertEqual(wrencode.find_agents_files(), [self.ws / "AGENTS.md"])
+
+    def test_user_wide_file_comes_first(self):
+        (self._tmp / "config").mkdir()
+        (self._tmp / "config" / "AGENTS.md").write_text("mine")
+        (self.ws / "AGENTS.md").write_text("project")
+        self.assertEqual(wrencode.find_agents_files()[0], self._tmp / "config" / "AGENTS.md")
+
+    def test_outside_git_only_workspace(self):
+        import shutil
+
+        shutil.rmtree(self.repo / ".git")
+        (self.repo / "AGENTS.md").write_text("parent")
+        self.assertEqual(wrencode.find_agents_files(), [])
+
+    def test_in_system_prompt_and_capped(self):
+        (self.ws / "AGENTS.md").write_text("x" * 50_000)
+        prompt = wrencode.build_system_prompt()
+        self.assertIn("Project instructions from AGENTS.md", prompt)
+        self.assertIn("x" * 100, prompt)
+        self.assertNotIn("x" * (wrencode.MAX_AGENTS_MD_CHARS + 1), prompt)
+
+    def test_no_files_no_section(self):
+        self.assertNotIn("AGENTS.md", wrencode.build_system_prompt())
+
+
 if __name__ == "__main__":
     unittest.main()
