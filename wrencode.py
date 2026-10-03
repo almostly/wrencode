@@ -1618,41 +1618,64 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
             # malformed block with no JSON payload; skip and keep scanning
             pos = close + len(close_tag) if close != -1 else start + len(open_tag)
             continue
-        payload: Optional[dict[str, Any]] = None
+        payload: Optional[tuple[str, dict[str, Any]]] = None
         with contextlib.suppress(Exception):
             obj, rel_end = json.JSONDecoder().raw_decode(text, brace)
             if isinstance(obj, dict):
-                payload = obj if _known_tool(obj.get("tool")) else None
                 pos = rel_end
-                if payload:
-                    calls.append(
-                        {
-                            "type": "tool_use",
-                            "id": f"call_{len(calls)}",
-                            "name": payload["tool"],
-                            "input": payload.get("args", {}),
-                        }
-                    )
+                if payload := _call_payload(obj):
+                    calls.append(_tool_use(len(calls), *payload))
                 continue
         if close != -1 and close > brace:
-            payload = None
             with contextlib.suppress(Exception):
-                d = json.loads(text[brace:close])
-                if isinstance(d, dict):
-                    payload = d
+                payload = _call_payload(json.loads(text[brace:close]))
             pos = close + len(close_tag)
         else:
             break  # JSON may still be streaming
-        if payload and _known_tool(payload.get("tool")):
-            calls.append(
-                {
-                    "type": "tool_use",
-                    "id": f"call_{len(calls)}",
-                    "name": payload["tool"],
-                    "input": payload.get("args", {}),
-                }
-            )
+        if payload:
+            calls.append(_tool_use(len(calls), *payload))
     return calls
+
+
+def _call_payload(obj: Any) -> Optional[tuple[str, dict[str, Any]]]:
+    """Return (tool, args) from {"tool", "args"} or the Hermes/Qwen {"name", "arguments"} shape."""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("tool", obj.get("name"))
+    args = obj.get("args", obj.get("arguments", obj.get("parameters", {})))
+    if isinstance(args, str):  # OpenAI-style arguments are a JSON string
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if not _known_tool(name) or not isinstance(args, dict):
+        return None
+    return name, args
+
+
+def _tool_use(index: int, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "tool_use", "id": f"call_{index}", "name": name, "input": args}
+
+
+def _garbled_tool_call(text: str, native: bool) -> str:
+    """Explain why a <tool_call> block in a reply wasn't run, or "" if there is none.
+
+    Native backends parse tool calls server-side, so any call left in the text
+    went unrun; on the XML path an unparsed block means bad JSON or an unknown tool.
+    """
+    m = re.search(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", text, re.DOTALL)
+    if not m:
+        return ""
+    body = m.group(1)
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(body)
+    except json.JSONDecodeError as err:
+        near = body[max(0, err.pos - 40) : err.pos + 20].replace("\n", "\\n")
+        return f"invalid JSON at character {err.pos} ({err.msg}) near: {near}"
+    if native:
+        return "it was written as text instead of through the function-calling interface"
+    name = obj.get("tool", obj.get("name")) if isinstance(obj, dict) else None
+    return "" if _call_payload(obj) else f"unknown tool or bad arguments for {name!r}"
 
 
 # -----------------------------------------------------------------------------------------------
@@ -2693,6 +2716,14 @@ REPEATED_CALL_NOTE = (
     "\n\n(This exact call has now failed {n} times. Repeating it won't work: "
     "change approach, e.g. re-read the file and copy the text exactly.)"
 )
+GARBLED_NUDGE = (
+    "Your last message contained a tool call that couldn't be run: {why}. Nothing "
+    "was executed. Send the call again as a proper tool call, with arguments as "
+    "valid JSON: each string is one JSON string literal with newlines escaped as "
+    "\\n and quotes as \\\"; no + concatenation or Python syntax."
+)
+
+
 RESPOND_NUDGE = (
     f"You haven't given your final answer. Call the {RESPOND_TOOL} tool with arguments "
     "matching its schema; a plain-text reply isn't accepted."
@@ -2730,7 +2761,7 @@ def run_agent_turn(
     max_iters > 0 caps the tool-calling rounds (used to bound subagents);
     0 means unlimited, preserving the interactive default. Returns why the turn
     ended: "done", "max_turns", "max_tokens", "tool_errors",
-    "no_structured_output", or "cancelled".
+    "no_structured_output", "malformed_tool_call", or "cancelled".
     """
     iters = 0
     last_tool_error: Optional[str] = None
@@ -2738,6 +2769,7 @@ def run_agent_turn(
     retried_overflow = False
     truncations = 0
     respond_nudges = 0
+    garbled_nudges = 0
     failed_calls: dict[str, int] = {}
     try:
         while True:
@@ -2778,7 +2810,18 @@ def run_agent_turn(
                 messages.append({"role": "user", "content": TRUNCATION_NUDGE})
                 continue
             truncations = 0
+            garbled = "" if tool_calls else _garbled_tool_call(
+                display_text if raw_data is not None else response_text, raw_data is not None
+            )
             _append_assistant(messages, display_text, tool_calls, raw_data)
+            if garbled:
+                # A tool call the model meant to make but that couldn't run.
+                garbled_nudges += 1
+                if garbled_nudges > MAX_TRUNCATION_RETRIES:
+                    return "malformed_tool_call"
+                print(f"{YELLOW}Unparseable tool call ({garbled}); asking for a resend.{RESET}")
+                messages.append({"role": "user", "content": GARBLED_NUDGE.format(why=garbled)})
+                continue
             if not tool_calls:
                 if _respond_schema() is None or _STRUCTURED_RESULT:
                     return "done"
