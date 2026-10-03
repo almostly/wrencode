@@ -3571,6 +3571,8 @@ def run_headless(prompt: str, output_format: str = "text", max_turns: int = 0) -
             reason = run_agent_turn(
                 messages, build_system_prompt(), _MLX_STATE, max_iters=max_turns
             )
+        except SystemExit:  # setup failed (no backend, key, or model); reason is on stderr
+            error = "configuration error (see stderr)"
         except Exception as err:  # noqa: BLE001 — reported in the result
             error = str(err)
             print(f"{RED}Error: {error}{RESET}")

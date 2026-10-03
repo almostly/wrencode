@@ -1802,6 +1802,21 @@ class TestHeadless(unittest.TestCase):
         data = json.loads(out.getvalue())
         self.assertEqual((code, data["error"], data["stop_reason"]), (1, "HTTP 401", "error"))
 
+    def test_setup_failure_still_reports_json(self):
+        def no_backend():
+            raise SystemExit(1)
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(wrencode, "resolve_configuration", no_backend),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            code = wrencode.run_headless("x", "json")
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["stop_reason"]), (1, "error"))
+        self.assertIn("configuration error", data["error"])
+
     def test_arg_value(self):
         self.assertEqual(wrencode._arg_value(["-p", "hi"], "-p", "--print"), "hi")
         self.assertEqual(wrencode._arg_value(["--print=hi"], "-p", "--print"), "hi")
