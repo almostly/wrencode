@@ -3490,7 +3490,7 @@ def run_synthesize(
 
 def print_help() -> None:
     """Print CLI usage."""
-    print("wrencode — a minimal agentic coding assistant\n")
+    print("wrencode — a minimal agent harness for coding\n")
     print("Usage: wrencode [options]\n")
     print("Options:")
     print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")

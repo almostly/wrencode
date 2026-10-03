@@ -1,6 +1,6 @@
 # 🐦 WrenCode
 
-A minimal agentic coding assistant in a single Python file.
+A minimal agent harness for coding, in a single Python file.
 
 Named after Harold Wren - the alias of a genius who built a superintelligent AI and operated quietly in the background.
 
@@ -8,9 +8,9 @@ Named after Harold Wren - the alias of a genius who built a superintelligent AI 
 
 ## What it is
 
-WrenCode is a lightweight alternative to Claude Code. It runs a tool-calling agent loop locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
+WrenCode is a coding agent harness: everything around the model that turns it into an agent. It runs the tool-calling loop, executes tools, builds the system prompt, and manages context, locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
 
-Where Claude Code is the batteries-included tool, WrenCode is the **"understand and own your agent" tool**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
+Where Claude Code is the batteries-included harness, WrenCode is the **"understand and own your agent" harness**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
 
 ## Backends
 
