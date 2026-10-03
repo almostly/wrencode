@@ -1834,7 +1834,7 @@ class TestHeadless(unittest.TestCase):
         ):
             wrencode.main()
         self.assertEqual(cm.exception.code, 0)
-        run.assert_called_once_with("fix it", "json", 3)
+        run.assert_called_once_with("fix it", "json", 3, None)
 
     def test_main_reads_piped_stdin(self):
         stdin = io.StringIO("from a pipe")
@@ -1845,7 +1845,7 @@ class TestHeadless(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             wrencode.main()
-        run.assert_called_once_with("from a pipe", "text", 0)
+        run.assert_called_once_with("from a pipe", "text", 0, None)
 
 
 class TestOpenAICompatibleBackend(unittest.TestCase):
@@ -2259,6 +2259,160 @@ class TestTruncationRecovery(unittest.TestCase):
             msgs = [{"role": "user", "content": "x"}]
             self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "done")
         self.assertEqual(len(msgs), 2)
+
+
+class TestValidateJson(unittest.TestCase):
+    SCHEMA = {
+        "type": "object",
+        "properties": {
+            "verdict": {"enum": ["pass", "fail"]},
+            "score": {"type": "integer", "minimum": 0, "maximum": 10},
+            "files": {"type": "array", "items": {"type": "string", "pattern": r"\.py$"}},
+            "note": {"type": ["string", "null"], "maxLength": 5},
+        },
+        "required": ["verdict", "score"],
+        "additionalProperties": False,
+    }
+
+    def test_valid(self):
+        ok = {"verdict": "pass", "score": 7, "files": ["a.py"], "note": None}
+        self.assertEqual(wrencode.validate_json(ok, self.SCHEMA), [])
+
+    def test_errors_have_paths(self):
+        bad = {"verdict": "maybe", "score": 11.5, "files": ["a.txt"], "note": "toolong", "x": 1}
+        errs = wrencode.validate_json(bad, self.SCHEMA)
+        joined = "\n".join(errs)
+        for frag in ("$.verdict: must be one of", "$.score: expected integer",
+                     "$.files[0]: doesn't match pattern", "$.note: longer than 5",
+                     "unexpected property 'x'"):
+            self.assertIn(frag, joined)
+
+    def test_missing_required_and_bool_is_not_int(self):
+        errs = wrencode.validate_json({"verdict": "pass", "score": True}, self.SCHEMA)
+        self.assertTrue(any("$.score: expected integer" in e for e in errs))
+        self.assertIn("$: missing required property 'score'",
+                      wrencode.validate_json({"verdict": "fail"}, self.SCHEMA))
+
+    def test_combinators(self):
+        s = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+        self.assertEqual(wrencode.validate_json(3, s), [])
+        self.assertTrue(wrencode.validate_json(3.5, s))
+        one = {"oneOf": [{"type": "number"}, {"type": "integer"}]}
+        self.assertTrue(wrencode.validate_json(3, one))  # matches both
+
+
+class TestStructuredOutput(unittest.TestCase):
+    SCHEMA = {
+        "type": "object",
+        "properties": {"bugs": {"type": "integer"}, "files": {"type": "array", "items": {"type": "string"}}},
+        "required": ["bugs", "files"],
+    }
+
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp)}),
+            mock.patch.object(wrencode, "resolve_configuration", lambda: None),
+            mock.patch.object(wrencode, "load_model", lambda: None),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch.object(wrencode, "_OUTPUT_SCHEMA", None),
+            mock.patch.object(wrencode, "BACKEND", "ollama"),
+        ]
+        for p in self._patches:
+            p.start()
+        os.environ.pop("WRENCODE_AUTO_APPROVE", None)
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        wrencode._STRUCTURED_RESULT.clear()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def run_headless(self, replies, schema, fmt="json"):
+        replies = iter(replies)
+        seen = []
+
+        def get_response(messages, system_prompt, mlx_state):
+            seen.append(system_prompt)
+            return next(replies)
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(wrencode, "get_response", get_response),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            code = wrencode.run_headless("count bugs", fmt, 0, schema)
+        return code, out.getvalue(), seen
+
+    @staticmethod
+    def call(args):
+        return '<tool_call>{"tool": "respond", "args": %s}</tool_call>' % json.dumps(args)
+
+    def test_valid_answer_ends_run(self):
+        code, out, prompts = self.run_headless(
+            [self.call({"bugs": 2, "files": ["a.py"]}), "should not be asked"], self.SCHEMA
+        )
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["structured_output"], {"bugs": 2, "files": ["a.py"]})
+        self.assertEqual(len(prompts), 1)
+        self.assertIn('"bugs"', prompts[0])  # schema shown in the prompt
+
+    def test_invalid_answer_gets_errors_then_retries(self):
+        code, out, _ = self.run_headless(
+            [self.call({"bugs": "two"}), self.call({"bugs": 2, "files": []})], self.SCHEMA
+        )
+        self.assertEqual((code, json.loads(out)["structured_output"]), (0, {"bugs": 2, "files": []}))
+
+    def test_text_mode_prints_the_json(self):
+        code, out, _ = self.run_headless([self.call({"bugs": 0, "files": []})], self.SCHEMA, "text")
+        self.assertEqual((code, json.loads(out)), (0, {"bugs": 0, "files": []}))
+
+    def test_plain_reply_is_nudged_then_fails(self):
+        code, out, _ = self.run_headless(["two bugs", "still text", "and again"], self.SCHEMA)
+        data = json.loads(out)
+        self.assertEqual((code, data["stop_reason"]), (1, "no_structured_output"))
+        self.assertIsNone(data["structured_output"])
+
+    def test_non_object_schema_is_wrapped(self):
+        code, out, _ = self.run_headless(
+            [self.call({"value": ["x", "y"]})], {"type": "array", "items": {"type": "string"}}
+        )
+        self.assertEqual(json.loads(out)["structured_output"], ["x", "y"])
+
+    def test_native_tool_schema_and_subagents(self):
+        with mock.patch.object(wrencode, "_OUTPUT_SCHEMA", self.SCHEMA):
+            names = [t["function"]["name"] for t in wrencode._build_tool_schemas("openai")]
+            self.assertIn("respond", names)
+            with mock.patch.object(wrencode, "_SUBAGENT_DEPTH", 1):
+                names = [t["function"]["name"] for t in wrencode._build_tool_schemas("openai")]
+                self.assertNotIn("respond", names)
+                self.assertIn("only available", wrencode.respond({"bugs": 1, "files": []}))
+        self.assertNotIn("respond", [t["name"] for t in wrencode._build_tool_schemas("anthropic")])
+
+    def test_cli_schema_from_file_and_inline(self):
+        path = self._tmp / "s.json"
+        path.write_text(json.dumps(self.SCHEMA))
+        for value in (str(path), json.dumps(self.SCHEMA)):
+            with (
+                mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--json-schema", value]),
+                mock.patch.object(wrencode, "run_headless", return_value=0) as run,
+                self.assertRaises(SystemExit),
+            ):
+                wrencode.main()
+            run.assert_called_once_with("x", "text", 0, self.SCHEMA)
+
+    def test_cli_bad_schema(self):
+        with (
+            mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--json-schema", "{nope"]),
+            mock.patch("sys.stdout", io.StringIO()),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            wrencode.main()
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

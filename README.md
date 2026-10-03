@@ -114,6 +114,26 @@ wrencode -p "List the TODOs" --output-format json | jq -r .result
 - The exit code is `0` when the agent finishes, `1` if it errors, hits
   `--max-turns`, or stops on repeated tool errors, and `2` for bad arguments.
 
+### Structured output
+
+`--json-schema` makes the answer a JSON value that matches a schema, given as
+a file or inline:
+
+```bash
+wrencode -p "Review this repo for bugs" --json-schema bugs.schema.json
+wrencode -p "Is the build green?" --json-schema '{"type": "object", "properties": {"green": {"type": "boolean"}}, "required": ["green"]}'
+```
+
+The agent gets a `respond` tool whose arguments are your schema, and the run
+ends when it calls `respond` with a valid answer. If the answer doesn't match,
+the validation errors go back to the model so it can fix them; if it never
+calls `respond`, the run fails with `stop_reason: "no_structured_output"`.
+stdout is the JSON value (or, with `--output-format json`, the usual object
+with a `structured_output` field). Validation is built in and covers the
+common keywords: `type`, `enum`, `const`, `properties`, `required`,
+`additionalProperties`, `items`, length and numeric bounds, `pattern`, and
+`anyOf`/`oneOf`/`allOf`.
+
 ## Context management
 
 Long sessions are compacted automatically. Before each model call WrenCode

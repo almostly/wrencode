@@ -281,6 +281,11 @@ AutoTokenizer: Any = None  # transformers.AutoTokenizer
 # Subagent state: the loaded model (set in main) and a recursion-depth guard.
 _MLX_STATE: Optional[tuple[Any, Any]] = None
 _SUBAGENT_DEPTH = 0
+# Set by run_headless(--json-schema): the final answer must come through the
+# `respond` tool and match this JSON Schema. _STRUCTURED_RESULT holds it once accepted.
+RESPOND_TOOL = "respond"
+_OUTPUT_SCHEMA: Optional[dict[str, Any]] = None
+_STRUCTURED_RESULT: list[Any] = []
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
 
 
@@ -1048,6 +1053,128 @@ def task(args: dict[str, Any]) -> str:
     return (texts[-1] if texts else "") or "(subagent produced no text output)"
 
 
+RESPOND_DESCRIPTION = (
+    "Give your final answer. Call this once, when the task is done, with arguments "
+    "matching its schema; the answer is only accepted through this tool."
+)
+
+
+def _respond_schema() -> Optional[dict[str, Any]]:
+    """Return the respond tool's argument schema, or None when it isn't offered.
+
+    Only the top-level agent gets it. A non-object output schema is wrapped as
+    {"value": ...}, since tool arguments must be an object.
+    """
+    if _OUTPUT_SCHEMA is None or _SUBAGENT_DEPTH:
+        return None
+    if _OUTPUT_SCHEMA.get("type") == "object":
+        return _OUTPUT_SCHEMA
+    return {"type": "object", "properties": {"value": _OUTPUT_SCHEMA}, "required": ["value"]}
+
+
+def _known_tool(name: Any) -> bool:
+    return name in TOOLS or (name == RESPOND_TOOL and _respond_schema() is not None)
+
+
+def respond(args: dict[str, Any]) -> str:
+    """Record the final structured answer if it matches the output schema."""
+    schema = _respond_schema()
+    if schema is None or _OUTPUT_SCHEMA is None:
+        return "error: respond is only available to the top-level agent with --json-schema"
+    errors = validate_json(args, schema)
+    if errors:
+        listed = "\n".join(f"- {e}" for e in errors[:20])
+        return f"error: the answer doesn't match the schema:\n{listed}\nFix these and call respond again."
+    _STRUCTURED_RESULT[:] = [args if _OUTPUT_SCHEMA.get("type") == "object" else args["value"]]
+    return "ok: answer recorded"
+
+
+_JSON_TYPES: dict[str, Any] = {
+    "object": dict,
+    "array": list,
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "null": type(None),
+}
+
+
+def _json_type_ok(value: Any, name: str) -> bool:
+    if name in {"integer", "number"} and isinstance(value, bool):
+        return False
+    if name == "integer" and isinstance(value, float):
+        return value.is_integer()
+    return isinstance(value, _JSON_TYPES.get(name, object))
+
+
+def validate_json(value: Any, schema: Any, path: str = "$") -> list[str]:
+    """Check value against a JSON Schema subset; return readable errors (empty if valid).
+
+    Supports type, enum, const, string length and pattern, numeric bounds,
+    object properties/required/additionalProperties, array items and length,
+    and anyOf/oneOf/allOf. Unknown keywords are ignored.
+    """
+    if not isinstance(schema, dict):
+        return []
+    if "type" in schema:
+        types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
+        if not any(_json_type_ok(value, t) for t in types):
+            return [f"{path}: expected {' or '.join(types)}, got {type(value).__name__}"]
+    errs: list[str] = []
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path}: must be one of {json.dumps(schema['enum'])}")
+    if "const" in schema and value != schema["const"]:
+        errs.append(f"{path}: must be {json.dumps(schema['const'])}")
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            errs.append(f"{path}: shorter than {schema['minLength']} characters")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errs.append(f"{path}: longer than {schema['maxLength']} characters")
+        if "pattern" in schema and not re.search(schema["pattern"], value):
+            errs.append(f"{path}: doesn't match pattern {schema['pattern']}")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        for key, bad in (
+            ("minimum", lambda v, b: v < b),
+            ("maximum", lambda v, b: v > b),
+            ("exclusiveMinimum", lambda v, b: v <= b),
+            ("exclusiveMaximum", lambda v, b: v >= b),
+        ):
+            if key in schema and bad(value, schema[key]):
+                errs.append(f"{path}: violates {key} {schema[key]}")
+    if isinstance(value, dict):
+        props = schema.get("properties", {})
+        for key in schema.get("required", []):
+            if key not in value:
+                errs.append(f"{path}: missing required property '{key}'")
+        extra = schema.get("additionalProperties", True)
+        for key, v in value.items():
+            if key in props:
+                errs += validate_json(v, props[key], f"{path}.{key}")
+            elif extra is False:
+                errs.append(f"{path}: unexpected property '{key}'")
+            elif isinstance(extra, dict):
+                errs += validate_json(v, extra, f"{path}.{key}")
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            errs.append(f"{path}: fewer than {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errs.append(f"{path}: more than {schema['maxItems']} items")
+        if isinstance(schema.get("items"), dict):
+            for i, v in enumerate(value):
+                errs += validate_json(v, schema["items"], f"{path}[{i}]")
+    if "allOf" in schema:
+        for sub in schema["allOf"]:
+            errs += validate_json(value, sub, path)
+    if "anyOf" in schema and all(validate_json(value, sub, path) for sub in schema["anyOf"]):
+        errs.append(f"{path}: doesn't match any of the allowed shapes (anyOf)")
+    if "oneOf" in schema:
+        matches = sum(not validate_json(value, sub, path) for sub in schema["oneOf"])
+        if matches != 1:
+            errs.append(f"{path}: must match exactly one shape in oneOf, matched {matches}")
+    return errs
+
+
 ToolFn = Callable[[dict[str, Any]], str]
 ToolEntry = tuple[str, dict[str, str], ToolFn]
 
@@ -1167,6 +1294,8 @@ def print_tool_result(result: str) -> None:
 
 def run_tool(name: str, args: dict[str, Any]) -> str:
     """Execute a named tool with args, truncating output if it exceeds MAX_OUT."""
+    if name == RESPOND_TOOL:
+        return respond(args)
     try:
         result = TOOLS[name][2](normalize_tool_args(name, args))
         if len(result) > MAX_OUT:
@@ -1379,7 +1508,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
         with contextlib.suppress(Exception):
             obj, rel_end = json.JSONDecoder().raw_decode(text, brace)
             if isinstance(obj, dict):
-                payload = obj if obj.get("tool") in TOOLS else None
+                payload = obj if _known_tool(obj.get("tool")) else None
                 pos = rel_end
                 if payload:
                     calls.append(
@@ -1400,7 +1529,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
             pos = close + len(close_tag)
         else:
             break  # JSON may still be streaming
-        if payload and payload.get("tool") in TOOLS:
+        if payload and _known_tool(payload.get("tool")):
             calls.append(
                 {
                     "type": "tool_use",
@@ -1428,10 +1557,14 @@ _TYPE_MAP: dict[str, str] = {
 def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
     """Build tool definitions for 'anthropic', 'converse', or 'openai' format."""
     out = []
+    specs: list[tuple[str, str, dict[str, Any]]] = []
     for name, (desc, params, _) in TOOLS.items():
         props = {k: {"type": _TYPE_MAP.get(v, "string")} for k, v in params.items()}
         req = [k for k, v in params.items() if not v.endswith("?")]
-        schema = {"type": "object", "properties": props, "required": req}
+        specs.append((name, desc, {"type": "object", "properties": props, "required": req}))
+    if (respond_schema := _respond_schema()) is not None:
+        specs.append((RESPOND_TOOL, RESPOND_DESCRIPTION, respond_schema))
+    for name, desc, schema in specs:
         if fmt == "anthropic":
             out.append({"name": name, "description": desc, "input_schema": schema})
         elif fmt == "converse":
@@ -2407,6 +2540,12 @@ def build_system_prompt() -> str:
 Examples:
 <tool_call>{"tool": "read", "args": {"path": "file.py", "offset": 0, "limit": 20}}</tool_call>
 <tool_call>{"tool": "glob", "args": {"pat": "*.py"}}</tool_call>"""
+    respond_line = ""
+    if (respond_schema := _respond_schema()) is not None:
+        respond_line = (
+            f"- {RESPOND_TOOL}(...): {RESPOND_DESCRIPTION} Its arguments must match this "
+            f"JSON Schema: {json.dumps(respond_schema)}\n\n"
+        )
     return f"""You are a helpful coding assistant with tools to interact with the file system.
 Workspace root: {ws}
 Process cwd: {os.getcwd()}
@@ -2423,7 +2562,7 @@ Available tools:
 - bash(cmd): Run a shell command
 - task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result
 
-{tool_format}
+{respond_line}{tool_format}
 
 When reading a file, always pass offset and limit. When you finish a task, summarize what you changed.
 CRITICAL: You MUST use tools for file operations. Never say you can't access files!{agents_md_context()}"""
@@ -2433,6 +2572,10 @@ CRITICAL: You MUST use tools for file operations. Never say you can't access fil
 # Agentic loop
 # -----------------------------------------------------------------------------------------------
 MAX_TRUNCATION_RETRIES = 2
+RESPOND_NUDGE = (
+    f"You haven't given your final answer. Call the {RESPOND_TOOL} tool with arguments "
+    "matching its schema; a plain-text reply isn't accepted."
+)
 TRUNCATION_NUDGE = (
     "Your last response hit the output token limit before you called a tool or "
     "finished, so nothing happened. Continue in smaller steps: keep any reasoning "
@@ -2465,13 +2608,15 @@ def run_agent_turn(
 
     max_iters > 0 caps the tool-calling rounds (used to bound subagents);
     0 means unlimited, preserving the interactive default. Returns why the turn
-    ended: "done", "max_turns", "max_tokens", "tool_errors", or "cancelled".
+    ended: "done", "max_turns", "max_tokens", "tool_errors",
+    "no_structured_output", or "cancelled".
     """
     iters = 0
     last_tool_error: Optional[str] = None
     repeated_tool_error_count = 0
     retried_overflow = False
     truncations = 0
+    respond_nudges = 0
     try:
         while True:
             if max_iters and iters >= max_iters:
@@ -2513,7 +2658,14 @@ def run_agent_turn(
             truncations = 0
             _append_assistant(messages, display_text, tool_calls, raw_data)
             if not tool_calls:
-                return "done"
+                if _respond_schema() is None or _STRUCTURED_RESULT:
+                    return "done"
+                # A structured answer is required but the model just stopped.
+                respond_nudges += 1
+                if respond_nudges > MAX_TRUNCATION_RETRIES:
+                    return "no_structured_output"
+                messages.append({"role": "user", "content": RESPOND_NUDGE})
+                continue
             results: list[tuple[ToolCall, str]] = []
             stop = False
             for tc in tool_calls:
@@ -2530,6 +2682,8 @@ def run_agent_turn(
             _append_tool_results(messages, results)
             if stop:
                 return "tool_errors"
+            if _STRUCTURED_RESULT and _respond_schema() is not None:
+                return "done"
     except (UserCancelled, KeyboardInterrupt):
         print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
         return "cancelled"
@@ -3799,15 +3953,23 @@ def _arg_value(args: list[str], *names: str) -> Optional[str]:
     return None
 
 
-def run_headless(prompt: str, output_format: str = "text", max_turns: int = 0) -> int:
+def run_headless(
+    prompt: str,
+    output_format: str = "text",
+    max_turns: int = 0,
+    schema: Optional[dict[str, Any]] = None,
+) -> int:
     """Run one prompt without the interactive UI and return the exit code (wrencode -p).
 
     The UI goes to stderr so stdout carries only the final answer, or a JSON
     object with --output-format json. Saved history is neither loaded nor saved.
     Without --yes, writes and shell commands are declined rather than prompted.
+    With a schema (--json-schema), the answer is a validated JSON value instead.
     """
-    global _HEADLESS, _MLX_STATE
+    global _HEADLESS, _MLX_STATE, _OUTPUT_SCHEMA
     _HEADLESS = True
+    _OUTPUT_SCHEMA = schema
+    _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     reason, error = "error", ""
     with contextlib.redirect_stdout(sys.stderr):
@@ -3824,7 +3986,7 @@ def run_headless(prompt: str, output_format: str = "text", max_turns: int = 0) -
             print(f"{RED}Error: {error}{RESET}")
     texts = [flatten_content(m["content"]) for m in messages if m["role"] == "assistant"]
     result = texts[-1].strip() if texts else ""
-    is_error = reason != "done"
+    is_error = reason != "done" or (schema is not None and not _STRUCTURED_RESULT)
     if output_format == "json":
         out: dict[str, Any] = {
             "result": result,
@@ -3834,9 +3996,14 @@ def run_headless(prompt: str, output_format: str = "text", max_turns: int = 0) -
             "backend": BACKEND,
             "model": MODEL,
         }
+        if schema is not None:
+            out["structured_output"] = _STRUCTURED_RESULT[0] if _STRUCTURED_RESULT else None
         if error:
             out["error"] = error
         print(json.dumps(out, ensure_ascii=False))
+    elif schema is not None:
+        if _STRUCTURED_RESULT:
+            print(json.dumps(_STRUCTURED_RESULT[0], ensure_ascii=False))
     elif result:
         print(result)
     return 1 if is_error else 0
@@ -3851,6 +4018,7 @@ def print_help() -> None:
     print("                     (PROMPT '-' or omitted with piped stdin reads stdin)")
     print("--output-format F    with -p: text (default) or json")
     print("--max-turns N        with -p: cap tool-calling rounds")
+    print("--json-schema S      with -p: answer as JSON matching schema S (file or inline)")
     print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("--uninstall   remove saved config and show how to delete wrencode")
     print("--version, -V print version and exit")
@@ -3923,7 +4091,18 @@ def main() -> None:
         if not turns.isdigit():
             print(f"{RED}--max-turns must be a non-negative integer.{RESET}")
             raise SystemExit(2)
-        raise SystemExit(run_headless(prompt, fmt, int(turns)))
+        schema = None
+        if (raw := _arg_value(args, "--json-schema")) is not None:
+            try:
+                text = raw if raw.lstrip().startswith("{") else pathlib.Path(raw).read_text()
+                schema = json.loads(text)
+            except (OSError, ValueError) as err:
+                print(f"{RED}--json-schema: {err}{RESET}")
+                raise SystemExit(2) from err
+            if not isinstance(schema, dict):
+                print(f"{RED}--json-schema must be a JSON object (a schema).{RESET}")
+                raise SystemExit(2)
+        raise SystemExit(run_headless(prompt, fmt, int(turns), schema))
 
     resolve_configuration()
 
