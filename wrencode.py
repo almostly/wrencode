@@ -32,6 +32,7 @@ THE SOFTWARE.
 # flake8: noqa: E501, E203
 
 import ast
+import difflib
 import contextlib
 import datetime
 import getpass
@@ -776,12 +777,16 @@ def edit(args: dict[str, Any]) -> str:
     if path.stat().st_size > MAX_READ_BYTES:
         return f"error: file too large (max {MAX_READ_BYTES} bytes)"
     text = path.read_text(encoding="utf-8", errors="replace")
-    if old not in text:
-        return "error: old_string not found"
-    count = text.count(old)
-    if not args.get("all") and count > 1:
-        return f"error: old_string appears {count} times (use all=true)"
-    updated = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+    note = ""
+    if old in text:
+        count = text.count(old)
+        if not args.get("all") and count > 1:
+            return f"error: 'old' appears {count} times (add context to make it unique, or use all=true)"
+        updated = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+    elif (shifted := _reindented_edit(text, old, new)) is not None:
+        updated, note = shifted
+    else:
+        return _not_found_error(text, old)
     if updated == text:
         return "error: edit produced no change"
     suffix = path.suffix.lower()
@@ -799,7 +804,83 @@ def edit(args: dict[str, Any]) -> str:
     if approval != "ok":
         return approval
     path.write_text(updated, encoding="utf-8")
-    return "ok"
+    return f"ok ({note})" if note else "ok"
+
+
+def _indent(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _reindented_edit(text: str, old: str, new: str) -> Optional[tuple[str, str]]:
+    """Apply an edit whose `old` matches whole lines except for a uniform indent shift.
+
+    Models often drop or add one indentation level when quoting a block (e.g. a
+    method quoted at column 0). If exactly one block of lines matches after
+    shifting every non-blank line by the same amount, replace it and shift `new`
+    the same way. Returns (updated text, note) or None.
+    """
+    old_lines = old.strip("\n").split("\n")
+    lines = text.split("\n")
+    n = len(old_lines)
+    hits: list[tuple[int, str, str]] = []  # (start line, add, remove)
+    for i in range(len(lines) - n + 1):
+        add = remove = None
+        for fl, ol in zip(lines[i : i + n], old_lines):
+            if not ol.strip():
+                if fl.strip():
+                    break
+                continue
+            if fl.lstrip() != ol.lstrip():
+                break
+            fi, oi = _indent(fl), _indent(ol)
+            if fi.endswith(oi):  # file is indented deeper than `old`
+                shift = (fi[: len(fi) - len(oi)], "")
+            elif oi.endswith(fi):  # `old` is indented deeper than the file
+                shift = ("", oi[: len(oi) - len(fi)])
+            else:
+                break
+            if add is not None and shift != (add, remove):
+                break
+            add, remove = shift
+        else:
+            if add is not None and (add or remove):
+                hits.append((i, add, remove or ""))
+    if len(hits) != 1:
+        return None
+    i, add, remove = hits[0]
+    shifted = []
+    for line in new.strip("\n").split("\n"):
+        if not line.strip():
+            shifted.append(line)
+        elif remove and line.startswith(remove):
+            shifted.append(line[len(remove) :])
+        else:
+            shifted.append(add + line)
+    updated = "\n".join(lines[:i] + shifted + lines[i + n :])
+    how = f"added {len(add)}" if add else f"removed {len(remove)}"
+    return updated, f"matched lines {i + 1}-{i + n} after adjusting indentation ({how} chars)"
+
+
+def _not_found_error(text: str, old: str) -> str:
+    """Explain a failed match and show the closest block of lines in the file."""
+    msg = "error: 'old' text not found; it must match the file exactly, including indentation."
+    old_lines = old.strip("\n").split("\n")
+    lines = text.split("\n")
+    n = max(1, len(old_lines))
+    target = "\n".join(l.strip() for l in old_lines)
+    best, best_i = 0.0, -1
+    for i in range(max(1, len(lines) - n + 1)):
+        window = "\n".join(l.strip() for l in lines[i : i + n])
+        sm = difflib.SequenceMatcher(None, target, window)
+        if sm.real_quick_ratio() > best and sm.quick_ratio() > best:
+            if (r := sm.ratio()) > best:
+                best, best_i = r, i
+    if best < 0.5:
+        return msg + " Re-read the file and copy the text you want to replace."
+    shown = "\n".join(
+        f"{j + 1:>5}| {lines[j]}" for j in range(best_i, min(len(lines), best_i + n))
+    )
+    return f"{msg} Closest match ({best:.0%} similar), lines {best_i + 1}-{best_i + n}:\n{shown}"
 
 
 def glob(args: dict[str, Any]) -> str:

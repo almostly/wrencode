@@ -67,7 +67,10 @@ The agent has access to seven tools:
 
 - **read** - read a file with line numbers, or list a directory
 - **write** - write content to a file
-- **edit** - replace a unique string in a file
+- **edit** - replace a unique string in a file. If the text only matches with
+  its indentation shifted by a consistent amount (a common slip when quoting a
+  method), the edit is applied with the replacement shifted to match; otherwise
+  the error shows the closest lines in the file
 - **glob** - find files by pattern, sorted by modification time
 - **grep** - search files for a regex pattern using `rg` when available, falling back to `grep`
 - **bash** - run a shell command with timeout and streaming output

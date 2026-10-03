@@ -2415,5 +2415,79 @@ class TestStructuredOutput(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class TestForgivingEdit(unittest.TestCase):
+    CART = (
+        "class Cart:\n"
+        "    def remove(self, sku: str):\n"
+        "        del self.items[sku]\n"
+        "\n"
+        "    def subtotal(self) -> int:\n"
+        "        return 0\n"
+    )
+
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self._env = mock.patch.dict(
+            os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}
+        )
+        self._env.start()
+        self._out = mock.patch("sys.stdout", io.StringIO())
+        self._out.start()
+        (self._tmp / "cart.py").write_text(self.CART)
+
+    def tearDown(self):
+        import shutil
+
+        self._out.stop()
+        self._env.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def edit(self, old, new):
+        return wrencode.edit({"path": "cart.py", "old": old, "new": new})
+
+    def test_dedented_quote_is_reindented(self):
+        # The exact failure Qwen3-8B hit 22 times: a method quoted at column 0.
+        result = self.edit(
+            "def remove(self, sku: str):\n    del self.items[sku]",
+            "def remove(self, sku: str):\n    self.items.pop(sku, None)",
+        )
+        self.assertTrue(result.startswith("ok (matched lines 2-3"), result)
+        self.assertIn("added 4 chars", result)
+        text = (self._tmp / "cart.py").read_text()
+        self.assertIn("    def remove(self, sku: str):\n        self.items.pop(sku, None)\n", text)
+        self.assertIn("    def subtotal", text)
+
+    def test_over_indented_quote_is_dedented(self):
+        result = self.edit("            return 0", "            return 42")
+        self.assertIn("removed 4 chars", result)
+        self.assertIn("        return 42\n", (self._tmp / "cart.py").read_text())
+
+    def test_inconsistent_shift_is_rejected(self):
+        # def is 2 spaces short of the file, body 4 short: no single shift fits.
+        result = self.edit("  def remove(self, sku: str):\n    del self.items[sku]", "x")
+        self.assertTrue(result.startswith("error:"), result)
+        self.assertEqual((self._tmp / "cart.py").read_text(), self.CART)
+
+    def test_ambiguous_reindent_is_rejected(self):
+        (self._tmp / "cart.py").write_text("def a():\n    x = 1\n\ndef b():\n    x = 1\n")
+        result = self.edit("x = 1", "x = 2")
+        self.assertIn("appears 2 times", result)
+
+    def test_not_found_shows_closest_lines(self):
+        result = self.edit("def remove(self, sku):\n    del items[sku]", "x")
+        self.assertIn("Closest match", result)
+        self.assertIn("    2|     def remove(self, sku: str):", result)
+        self.assertIn("including indentation", result)
+
+    def test_unrelated_text_has_no_closest_match(self):
+        result = self.edit("import numpy as np", "x")
+        self.assertNotIn("Closest match", result)
+        self.assertIn("Re-read the file", result)
+
+    def test_reindented_result_still_syntax_checked(self):
+        result = self.edit("return 0", "return (")
+        self.assertIn("invalid Python", result)
+
+
 if __name__ == "__main__":
     unittest.main()
