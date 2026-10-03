@@ -2619,5 +2619,95 @@ class TestVerify(unittest.TestCase):
         run.assert_called_once_with("x", "text", 0, None, "make test")
 
 
+# Trimmed from a real Qwen3-8B reply on vLLM: a "+" join inside the JSON arguments.
+QWEN3_GARBLED_CALL = "<tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\": \"shop/money.py\", \"old\": \"def to_cents(amount: str) -> int:\\n        \\\"\\\"\\\"Parse '12.34' or '12' into cents.\\\"\\\"\\\"\\n        if '.' in amount:\\n            whole, frac = amount.split('.')\" + \"\\n            return int(whole) * 100 + int(frac.ljust(</tool_call>"
+
+
+class TestGarbledToolCalls(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+        (self._tmp / "a.txt").write_text("hello")
+        self._patches = [
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch("sys.stdout", io.StringIO()),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def loop(self, backend, replies):
+        replies = iter(replies)
+        msgs = [{"role": "user", "content": "go"}]
+        with (
+            mock.patch.object(wrencode, "BACKEND", backend),
+            mock.patch.object(wrencode, "get_response", lambda *a: next(replies)),
+        ):
+            reason = wrencode.run_agent_turn(msgs, "sys", None)
+        return reason, msgs
+
+    @staticmethod
+    def openai(content, calls=None):
+        msg = {"role": "assistant", "content": content}
+        if calls:
+            msg["tool_calls"] = calls
+        return json.dumps({"choices": [{"message": msg, "finish_reason": "stop"}]})
+
+    def test_real_qwen3_call_is_explained(self):
+        why = wrencode._garbled_tool_call(QWEN3_GARBLED_CALL, native=True)
+        self.assertIn("invalid JSON at character", why)
+        self.assertIn("Expecting ',' delimiter", why)
+        self.assertIn('split(\'.\')" + "', why)
+
+    def test_native_garbled_call_is_resent_not_final(self):
+        good = self.openai(None, [{"id": "c1", "type": "function",
+                                   "function": {"name": "read", "arguments": '{"path": "a.txt"}'}}])
+        reason, msgs = self.loop("openai", [self.openai(QWEN3_GARBLED_CALL), good, self.openai("Read it.")])
+        self.assertEqual(reason, "done")
+        nudge = msgs[2]["content"]
+        self.assertTrue(nudge.startswith("Your last message contained a tool call that couldn't be run"))
+        self.assertEqual(msgs[-1]["content"], "Read it.")
+        out = wrencode._to_openai_messages(msgs)  # history stays valid; the tag is defanged
+        self.assertEqual([m["role"] for m in out], [m["role"] for m in msgs])
+        self.assertNotIn("<tool_call>", json.dumps(out))
+
+    def test_xml_garbled_call_is_resent(self):
+        bad = '<tool_call>{"tool": "read", "args": {"path": "a" + ".txt"}}</tool_call>'
+        good = '<tool_call>{"tool": "read", "args": {"path": "a.txt"}}</tool_call>'
+        reason, msgs = self.loop("ollama", [bad, good, "It says hello."])
+        self.assertEqual(reason, "done")
+        results = [b["content"] for m in msgs if isinstance(m["content"], list)
+                   for b in m["content"] if b.get("type") == "tool_result"]
+        self.assertTrue(any("hello" in r for r in results))
+
+    def test_gives_up_after_repeated_garbling(self):
+        reason, _ = self.loop("openai", [self.openai(QWEN3_GARBLED_CALL)] * 5)
+        self.assertEqual(reason, "malformed_tool_call")
+
+    def test_native_call_written_as_text(self):
+        text = '<tool_call>{"name": "read", "arguments": {"path": "a.txt"}}</tool_call>'
+        self.assertIn("function-calling interface", wrencode._garbled_tool_call(text, native=True))
+
+    def test_xml_unknown_tool(self):
+        why = wrencode._garbled_tool_call('<tool_call>{"tool": "fly", "args": {}}</tool_call>', native=False)
+        self.assertIn("unknown tool", why)
+
+    def test_plain_final_answer_unaffected(self):
+        self.assertEqual(wrencode._garbled_tool_call("All done, tests pass.", native=True), "")
+
+    def test_hermes_shape_parsed_on_xml_path(self):
+        calls = wrencode.parse_tool_calls(
+            '<tool_call>{"name": "read", "arguments": {"path": "a.txt"}}</tool_call>'
+            '<tool_call>{"name": "glob", "arguments": "{\\"pat\\": \\"*.txt\\"}"}</tool_call>'
+        )
+        self.assertEqual([(c["name"], c["input"]) for c in calls],
+                         [("read", {"path": "a.txt"}), ("glob", {"pat": "*.txt"})])
+
+
 if __name__ == "__main__":
     unittest.main()
