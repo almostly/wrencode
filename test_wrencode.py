@@ -2160,5 +2160,43 @@ class TestAutoCompactInLoop(unittest.TestCase):
         ac.assert_not_called()
 
 
+class TestHttpRetry(unittest.TestCase):
+    def http_error(self, code):
+        import urllib.error
+
+        return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b"busy"))
+
+    def test_retries_server_errors_then_succeeds(self):
+        ok = mock.MagicMock()
+        ok.__enter__.return_value = io.BytesIO(b'{"ok": 1}')
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=[self.http_error(503), ok]) as op,
+            mock.patch("time.sleep") as sleep,
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            self.assertEqual(wrencode._http_post_raw("http://x", b"{}", {}), {"ok": 1})
+        self.assertEqual(op.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(op.call_args.kwargs["timeout"], wrencode.HTTP_TIMEOUT)
+
+    def test_gives_up_after_retries(self):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: (_ for _ in ()).throw(self.http_error(429))) as op,
+            mock.patch("time.sleep"),
+            mock.patch("sys.stderr", io.StringIO()),
+            self.assertRaisesRegex(Exception, "HTTP 429: busy"),
+        ):
+            wrencode._http_post_raw("http://x", b"{}", {})
+        self.assertEqual(op.call_count, wrencode.HTTP_RETRIES + 1)
+
+    def test_client_errors_not_retried(self):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=self.http_error(400)) as op,
+            self.assertRaisesRegex(Exception, "HTTP 400"),
+        ):
+            wrencode._http_post_raw("http://x", b"{}", {})
+        self.assertEqual(op.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

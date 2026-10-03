@@ -304,6 +304,8 @@ This publishes release assets:
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
 |`MAX_TOKENS`                 |`8192`                 |Max tokens per response           |
+|`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
+|`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx, with backoff|
 |`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction|
 |`WRENCODE_COMPACT_AT`        |`0.75`                 |Compact at this fraction of the window (`0` disables)|
 |`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |

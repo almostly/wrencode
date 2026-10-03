@@ -331,6 +331,8 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
 # Constants & environment variables
 # -----------------------------------------------------------------------------------------------
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
+HTTP_TIMEOUT = float(os.environ.get("WRENCODE_HTTP_TIMEOUT", "600"))
+HTTP_RETRIES = int(os.environ.get("WRENCODE_HTTP_RETRIES", "2"))
 # Auto-compaction: once the estimated prompt passes COMPACT_AT of the model's
 # context window, older turns are summarized (0 disables it).
 CONTEXT_TOKENS = int(os.environ.get("WRENCODE_CONTEXT_TOKENS", "128000"))
@@ -1643,13 +1645,25 @@ def _append_tool_results(
 # HTTP helper
 # -----------------------------------------------------------------------------------------------
 def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
-    """POST pre-encoded bytes to a URL and return the parsed JSON response."""
+    """POST pre-encoded bytes to a URL and return the parsed JSON response.
+
+    Responses aren't streamed, so the timeout must cover a whole generation.
+    Rate limits and server errors (429/5xx) are retried with backoff.
+    """
     req = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as e:
-        raise Exception(f"HTTP {e.code}: {e.read().decode()}") from e
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if e.code in {429, 500, 502, 503, 504} and attempt < HTTP_RETRIES:
+                wait = 2 ** (attempt + 1)
+                print(f"{YELLOW}HTTP {e.code}, retrying in {wait}s{RESET}", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise Exception(f"HTTP {e.code}: {body}") from e
+    raise AssertionError("unreachable")
 
 
 def _http_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> Any:
