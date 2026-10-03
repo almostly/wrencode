@@ -2724,17 +2724,27 @@ def fetch_ollama_models() -> list[str]:
         return [BACKEND_SPECS["ollama"]["model"]]
 
 
-def fetch_openai_compatible_models() -> list[str]:
-    """Return the model ids an openai-compatible server serves (GET /models), or []."""
+def _list_openai_compatible_models() -> tuple[list[str], str]:
+    """Return (model ids, "") from the server's GET /models, or ([], why it failed)."""
     key = os.environ.get("OPENAI_COMPATIBLE_API_KEY", "")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
         req = urllib.request.Request(f"{_openai_compatible_base()}/models", headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        # Generous timeout: serverless hosts (Modal, etc.) may cold-start here.
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.load(resp)
-        return sorted(m["id"] for m in data.get("data", []) if m.get("id"))
-    except Exception:
-        return []
+        return sorted(m["id"] for m in data.get("data", []) if m.get("id")), ""
+    except urllib.error.HTTPError as err:
+        if err.code in {401, 403}:
+            return [], f"the server rejected the key (HTTP {err.code}); check OPENAI_COMPATIBLE_API_KEY"
+        return [], f"HTTP {err.code}"
+    except Exception as err:
+        return [], f"{err} — is the server running?"
+
+
+def fetch_openai_compatible_models() -> list[str]:
+    """Return the model ids an openai-compatible server serves, or [] if unavailable."""
+    return _list_openai_compatible_models()[0]
 
 
 def list_models_for_backend(backend: str) -> list[str]:
@@ -3142,9 +3152,9 @@ def load_model() -> Optional[tuple[Any, Any]]:
         return None
     if BACKEND == "openai-compatible":
         base = _openai_compatible_base()
-        served = fetch_openai_compatible_models()
+        served, why = _list_openai_compatible_models()
         if not served:
-            print(f"{YELLOW}⚠ Couldn't list models at {base} — is the server running?{RESET}")
+            print(f"{YELLOW}⚠ Couldn't list models at {base}: {why}{RESET}")
         elif not MODEL and len(served) == 1:
             MODEL = served[0]
         if not MODEL:

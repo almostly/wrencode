@@ -1971,6 +1971,23 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
             code, data = self.headless()
         self.assertEqual((code, data["model"]), (0, "b"))
 
+    def test_rejected_key_explained(self):
+        def deny(*a, **k):
+            import urllib.error
+
+            raise urllib.error.HTTPError("u", 401, "x", {}, io.BytesIO(b""))
+
+        err = io.StringIO()
+        with (
+            mock.patch("urllib.request.urlopen", deny),
+            mock.patch.object(wrencode, "BACKEND", "openai-compatible"),
+            mock.patch.object(wrencode, "MODEL", ""),
+            mock.patch("sys.stdout", err),
+            self.assertRaises(SystemExit),
+        ):
+            wrencode.load_model()
+        self.assertIn("rejected the key (HTTP 401)", err.getvalue())
+
     def test_lists_served_models(self):
         self.models = ["m2", "m1"]
         wrencode.apply_backend("openai-compatible")
