@@ -114,6 +114,20 @@ wrencode -p "List the TODOs" --output-format json | jq -r .result
 - The exit code is `0` when the agent finishes, `1` if it errors, hits
   `--max-turns`, or stops on repeated tool errors, and `2` for bad arguments.
 
+## Context management
+
+Long sessions are compacted automatically. Before each model call WrenCode
+estimates the prompt size (about 4 characters per token), and once it passes
+`WRENCODE_COMPACT_AT` (default 75%) of `WRENCODE_CONTEXT_TOKENS` (default
+128,000) it has the model summarize the older messages: the request, files
+touched, commands and results, decisions, and what's left to do. The most recent
+messages, about a quarter of the window, are kept verbatim, along with the
+user's latest request, so it works mid-task, between tool calls. If a request still
+fails with a context-length error, WrenCode compacts and retries once.
+
+Set `WRENCODE_CONTEXT_TOKENS` to your model's window, especially for local
+models with small ones. `/compact` summarizes on demand.
+
 ## Installation
 
 ### Option 1: Standalone binary (recommended)
@@ -274,7 +288,7 @@ This publishes release assets:
 |--------------|----------------------------------------------|
 |`/help`       |Show available commands                       |
 |`/c`          |Clear conversation history                    |
-|`/compact`    |Summarize history to reduce context (mlx only)|
+|`/compact`    |Summarize history to reduce context          |
 |`/q` or `exit`|Quit                                          |
 
 ## Environment Variables
@@ -289,7 +303,11 @@ This publishes release assets:
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
-|`MAX_TOKENS`                 |`4096`                 |Max tokens per response           |
+|`MAX_TOKENS`                 |`8192`                 |Max tokens per response           |
+|`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
+|`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx, with backoff|
+|`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction|
+|`WRENCODE_COMPACT_AT`        |`0.75`                 |Compact at this fraction of the window (`0` disables)|
 |`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |
 |`MAX_READ_LINES`             |`800`                  |Max lines returned per read       |
 |`GREP_MAX_MATCHES`           |`80`                   |Max grep results                  |
