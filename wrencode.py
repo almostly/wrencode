@@ -83,6 +83,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # The other modules read environment defaults at import, so they come after .env.
 import wrencode_backends as backends
 import wrencode_configure as configure
+import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
 import wrencode_ui as ui
@@ -739,6 +740,42 @@ TOOLS: dict[str, ToolEntry] = {
 }
 
 
+def python(args: dict[str, Any]) -> str:
+    """Run a model-written Python snippet in the sandbox (see wrencode_sandbox).
+
+    The snippet can't reach the network, a shell or the environment, and sees the
+    workspace read-only, so it runs without an approval prompt. wrencode's own
+    read, glob and grep are available inside it as functions.
+    """
+    code = _require_str(args, "code")
+
+    def as_tool(fn: ToolFn, **kw: Any) -> str:
+        return fn({k: v for k, v in kw.items() if v is not None})
+
+    functions = {
+        "read": lambda path, offset=None, limit=None: as_tool(
+            read, path=path, offset=offset, limit=limit
+        ),
+        "glob": lambda pat, path=None: as_tool(glob, pat=pat, path=path),
+        "grep": lambda pat, path=None: as_tool(grep, pat=pat, path=path),
+    }
+    return sandbox.run(code, workspace=workspace_root(), functions=functions)
+
+
+# An eighth tool when pydantic-monty is installed (pip install 'wrencode[sandbox]').
+if sandbox.available():
+    TOOLS["python"] = (
+        (
+            "Run a Python snippet in a sandbox: no network, shell or environment, "
+            "a standard-library subset, the workspace read-only at /workspace (the "
+            "working directory), and read(path), glob(pat), grep(pat) available as "
+            "functions. Printed output and the trailing expression's value come back"
+        ),
+        {"code": "string"},
+        python,
+    )
+
+
 def normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Normalize common model arg aliases before dispatching a tool."""
     out = dict(args or {})
@@ -753,6 +790,11 @@ def normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
         for alias in ("description", "subtask"):
             if str(out.get(alias, "")).strip():
                 out["prompt"] = str(out[alias]).strip()
+                break
+    if name == "python" and not str(out.get("code", "")).strip():
+        for alias in ("source", "script", "snippet"):
+            if str(out.get(alias, "")).strip():
+                out["code"] = str(out[alias])
                 break
     return out
 
@@ -790,6 +832,11 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     if name == "task":
         prompt = str(args.get("prompt", "")).strip()
         return f"task {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
+    if name == "python":
+        code = str(args.get("code", "")).strip()
+        lines = code.split("\n")
+        more = f"  (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+        return f"python {lines[0][:160]}{more}"
     return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
 
@@ -1245,6 +1292,14 @@ def build_system_prompt() -> str:
 Examples:
 <tool_call>{"tool": "read", "args": {"path": "file.py", "offset": 0, "limit": 20}}</tool_call>
 <tool_call>{"tool": "glob", "args": {"pat": "*.py"}}</tool_call>"""
+    python_line = ""
+    if "python" in TOOLS:
+        python_line = (
+            "- python(code): Run a Python snippet in a sandbox: no network, shell or "
+            "environment, a standard-library subset, the workspace read-only at "
+            "/workspace, and read(path), glob(pat), grep(pat) callable inside it. "
+            "print() what you want to see; a trailing expression's value is returned\n"
+        )
     respond_line = ""
     if (respond_schema := _respond_schema()) is not None:
         respond_line = (
@@ -1266,7 +1321,7 @@ Available tools:
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
 - task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result. Several task calls in one reply run in parallel, so batch independent subtasks together
-
+{python_line}
 {respond_line}{tool_format}
 
 When reading a file, always pass offset and limit. When you finish a task, summarize what you changed.

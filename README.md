@@ -23,6 +23,7 @@ Read `wrencode.py` top to bottom to understand the agent; the files beside it ar
 |`wrencode_configure.py` |Picking a backend and model: the first-run chooser, `/configure` and `/model`, API-key prompts and verification, model lists, saved config|
 |`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
 |`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
+|`wrencode_sandbox.py`   |The `python` tool's sandbox, on pydantic-monty                    |
 |`wrencode_synthesize.py`|The `synthesize` subcommand                                       |
 
 Each module imports only the ones below it in this table's dependency order (`wrencode.py` → backends/configure/sdk/synthesize → ui), so the loop can be read without the rest.
@@ -115,6 +116,7 @@ The agent has access to seven tools:
 - **grep** - search files for a regex pattern using `rg` when available, falling back to `grep`
 - **bash** - run a shell command with timeout and streaming output
 - **task** - delegate a self-contained subtask to a fresh subagent (its own context, same tools) that returns only its final result
+- **python** - run a snippet of Python in a sandbox, with `pydantic-monty` installed (see below)
 
 All file operations are sandboxed to the workspace root by default.
 
@@ -133,6 +135,29 @@ take turns and pause the other agents' output until you answer. Escape stops
 the whole batch. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
 each subagent round is bounded. For autonomous subagent runs, enable
 `--yes` / `WRENCODE_AUTO_APPROVE` so sub-tool calls don't block on confirmation.
+
+### Python sandbox
+
+With [pydantic-monty](https://github.com/pydantic/monty) installed, the agent gets
+an eighth tool, `python`. It runs a snippet of model-written code in Monty, a
+Python interpreter built as a sandbox: each call is a fresh interpreter with no
+network, no shell, no environment variables, and a read-only view of the
+workspace at `/workspace`, which is also the working directory, so
+`open("foo.py")` works. wrencode's `read(path)`, `glob(pat)` and `grep(pat)` are
+callable inside the snippet. Printed output and the value of a trailing
+expression come back to the model; an exception comes back as its traceback.
+Since the snippet can't change anything, it runs without an approval prompt;
+changes still go through `write` and `edit`.
+
+```bash
+pip install 'wrencode[sandbox]'   # or: pip install pydantic-monty
+```
+
+Monty runs a subset of Python: no class inheritance, generators or third-party
+packages, and a curated standard library (`json`, `re`, `math`, `datetime`,
+`pathlib`, ...). `WRENCODE_SANDBOX_TIMEOUT` (default 30 seconds) and
+`WRENCODE_SANDBOX_MEMORY_MB` (default 256) bound each run. The standalone binary
+doesn't bundle Monty, so the tool is a source-install feature.
 
 ## Project instructions (AGENTS.md)
 
@@ -351,6 +376,12 @@ For HuggingFace Transformers:
 pip install transformers torch
 ```
 
+For the `python` sandbox tool:
+
+```bash
+pip install pydantic-monty
+```
+
 ## Usage
 
 ```bash
@@ -446,6 +477,8 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
 |`WRENCODE_MAX_PARALLEL_SUBAGENTS`|`4`                |Subagents run at once from one reply; `1` runs them in order|
+|`WRENCODE_SANDBOX_TIMEOUT`   |`30`                   |Seconds a `python` tool snippet may run|
+|`WRENCODE_SANDBOX_MEMORY_MB` |`256`                  |Memory a `python` tool snippet may use|
 |`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|

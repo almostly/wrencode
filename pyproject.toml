@@ -36,6 +36,8 @@ mlx = ["mlx-lm"]
 transformers = ["transformers", "torch"]
 # Claude Code's agent loop as a backend; the SDK needs Python 3.10+.
 agent-sdk = ["claude-agent-sdk; python_version >= '3.10'"]
+# The `python` tool: model-written snippets run in the pydantic-monty sandbox.
+sandbox = ["pydantic-monty"]
 
 [project.scripts]
 wrencode = "wrencode:main"
@@ -89,7 +91,8 @@ ignore = [
 # Optional at runtime, so not installed in the dev environment: certifi is
 # soft-imported for the frozen binary's CA bundle, mlx-lm and transformers/torch
 # are the [mlx]/[transformers] extras, claude_agent_sdk is the [agent-sdk]
-# extra, and modal is only for examples/modal_vllm.py.
+# extra, pydantic_monty is the [sandbox] extra, and modal is only for
+# examples/modal_vllm.py.
 allowed-unresolved-imports = [
     "certifi",
     "mlx_lm",
@@ -99,4 +102,5 @@ allowed-unresolved-imports = [
     "modal",
     "claude_agent_sdk",
     "claude_agent_sdk.*",
+    "pydantic_monty",
 ]
