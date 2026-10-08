@@ -38,6 +38,9 @@ transformers = ["transformers", "torch"]
 agent-sdk = ["claude-agent-sdk; python_version >= '3.10'"]
 # The `python` tool: model-written snippets run in the pydantic-monty sandbox.
 sandbox = ["pydantic-monty"]
+# Conversation history in Postgres: a server (WRENCODE_DATABASE_URL) or embedded
+# PGlite, which also needs Node.js.
+history = ["psycopg[binary]"]
 
 [project.scripts]
 wrencode = "wrencode:main"
@@ -93,8 +96,8 @@ ignore = [
 # Optional at runtime, so not installed in the dev environment: certifi is
 # soft-imported for the frozen binary's CA bundle, mlx-lm and transformers/torch
 # are the [mlx]/[transformers] extras, claude_agent_sdk is the [agent-sdk]
-# extra, pydantic_monty is the [sandbox] extra, and modal is only for
-# examples/modal_vllm.py.
+# extra, pydantic_monty is the [sandbox] extra, psycopg is the [history] extra,
+# and modal is only for examples/modal_vllm.py.
 allowed-unresolved-imports = [
     "certifi",
     "mlx_lm",
@@ -105,4 +108,5 @@ allowed-unresolved-imports = [
     "claude_agent_sdk",
     "claude_agent_sdk.*",
     "pydantic_monty",
+    "psycopg",
 ]

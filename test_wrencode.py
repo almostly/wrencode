@@ -7,6 +7,7 @@ Run (from the repo root — stdlib only, no extra deps):
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import os
@@ -24,6 +25,7 @@ from unittest import mock
 import wrencode
 import wrencode_backends as backends
 import wrencode_configure as configure
+import wrencode_history as history
 import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
@@ -2562,6 +2564,159 @@ class TestRepoRules(unittest.TestCase):
             if "noqa" in line and "test_no_noqa_markers" not in line
         ]
         self.assertEqual(offenders, [], "lint exceptions belong in pyproject.toml")
+
+
+try:
+    import psycopg
+except ImportError:  # the Postgres history tests below skip without it
+    psycopg = None
+
+
+@unittest.skipIf(
+    psycopg is None or shutil.which("node") is None, "psycopg or Node.js not installed"
+)
+class TestHistoryStore(unittest.TestCase):
+    """The Postgres history store, against a real embedded PGlite."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = pathlib.Path(cls._tmp.name) / "pglite"
+        cls.server = history.EmbeddedPGlite(cls.root)
+        try:
+            cls.store = history.Store(cls.server.start(), cls.server)
+            cls.store.init_schema()
+        except RuntimeError as err:
+            cls.server.stop()
+            cls._tmp.cleanup()
+            raise unittest.SkipTest(f"embedded PGlite unavailable: {err}") from err
+        except BaseException:
+            cls.server.stop()
+            cls._tmp.cleanup()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+        cls._tmp.cleanup()
+
+    def test_sessions_and_messages_roundtrip(self):
+        ws = "/work/roundtrip"
+        self.assertIsNone(self.store.latest_session(ws))
+        sid = self.store.new_session(ws, "openai", "gpt-x")
+        msgs = [
+            {"role": "user", "content": "fix the parser"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "1| x"},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        ]
+        self.store.save(sid, msgs)
+        self.assertEqual(self.store.load(sid), msgs)
+        self.assertEqual(self.store.latest_session(ws), sid)
+        row = self.store.sessions(ws)[0]
+        self.assertEqual(
+            (row["id"], row["title"], row["chats"]), (sid, "fix the parser", 1)
+        )
+        self.store.save(sid, msgs[:1])  # a save replaces the list (compaction)
+        self.assertEqual(self.store.load(sid), msgs[:1])
+
+    def test_search_is_per_workspace(self):
+        a, b = "/work/search-a", "/work/search-b"
+        sa = self.store.new_session(a, "x", "y")
+        sb = self.store.new_session(b, "x", "y")
+        self.store.save(sa, [{"role": "user", "content": "the flux capacitor leaks"}])
+        self.store.save(sb, [{"role": "user", "content": "flux elsewhere"}])
+        hits = self.store.search(a, "flux")
+        self.assertEqual([h["session_id"] for h in hits], [sa])
+        self.assertIn("capacitor", hits[0]["text"])
+        self.assertEqual(self.store.search(a, "nomatchxyz"), [])
+
+    def test_data_survives_a_server_restart(self):
+        ws = "/work/persist"
+        sid = self.store.new_session(ws, "x", "y")
+        self.store.save(sid, [{"role": "user", "content": "keep me"}])
+        self.server.stop()
+        server = history.EmbeddedPGlite(self.root)
+        store = history.Store(server.start(), server)
+        type(self).server, type(self).store = server, store  # for the other tests
+        self.assertEqual(store.latest_session(ws), sid)
+        self.assertEqual(store.load(sid)[0]["content"], "keep me")
+
+
+class TestHistoryWiring(unittest.TestCase):
+    """The loop's use of the store, with the store mocked."""
+
+    def setUp(self):
+        self.store = mock.Mock()
+        self.store.load.return_value = [{"role": "user", "content": "hi"}]
+        self.store.new_session.return_value = 7
+        self.store.sessions.return_value = [
+            {
+                "id": 7,
+                "title": "hi",
+                "model": "m",
+                "updated_at": datetime.datetime(
+                    2026, 10, 8, 12, 0, tzinfo=datetime.timezone.utc
+                ),
+                "chats": 1,
+            }
+        ]
+        self.store.search.return_value = [
+            {"session_id": 7, "role": "user", "text": "hi there"}
+        ]
+        for p in (
+            mock.patch.object(wrencode, "_STORE", self.store),
+            mock.patch.object(wrencode, "_SESSION_ID", 7),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_load_and_save_go_to_the_store(self):
+        self.assertEqual(wrencode.load_history(), [{"role": "user", "content": "hi"}])
+        wrencode.save_history([{"role": "user", "content": "x"}])
+        self.store.save.assert_called_once_with(7, [{"role": "user", "content": "x"}])
+
+    def test_clear_starts_a_new_session_and_keeps_the_old(self):
+        msgs = [{"role": "user", "content": "old"}]
+        action, _ = wrencode.handle_slash_command("/clear", msgs, None)
+        self.assertEqual(action, "handled")
+        self.assertEqual(msgs, [])
+        self.store.new_session.assert_called_once()
+        self.store.save.assert_not_called()
+        self.assertIn("new session #7", sys.stdout.getvalue())
+
+    def test_sessions_resume_and_search(self):
+        wrencode.handle_slash_command("/sessions", [], None)
+        self.assertIn("#7", sys.stdout.getvalue())
+        msgs: list = []
+        wrencode.handle_slash_command("/resume 7", msgs, None)
+        self.assertEqual(msgs, [{"role": "user", "content": "hi"}])
+        wrencode.handle_slash_command("/resume 99", [], None)
+        self.assertIn("No session #99", sys.stdout.getvalue())
+        wrencode.handle_slash_command("/search hi", [], None)
+        self.assertIn("hi there", sys.stdout.getvalue())
+        self.store.search.assert_called_with(mock.ANY, "hi")
+
+    def test_without_the_store_the_commands_explain(self):
+        with mock.patch.object(wrencode, "_STORE", None):
+            wrencode.handle_slash_command("/sessions", [], None)
+        self.assertIn("history.json", sys.stdout.getvalue())
+
+    def test_a_failed_save_is_reported_not_raised(self):
+        self.store.save.side_effect = RuntimeError("db gone")
+        wrencode.save_history([])
+        self.assertIn("Could not save history", sys.stdout.getvalue())
 
 
 class TestComplete(unittest.TestCase):

@@ -24,6 +24,7 @@ Read `wrencode.py` top to bottom to understand the agent; the files beside it ar
 |`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
 |`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
 |`wrencode_sandbox.py`   |The `python` tool's sandbox, on pydantic-monty                    |
+|`wrencode_history.py`   |Conversation history in Postgres: a server or embedded PGlite     |
 |`wrencode_synthesize.py`|The `synthesize` subcommand                                       |
 
 Each module imports only the ones below it in this table's dependency order (`wrencode.py` → backends/configure/sdk/synthesize → ui), so the loop can be read without the rest.
@@ -299,7 +300,8 @@ seeing and approving the real action, and opening an untrusted repository is saf
 - **Keys go only to their backend.** Fixed hosts for Anthropic, OpenAI, OpenRouter,
   NanoGPT and Bedrock; the URL you configured for openai-compatible, Ollama and the
   local proxy. Saved keys, the conversation history and model caches are owner-only
-  files (`0600`) under `~/.wrencode`. The Agent SDK backend runs with the API key
+  files (`0600`) under `~/.wrencode`; the embedded Postgres data and socket
+  directories are owner-only (`0700`). The Agent SDK backend runs with the API key
   only, subscription credentials blanked.
 - **The `python` tool is sandboxed** in pydantic-monty: no network, shell or
   environment, a read-only workspace, and time and memory limits.
@@ -494,7 +496,10 @@ This publishes release assets:
 |`/help`       |Show available commands                       |
 |`/model`      |Switch model, or `/model <id>` to set it directly|
 |`/backend`, `/configure`|Switch backend, model and API key   |
-|`/clear` or `/c`|Clear conversation history                  |
+|`/clear` or `/c`|Clear the conversation (a new session with Postgres history)|
+|`/sessions`   |List this project's conversations (Postgres history)|
+|`/resume <id>`|Continue an earlier conversation             |
+|`/search <text>`|Search past conversations                  |
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 
@@ -508,7 +513,9 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`MODEL`                      |backend-dependent      |Model path or ID                  |
 |`WRENCODE_CONFIG_DIR`        |`~/.wrencode`          |Dir for `config.json` (saved backend/key)|
 |`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
-|`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file path |
+|`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file, without the Postgres store|
+|`WRENCODE_DATABASE_URL`      |-                      |Postgres URL for history; unset, embedded PGlite is used|
+|`WRENCODE_PGLITE_START_TIMEOUT`|`60`                 |Seconds to wait for the embedded PGlite to start|
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
@@ -540,11 +547,33 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 
 ## History
 
-Conversation history is persisted to `~/.wrencode/history.json` by default. It is restored automatically on next launch.
+By default the conversation is saved to `~/.wrencode/history.json` and restored on
+the next launch (`WRENCODE_HISTORY_FILE` moves it; `/c` clears it).
 
-To override the history file location, set `WRENCODE_HISTORY_FILE` to a custom path.
+With the `history` extra, conversations live in Postgres instead, as sessions per
+project: wrencode resumes the project's latest session on launch, `/clear` starts a
+new one and keeps the old, `/sessions` lists them, `/resume <id>` continues one and
+`/search <text>` looks inside all of them (Postgres full-text search).
 
-To clear history: use `/c` in the session, or delete `~/.wrencode/history.json` (or your override path).
+```bash
+pip install 'wrencode[history]'   # psycopg; Node.js is needed for the embedded engine
+```
+
+Two engines, both real Postgres:
+
+- **Embedded PGlite** (the default): Postgres compiled to WebAssembly, run by Node.js
+  with a persistent data directory under `~/.wrencode/pglite`. The first launch runs
+  `npm install` there for the pinned `@electric-sql/pglite` packages; after that it
+  starts in about a second, serves a Unix socket in an owner-only directory, and
+  stops when wrencode exits. It is a single-user database: one wrencode at a time
+  holds it, and a second one started meanwhile says so and uses `history.json`
+  for that run.
+- **A Postgres server**: set `WRENCODE_DATABASE_URL=postgres://user:pass@host/db`
+  and the same schema is created there.
+
+Each session stores its message list exactly as the backend format needs it
+(JSONB), replaced whole on every save, so switching backends mid-history behaves as
+it always has. Headless runs (`-p`) never read or write history.
 
 ## License
 

@@ -109,6 +109,7 @@ if os.getcwd() != _SCRIPT_DIR:
 # The other modules read environment defaults at import, so they come after .env.
 import wrencode_backends as backends
 import wrencode_configure as configure
+import wrencode_history as history
 import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
@@ -1089,6 +1090,12 @@ def _parse_response(
 # -----------------------------------------------------------------------------------------------
 # History management
 # -----------------------------------------------------------------------------------------------
+# The Postgres store and the session the interactive loop is in, when the
+# [history] extra is installed (see wrencode_history); otherwise history.json.
+_STORE: history.Store | None = None
+_SESSION_ID: int | None = None
+
+
 def history_file_path() -> pathlib.Path:
     """Return the history file path from env override or user-level default."""
     if p := os.environ.get("WRENCODE_HISTORY_FILE"):
@@ -1097,14 +1104,24 @@ def history_file_path() -> pathlib.Path:
 
 
 def load_history() -> list[dict[str, Any]]:
-    """Load conversation history from the JSON history file."""
+    """Load the current session's messages from the store, else the JSON history file."""
+    if _STORE is not None and _SESSION_ID is not None:
+        return _STORE.load(_SESSION_ID)
     with contextlib.suppress(Exception), open(history_file_path()) as f:
         return list(json.load(f))
     return []
 
 
 def save_history(messages: list[dict[str, Any]]) -> None:
-    """Persist conversation history to the JSON history file."""
+    """Persist the conversation: the whole list, to the store or the JSON history file."""
+    if _STORE is not None and _SESSION_ID is not None:
+        try:
+            _STORE.save(_SESSION_ID, messages)
+        except Exception as err:  # the conversation is still in memory; say so
+            print(
+                f"{YELLOW}Could not save history to Postgres: {ui.visible(str(err))}{RESET}"
+            )
+        return
     with contextlib.suppress(Exception):
         p = history_file_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1703,10 +1720,22 @@ def handle_slash_command(
         save_history(messages)
         return "quit", configure._MLX_UNCHANGED
     if cmd == "/clear":
+        global _SESSION_ID
         ui.SESSION_AUTO_APPROVE = False  # "allow all" ends with the conversation
         messages.clear()
-        save_history(messages)
-        ui.print_system("Cleared")
+        if _STORE is not None:  # the old session stays in the store; start a new one
+            _SESSION_ID = _STORE.new_session(
+                str(workspace_root()), backends.BACKEND, backends.MODEL
+            )
+            ui.print_system(f"Cleared (new session #{_SESSION_ID})")
+        else:
+            save_history(messages)
+            ui.print_system("Cleared")
+        return "handled", configure._MLX_UNCHANGED
+    if cmd in {"/sessions", "/resume", "/search"} or cmd.startswith(
+        ("/resume ", "/search ")
+    ):
+        _history_command(cmd, messages)
         return "handled", configure._MLX_UNCHANGED
     if cmd == "/compact":
         if (
@@ -1894,6 +1923,53 @@ def run_headless(
     return 1 if is_error else 0
 
 
+def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
+    """/sessions, /resume <id> and /search <text>, over the Postgres history store."""
+    global _SESSION_ID
+    if _STORE is None:
+        ui.print_system(
+            "History is in history.json. For sessions and search, install the Postgres "
+            "store: pip install 'wrencode[history]' (see README, History)."
+        )
+        return
+    ws = str(workspace_root())
+    word, _, arg = cmd.partition(" ")
+    arg = arg.strip()
+    if word == "/sessions":
+        rows = _STORE.sessions(ws)
+        for r in rows:
+            mark = "›" if r["id"] == _SESSION_ID else " "
+            when = r["updated_at"].strftime("%Y-%m-%d %H:%M")
+            title = ui.visible(r["title"]) or "(empty)"
+            ui.print_system(
+                f"{mark} #{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
+            )
+        ui.print_system("/resume <id> continues one; /search <text> looks inside them.")
+    elif word == "/resume":
+        if not arg.isdigit():
+            ui.print_system("Usage: /resume <id>  (ids from /sessions)")
+            return
+        if not any(r["id"] == int(arg) for r in _STORE.sessions(ws, limit=1000)):
+            ui.print_system(f"No session #{arg} for this workspace.")
+            return
+        save_history(messages)
+        _SESSION_ID = int(arg)
+        messages[:] = load_history()
+        chats = sum(1 for m in messages if m.get("role") == "user")
+        ui.print_system(f"Resumed session #{_SESSION_ID} ({chats} chats)")
+    else:
+        if not arg:
+            ui.print_system("Usage: /search <text>")
+            return
+        hits = _STORE.search(ws, arg)
+        if not hits:
+            ui.print_system("No matches.")
+        for h in hits:
+            ui.print_system(
+                f"#{h['session_id']:<5} {h['role']:<9} {ui.visible(h['text'])}"
+            )
+
+
 def _warn_dotenv_ignored() -> None:
     if _DOTENV_IGNORED:
         names = ", ".join(sorted(set(_DOTENV_IGNORED)))
@@ -1927,7 +2003,9 @@ def print_help() -> None:
     print("synthesize               (no args) pick from this project's chat history")
     print("synthesize diff|log ...  diff = divergences only; log = decision timeline")
     print("synthesize --out FILE    write the result to FILE; --all skips the picker\n")
-    print("Slash commands: /backend /model /c /compact /q  (see /help in session)")
+    print(
+        "Slash commands: /backend /model /c /compact /sessions /resume /search /q  (see /help)"
+    )
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
         "(e.g. ANTHROPIC_API_KEY) take precedence over saved config."
@@ -2021,6 +2099,18 @@ def main() -> None:
     system_prompt = build_system_prompt()
     for path in find_agents_files():
         print(f"{DIM}Loaded {path}{RESET}")
+    global _STORE, _SESSION_ID
+    _STORE = history.open_store()
+    if _STORE is not None:
+        ws = str(workspace_root())
+        _SESSION_ID = _STORE.latest_session(ws) or _STORE.new_session(
+            ws, backends.BACKEND, backends.MODEL
+        )
+    elif history.UNAVAILABLE_REASON:
+        print(
+            f"{YELLOW}Postgres history unavailable ({ui.visible(history.UNAVAILABLE_REASON)}); "
+            f"using history.json{RESET}"
+        )
     messages = load_history()
     if backends.BACKEND == backends.AGENT_SDK_BACKEND:
         if agent_sdk._load_agent_sdk_session_id(workspace_root()):
@@ -2029,7 +2119,8 @@ def main() -> None:
             )
     elif messages:
         chats = sum(1 for m in messages if m.get("role") == "user")
-        print(f"{DIM}Restored {chats} chats{RESET}")
+        where = f"session #{_SESSION_ID} with " if _STORE is not None else ""
+        print(f"{DIM}Restored {where}{chats} chats{RESET}")
 
     while True:
         try:
@@ -2071,6 +2162,8 @@ def main() -> None:
             else:
                 print(f"{DIM}(set WRENCODE_DEBUG=1 for the full traceback){RESET}")
     close_agent_sdk_session()
+    if _STORE is not None:
+        _STORE.close()
 
 
 if __name__ == "__main__":

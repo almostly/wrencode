@@ -115,13 +115,16 @@ SLASH_COMMANDS: dict[str, str] = {
     "/backend": "switch backend and model",
     "/configure": "same as /backend",
     "/compact": "summarize history to free context",
-    "/clear": "clear the conversation",
+    "/clear": "clear the conversation (starts a new session)",
+    "/sessions": "list this project's conversations",
+    "/resume": "continue one: /resume <id>",
+    "/search": "search past conversations: /search <text>",
     "/help": "list commands",
     "/quit": "save history and exit",
 }
 # Short aliases: accepted and highlighted, but kept out of the menu.
 SLASH_ALIASES: dict[str, str] = {"/c": "/clear", "/q": "/quit", "/exit": "/quit"}
-MAX_SLASH_MENU = 8
+MAX_SLASH_MENU = 10
 
 
 def slash_matches(text: str) -> list[str]:
