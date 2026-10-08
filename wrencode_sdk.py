@@ -245,7 +245,7 @@ class AgentSDKSession:
         self._spinner.stop()
         self._esc.stop()  # confirm() reads stdin; the Escape listener must let go
         try:
-            body = format_sdk_tool_action(name, inp)
+            body = ui.visible(format_sdk_tool_action(name, inp))
             first, _, rest = body.partition("\n")
             print(f"{YELLOW}?{RESET} {first}")
             for line in rest.split("\n"):
@@ -348,9 +348,9 @@ class AgentSDKSession:
                     if not msg.error:  # an API error is reported with the result
                         ui.print_agent_message(block.text)
                 elif isinstance(block, ToolUseBlock):
-                    first = format_sdk_tool_action(block.name, block.input).split("\n")[
-                        0
-                    ]
+                    first = ui.visible(
+                        format_sdk_tool_action(block.name, block.input)
+                    ).split("\n")[0]
                     mark = f"{DIM}↳" if nested else f"{GREEN}⏺"  # ↳ = subagent
                     print(f"{mark}{RESET}{DIM} {first}{RESET}")
             if msg.error:
@@ -359,7 +359,9 @@ class AgentSDKSession:
         if isinstance(msg, UserMessage) and isinstance(msg.content, list):
             for block in msg.content:
                 if isinstance(block, ToolResultBlock):
-                    lines = _sdk_result_text(block.content).strip().split("\n")
+                    lines = (
+                        ui.visible(_sdk_result_text(block.content)).strip().split("\n")
+                    )
                     color = RED if block.is_error else DIM
                     head = lines[0][:200] if lines and lines[0] else "(empty)"
                     more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""

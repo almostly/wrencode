@@ -274,6 +274,42 @@ fails with a context-length error, WrenCode compacts and retries once.
 Set `WRENCODE_CONTEXT_TOKENS` to your model's window, especially for local
 models with small ones. `/compact` summarizes on demand.
 
+## Security
+
+wrencode reads untrusted files and runs commands on your machine, so the goal is
+narrower than "can't be attacked": nothing changes outside the sandbox without you
+seeing and approving the real action, and opening an untrusted repository is safe.
+
+- **Approvals show what will run.** Every write, edit and shell command asks first.
+  Control characters and escape sequences in a command, a file or a model reply are
+  displayed as `^[`, `^M` and so on, never interpreted, so nothing can redraw the
+  screen or hide part of a command. Writes under a hidden path (`.git/hooks`,
+  `.github/workflows`, dotfiles) are flagged. `--yes` turns the prompts off; use it
+  only in a sandbox you can throw away.
+- **File tools stay in the workspace.** Paths are resolved (symlinks followed) and
+  must land inside the workspace root unless `WRENCODE_UNRESTRICTED_PATHS=1`.
+  `grep` passes the pattern and path as arguments, never as flags.
+- **A project's `.env` can't reconfigure the agent.** It may set `*_API_KEY` and
+  `ANTHROPIC_WORKSPACE_ID` only. The backend, any server URL, auto-approve, and the
+  config, history and workspace locations come from your shell or the `.env` beside
+  `wrencode.py`; names a project `.env` tried to set are reported at startup.
+- **`AGENTS.md` / `CLAUDE.md` are prompt input.** A repository's instructions go into
+  the system prompt by design, which means a repository can steer the agent. The
+  approval prompts are the control; the files loaded are listed at startup.
+- **Keys go only to their backend.** Fixed hosts for Anthropic, OpenAI, OpenRouter,
+  NanoGPT and Bedrock; the URL you configured for openai-compatible, Ollama and the
+  local proxy. Saved keys, the conversation history and model caches are owner-only
+  files (`0600`) under `~/.wrencode`. The Agent SDK backend runs with the API key
+  only, subscription credentials blanked.
+- **The `python` tool is sandboxed** in pydantic-monty: no network, shell or
+  environment, a read-only workspace, and time and memory limits.
+- **Releases are verifiable.** Each binary is published with a SHA-256 checksum that
+  `install.sh` checks. Hosted backends are reached over TLS with certificate
+  verification. wrencode has no runtime dependencies beyond the standard library.
+
+Please report security issues privately through the repository's GitHub security
+advisories rather than in a public issue.
+
 ## Installation
 
 ### Option 1: Standalone binary (recommended)

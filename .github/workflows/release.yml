@@ -60,7 +60,15 @@ jobs:
       - name: Rename artifact for platform
         run: mv "dist/wrencode${{ matrix.bin_ext }}" "dist/${{ matrix.artifact_name }}"
 
+      - name: Publish a SHA-256 checksum beside the binary (install.sh verifies it)
+        run: |
+          f="dist/${{ matrix.artifact_name }}"
+          (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | awk '{print $1}' > "$f.sha256"
+          cat "$f.sha256"
+
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.artifact_name }}
+          files: |
+            dist/${{ matrix.artifact_name }}
+            dist/${{ matrix.artifact_name }}.sha256

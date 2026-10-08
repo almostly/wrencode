@@ -17,6 +17,9 @@ on:
           - pypi
         default: testpypi
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest

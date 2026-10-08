@@ -660,7 +660,7 @@ def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
+            body = ui.visible(e.read().decode(errors="replace"))
             if e.code in {429, 500, 502, 503, 504} and attempt < HTTP_RETRIES:
                 print(
                     f"{YELLOW}HTTP {e.code}, retrying in {wait}s{RESET}",

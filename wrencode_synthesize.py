@@ -394,7 +394,7 @@ def _first_user_prompt(path: str) -> str:
                     continue
                 turn = _record_to_turn(o)
                 if turn and turn["role"] == "user":
-                    return " ".join(turn["text"].split())
+                    return ui.visible(" ".join(turn["text"].split()))
     except OSError:
         pass
     return "(no prompt found)"

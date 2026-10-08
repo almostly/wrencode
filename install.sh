@@ -60,12 +60,35 @@ fi
 # -----------------------------------------------------------------------------------------------
 say "Downloading $asset ($VERSION)..."
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT INT TERM
+trap 'rm -f "$tmp" "$tmp.sha256"' EXIT INT TERM
 dl "$url" "$tmp" || err "download failed: $url"
 
 # GitHub serves an HTML page when an asset is missing; reject that.
 if head -c 64 "$tmp" | grep -qi '<!doctype\|<html'; then
   err "release asset not found ($asset @ $VERSION). Has a release been published?"
+fi
+
+# -----------------------------------------------------------------------------------------------
+# Verify the SHA-256 published with the release (releases before 0.4 have none)
+# -----------------------------------------------------------------------------------------------
+if dl "$url.sha256" "$tmp.sha256" 2>/dev/null; then
+  want="$(cut -d' ' -f1 "$tmp.sha256" | tr -d '[:space:]')"
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+  else
+    got=""
+  fi
+  if [ -z "$got" ]; then
+    say "⚠  Neither sha256sum nor shasum found; skipping checksum verification."
+  elif [ "$got" != "$want" ]; then
+    err "checksum mismatch for $asset: expected $want, got $got"
+  else
+    say "✓ Checksum verified"
+  fi
+else
+  say "⚠  No checksum published for $asset @ $VERSION; skipping verification."
 fi
 
 # -----------------------------------------------------------------------------------------------

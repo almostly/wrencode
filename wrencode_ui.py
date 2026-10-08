@@ -81,6 +81,22 @@ def colors_enabled() -> bool:
     return sys.stdout.isatty()
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # keeps \t and \n
+
+
+def visible(text: str) -> str:
+    """Show control characters as ^X (Escape as ^[) instead of letting the terminal act on them.
+
+    Model output, file contents and command output are untrusted; a carriage
+    return or escape sequence in them could redraw the screen or hide part of a
+    command from the approval prompt.
+    """
+    return _CONTROL_CHARS.sub(
+        lambda m: "^?" if m.group() == "\x7f" else f"^{chr(ord(m.group()) ^ 0x40)}",
+        text,
+    )
+
+
 def print_system(text: str, *, end: str = "\n") -> None:
     """Print slash-command / configure feedback in banner cyan."""
     s = f"{BOLD}{BRIGHT_CYAN}" if colors_enabled() else ""
@@ -585,7 +601,7 @@ def render_markdown(text: str) -> str:
 
 def print_agent_message(text: str) -> None:
     """Print the agent response in muted grey text — no label, no box."""
-    for line in render_markdown(text).split("\n"):
+    for line in render_markdown(visible(text)).split("\n"):
         print(f"{AGENT_TEXT}{line}{RESET}")
     print()
 

@@ -65,20 +65,46 @@ try:
 except ImportError:
     pass
 
-# Load .env (next to this script, then the current directory); real env vars win.
-for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
-    _env_path = os.path.join(_dir, ".env")
-    if os.path.exists(_env_path):
-        with open(_env_path) as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if not _line or _line.startswith("#") or "=" not in _line:
-                    continue
-                _line = _line.removeprefix("export ")
-                _k, _v = _line.split("=", 1)
-                with contextlib.suppress(ValueError):  # malformed quoting: raw value
-                    _v = shlex.split(_v)[0] if _v else _v
-                os.environ.setdefault(_k.strip(), _v)
+# What a project's own .env may set: credentials for the backends, nothing else.
+# Anything that steers the agent (BACKEND, WRENCODE_AUTO_APPROVE, a *_BASE_URL,
+# WRENCODE_CONFIG_DIR, WRENCODE_WORKSPACE, ...) comes only from the real environment
+# or the .env beside this script, so cloning a repository can't reconfigure wrencode.
+DOTENV_PROJECT_KEYS = re.compile(r"^[A-Z0-9_]*_API_KEY$|^ANTHROPIC_WORKSPACE_ID$")
+_DOTENV_IGNORED: list[
+    str
+] = []  # names a project .env tried to set; reported at startup
+
+
+def load_dotenv(path: str, *, trusted: bool) -> list[str]:
+    """Load KEY=VALUE lines from a .env file into the environment; real variables win.
+
+    A trusted file (next to this script) may set anything. A project file may only
+    set the names DOTENV_PROJECT_KEYS allows; the others are returned, not applied.
+    """
+    skipped: list[str] = []
+    try:
+        lines = pathlib.Path(path).read_text().splitlines()
+    except OSError:
+        return skipped
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key = key.strip()
+        with contextlib.suppress(ValueError):  # malformed quoting: raw value
+            value = shlex.split(value)[0] if value else value
+        if not trusted and not DOTENV_PROJECT_KEYS.match(key):
+            skipped.append(key)
+            continue
+        os.environ.setdefault(key, value)
+    return skipped
+
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_SCRIPT_DIR, ".env"), trusted=True)
+if os.getcwd() != _SCRIPT_DIR:
+    _DOTENV_IGNORED = load_dotenv(os.path.join(os.getcwd(), ".env"), trusted=False)
 
 # The other modules read environment defaults at import, so they come after .env.
 import wrencode_backends as backends
@@ -434,7 +460,7 @@ def grep(args: dict[str, Any]) -> str:
     tool = rg or grep_bin
     assert tool is not None  # guaranteed by the check above
     cmd = (
-        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, scope]
+        [tool, "-n", "--color", "never", "--no-heading", "-e", pat, "--", scope]
         if rg
         else [tool, "-R", "-n", "-I", "--", pat, scope]
     )
@@ -514,7 +540,7 @@ def bash(args: dict[str, Any]) -> str:
             assert proc.stdout is not None
             for line in proc.stdout:
                 output_lines.append(line)
-                print(f"{DIM}│ {line.rstrip()}{RESET}", flush=True)
+                print(f"{DIM}│ {ui.visible(line.rstrip())}{RESET}", flush=True)
 
     t = threading.Thread(target=reader, daemon=True)
     t.start()
@@ -799,6 +825,13 @@ def normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _hidden_path_note(path: Any) -> str:
+    """A warning for paths under a dot-directory or dotfile: hooks, workflows, rc files."""
+    parts = pathlib.PurePath(str(path)).parts
+    hidden = any(p.startswith(".") and p not in {".", ".."} for p in parts)
+    return "  ⚠ hidden/config path" if hidden else ""
+
+
 def format_tool_action(name: str, args: dict[str, Any]) -> str:
     """Human-readable summary of what a tool call will do."""
     args = normalize_tool_args(name, args)
@@ -819,12 +852,12 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
         lines = content.count("\n") + (1 if content else 0)
         preview = content[:160].replace("\n", "\\n")
         suffix = "..." if len(content) > 160 else ""
-        return f"write {path}  ({lines} lines)\n  {preview}{suffix}"
+        return f"write {path}{_hidden_path_note(path)}  ({lines} lines)\n  {preview}{suffix}"
     if name == "edit":
         path = args.get("path", "?")
         old = str(args.get("old", ""))[:80].replace("\n", "\\n")
         new = str(args.get("new", ""))[:80].replace("\n", "\\n")
-        return f"edit {path}\n  - {old}\n  + {new}"
+        return f"edit {path}{_hidden_path_note(path)}\n  - {old}\n  + {new}"
     if name == "glob":
         return f"glob {args.get('pat', args.get('pattern', '?'))}"
     if name == "grep":
@@ -841,8 +874,12 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
 
 
 def print_tool_action(name: str, args: dict[str, Any]) -> None:
-    """Print a tool call as plain text — no background boxes."""
-    body = format_tool_action(name, args)
+    """Print a tool call as plain text — no background boxes.
+
+    Control characters are shown, not interpreted, so what the approval prompt
+    displays is exactly what would run.
+    """
+    body = ui.visible(format_tool_action(name, args))
     ui._AGENT_LOCAL.last_action = body
     first, _, rest = body.partition("\n")
     print(f"{GREEN}⏺{RESET}{DIM} {first}{RESET}")
@@ -853,7 +890,7 @@ def print_tool_action(name: str, args: dict[str, Any]) -> None:
 
 def print_tool_result(result: str) -> None:
     """Print tool output with enough context to see what happened."""
-    lines = result.split("\n")
+    lines = ui.visible(result).split("\n")
     if ui._agent_tag():  # parallel agents: one line each, or the screen floods
         more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
         print(f"{DIM}⎿ {lines[0][:160] or '(empty)'}{more}{RESET}")
@@ -1071,8 +1108,10 @@ def save_history(messages: list[dict[str, Any]]) -> None:
     with contextlib.suppress(Exception):
         p = history_file_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w") as f:
             json.dump(messages, f)
+        os.chmod(p, 0o600)  # a file created earlier with a wider mode
 
 
 def _transcript(messages: list[dict[str, Any]], budget_chars: int) -> str:
@@ -1221,7 +1260,7 @@ def git_context() -> str:
     """Return a formatted git status string if inside a git repository."""
     with contextlib.suppress(Exception):
         r = subprocess.run(
-            ["git", "status", "--short", "--branch"],
+            ["git", "-c", "core.fsmonitor=false", "status", "--short", "--branch"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -1760,6 +1799,7 @@ def run_headless(
     cost_usd = 0.0
     with contextlib.redirect_stdout(sys.stderr):
         try:
+            _warn_dotenv_ignored()
             configure.resolve_configuration()
             _MLX_STATE = backends.load_model()
             system_prompt = build_system_prompt()
@@ -1811,7 +1851,7 @@ def run_headless(
             error = "configuration error (see stderr)"
         except Exception as err:  # noqa: BLE001 — reported in the result
             error = str(err)
-            print(f"{RED}Error: {error}{RESET}")
+            print(f"{RED}Error: {ui.visible(error)}{RESET}")
         finally:
             if sdk is not None:
                 sdk.close()
@@ -1852,6 +1892,15 @@ def run_headless(
     elif result:
         print(result)
     return 1 if is_error else 0
+
+
+def _warn_dotenv_ignored() -> None:
+    if _DOTENV_IGNORED:
+        names = ", ".join(sorted(set(_DOTENV_IGNORED)))
+        print(
+            f"{YELLOW}Ignored from ./.env: {names}. A project's .env may only set "
+            f"*_API_KEY and ANTHROPIC_WORKSPACE_ID; set the rest in your shell.{RESET}"
+        )
 
 
 def print_help() -> None:
@@ -1961,6 +2010,7 @@ def main() -> None:
         verify = _arg_value(args, "--verify") or ""
         raise SystemExit(run_headless(prompt, fmt, int(turns), schema, verify))
 
+    _warn_dotenv_ignored()
     configure.resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
@@ -2008,7 +2058,7 @@ def main() -> None:
             break
         except Exception as err:  # noqa: BLE001 — shown to the user; the session goes on
             msg = str(err)
-            print(f"{RED}Error: {msg}{RESET}")
+            print(f"{RED}Error: {ui.visible(msg)}{RESET}")
             if backends.BACKEND == "ollama" and (
                 "not found" in msg.lower() or "404" in msg
             ):
