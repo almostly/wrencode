@@ -1333,6 +1333,8 @@ def bash(args: dict[str, Any]) -> str:
     if not timed_out:
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=2.0)
+    if proc.stdout is not None:
+        proc.stdout.close()
     return "".join(output_lines).strip() or "(empty)"
 
 

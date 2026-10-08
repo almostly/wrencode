@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1721,12 +1722,28 @@ class TestCertifiTrustStore(unittest.TestCase):
 
     def test_ssl_cert_file_points_at_existing_bundle(self):
         # certifi is a build dep of the binary; if it's importable, the startup
-        # block must have set SSL_CERT_FILE to a real CA bundle file.
+        # block must set SSL_CERT_FILE to a real CA bundle file. Import in a
+        # fresh process with the variable unset: the running test process may
+        # have inherited one (corporate or proxy CA bundles), which the startup
+        # block rightly leaves alone.
         try:
             import certifi
         except ImportError:
             self.skipTest("certifi not installed in this environment")
-        cert_file = os.environ.get("SSL_CERT_FILE", "")
+        env = {k: v for k, v in os.environ.items() if k != "SSL_CERT_FILE"}
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os, wrencode; print(os.environ.get('SSL_CERT_FILE', ''))",
+            ],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cert_file = out.stdout.strip()
         self.assertEqual(cert_file, certifi.where())
         self.assertTrue(os.path.exists(cert_file))
 

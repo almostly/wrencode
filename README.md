@@ -28,6 +28,7 @@ saved choice, e.g. for CI.
 |`nanogpt`     |Any model via NanoGPT                   |binary + source       |
 |`ollama`      |Local models via a running `ollama serve`|binary + source     |
 |`openai-compatible`|vLLM, llama.cpp, Hugging Face, any OpenAI-compatible server|binary + source|
+|`bedrock`     |Any model via AWS Bedrock Converse (AWS credentials)|binary + source|
 |`local`       |Local proxy via Anthropic-compatible API|binary + source       |
 |`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
 |`mlx`         |Apple Silicon via MLX                   |source install, macOS |
@@ -218,6 +219,8 @@ chmod +x install.sh
 
 Manual install (fallback): download the right binary from GitHub Releases, make it executable, and move it into your `PATH`.
 
+Windows: download `wrencode-windows-x64.exe` from GitHub Releases and put it on your `PATH`.
+
 macOS Apple Silicon:
 
 ```bash
@@ -344,6 +347,7 @@ This publishes release assets:
 - `wrencode-linux-x64`
 - `wrencode-macos-x64`
 - `wrencode-macos-arm64`
+- `wrencode-windows-x64.exe`
 
 ## Slash Commands
 
