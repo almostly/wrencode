@@ -29,12 +29,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
-# flake8: noqa: E501, E203
-
 import ast
-import difflib
 import contextlib
 import datetime
+import difflib
 import getpass
 import glob as globlib
 import hashlib
@@ -56,7 +54,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 # The PyInstaller single-file binary ships no system CA trust store, so urllib's
 # TLS verification fails out of the box ("CERTIFICATE_VERIFY_FAILED") on a clean
@@ -64,7 +62,7 @@ from typing import Any, Callable, Optional
 # defaults at it before any request. Soft import keeps pip/uvx installs
 # dependency-free; setdefault preserves any user-provided override.
 try:
-    import certifi  # ty: ignore[unresolved-import]
+    import certifi
 
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
     os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
@@ -80,8 +78,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                 _line = _line.strip()
                 if not _line or _line.startswith("#") or "=" not in _line:
                     continue
-                if _line.startswith("export "):
-                    _line = _line[len("export ") :]
+                _line = _line.removeprefix("export ")
                 _k, _v = _line.split("=", 1)
                 try:
                     _v = shlex.split(_v)[0] if _v else _v
@@ -99,13 +96,23 @@ WRENCODE_VERSION = "0.2.0"
 #   local-proxy - Anthropic-compatible server already running on localhost
 #   local-ml    - in-process model weights (mlx / transformers); source install only,
 #                 since the standalone binary can't bundle the ML stack
+#   agent-sdk   - Claude Agent SDK: Claude Code's own agent loop and tools, billed
+#                 to an Anthropic API key; source install with claude-agent-sdk
 BACKEND_SPECS: dict[str, dict[str, str]] = {
     "anthropic": {
         "kind": "api",
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-opus-5-5",
         "key_env": "ANTHROPIC_API_KEY",
         "api_base": "https://api.anthropic.com/v1/messages",
         "label": "Anthropic Claude (API key)",
+    },
+    "claude-agent-sdk": {
+        "kind": "agent-sdk",
+        "model": "claude-opus-5-5",
+        "key_env": "ANTHROPIC_API_KEY",
+        # One-shot helpers (/compact summaries, synthesize) use the Messages API.
+        "api_base": "https://api.anthropic.com/v1/messages",
+        "label": "Claude Agent SDK — Claude Code's agent loop (API key, source install)",
     },
     "openai": {
         "kind": "api",
@@ -170,21 +177,17 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
-# Curated model lists for arrow-key pickers (OpenRouter/NanoGPT/Ollama are fetched live).
+# Offline/fallback model lists used only when a live /models fetch fails.
+# Anthropic, OpenAI, OpenRouter, NanoGPT, and Ollama are fetched from the
+# provider when a key (or local server) is available.
 BACKEND_MODELS: dict[str, list[str]] = {
     "anthropic": [
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-3-5-haiku-latest",
-        "claude-3-5-sonnet-latest",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
     ],
     "openai": [
         "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4-turbo",
-        "o1-mini",
-        "o1",
     ],
     "openrouter": [
         "anthropic/claude-3-haiku",
@@ -232,7 +235,12 @@ LOCAL_ML_BACKENDS: frozenset[str] = frozenset(
 # Backends whose responses use the Anthropic Messages format (content blocks,
 # tool_use, usage). Bedrock speaks the model-agnostic Converse API instead, so
 # it has its own format/parse path (see _bedrock_converse_call).
-ANTHROPIC_FORMAT_BACKENDS: frozenset[str] = frozenset({"anthropic"})
+ANTHROPIC_FORMAT_BACKENDS: frozenset[str] = frozenset({"anthropic", "claude-agent-sdk"})
+AGENT_SDK_BACKEND = "claude-agent-sdk"
+# Backends authenticated with an Anthropic API key (and optional workspace id).
+ANTHROPIC_KEY_BACKENDS: frozenset[str] = frozenset({"anthropic", AGENT_SDK_BACKEND})
+# Backend kinds that need an API key prompted, saved, and verified.
+KEYED_KINDS: frozenset[str] = frozenset({"api", "agent-sdk"})
 # Backends that return JSON with native tool calls (vs. XML-in-text), parsed by
 # _parse_native_response. Bedrock/Converse is native too.
 NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset(
@@ -256,17 +264,22 @@ CONFIG_DIR = pathlib.Path(
 ).expanduser()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OPENROUTER_MODELS_CACHE = CONFIG_DIR / "openrouter_models.json"
+ANTHROPIC_MODELS_CACHE = CONFIG_DIR / "anthropic_models.json"
+OPENAI_MODELS_CACHE = CONFIG_DIR / "openai_models.json"
 # Project instruction files, in preference order per directory (see find_agents_files).
 AGENTS_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_AGENTS_MD_CHARS = 32_000
 NANOGPT_MODELS_CACHE = CONFIG_DIR / "nanogpt_models.json"
 
 # Populated by apply_backend() once configuration is resolved (see resolve_configuration).
-BACKEND = ""
-MODEL = ""
-API_KEY = ""
-API_BASE = ""
-AWS_REGION = ""
+BACKEND: str = ""
+MODEL: str = ""
+API_KEY: str = ""
+API_BASE: str = ""
+AWS_REGION: str = ""
+# Multi-workspace Anthropic API keys need this on every request
+# (anthropic-workspace-id). Workspace-scoped keys can leave it empty.
+ANTHROPIC_WORKSPACE_ID: str = ""
 LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
 
 # Backend libraries are imported lazily inside load_model(); the rest of the
@@ -279,15 +292,31 @@ torch: Any = None  # torch
 AutoModelForCausalLM: Any = None  # transformers.AutoModelForCausalLM
 AutoTokenizer: Any = None  # transformers.AutoTokenizer
 
-# Subagent state: the loaded model (set in main) and a recursion-depth guard.
+# Subagent state: the loaded model (set in main). Everything that differs per
+# agent lives in _AGENT_LOCAL, because parallel subagents run in threads:
+#   depth        subagent nesting depth (0 for the top-level agent)
+#   tag          "1", "2", "1.2"... set only in a parallel subagent's thread
+#   cancel       that parallel batch's cancel event
+#   last_action  the last tool call shown, repeated when approval is needed
 _MLX_STATE: Optional[tuple[Any, Any]] = None
-_SUBAGENT_DEPTH = 0
+_AGENT_LOCAL = threading.local()
 # Set by run_headless(--json-schema): the final answer must come through the
 # `respond` tool and match this JSON Schema. _STRUCTURED_RESULT holds it once accepted.
 RESPOND_TOOL = "respond"
 _OUTPUT_SCHEMA: Optional[dict[str, Any]] = None
 _STRUCTURED_RESULT: list[Any] = []
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
+# Task calls made in one reply run this many at a time; 1 runs them in order.
+MAX_PARALLEL_SUBAGENTS = int(os.environ.get("WRENCODE_MAX_PARALLEL_SUBAGENTS", "4"))
+
+
+def _subagent_depth() -> int:
+    return getattr(_AGENT_LOCAL, "depth", 0)
+
+
+def _agent_tag() -> str:
+    """This thread's parallel-subagent tag, or '' outside a parallel batch."""
+    return getattr(_AGENT_LOCAL, "tag", "")
 
 
 def _openai_compatible_base() -> str:
@@ -296,18 +325,47 @@ def _openai_compatible_base() -> str:
     return base.rstrip("/").removesuffix("/chat/completions")
 
 
-def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
+def _env_api_key(backend: str) -> str:
+    """The backend's key from the environment (or .env), unless /configure saved
+    a key that should override it (config "api_key_overrides_env")."""
+    key_env = BACKEND_SPECS[backend].get("key_env", "")
+    if not key_env:
+        return ""
+    cfg = load_config()
+    if (
+        cfg.get("backend") == backend
+        and cfg.get("api_key_overrides_env")
+        and cfg.get("api_key")
+    ):
+        return ""
+    return os.environ.get(key_env, "")
+
+
+def apply_backend(
+    backend: str,
+    model: str = "",
+    api_key: str = "",
+    anthropic_workspace_id: str = "",
+) -> None:
     """Set the module-level backend globals from a backend name plus overrides.
 
     Precedence for each value: explicit environment variable > saved/chosen
-    value > built-in default. Heavy backend imports are deferred to load_model().
+    value > built-in default. The one exception is an API key entered in
+    /configure to replace an environment key (see _env_api_key). Heavy backend
+    imports are deferred to load_model().
     """
     global BACKEND, MODEL, API_KEY, API_BASE, AWS_REGION, LOCAL_PORT
+    global ANTHROPIC_WORKSPACE_ID
     spec = BACKEND_SPECS[backend]
     BACKEND = backend
     MODEL = os.environ.get("MODEL") or model or spec["model"]
-    if spec["kind"] == "api":
-        API_KEY = os.environ.get(spec["key_env"]) or api_key or ""
+    ANTHROPIC_WORKSPACE_ID = (
+        (os.environ.get("ANTHROPIC_WORKSPACE_ID") or anthropic_workspace_id or "")
+        if backend in ANTHROPIC_KEY_BACKENDS
+        else ""
+    )
+    if spec["kind"] in KEYED_KINDS:
+        API_KEY = _env_api_key(backend) or api_key or ""
         API_BASE = spec["api_base"]
     elif spec["kind"] == "aws":
         # Bedrock: creds + region come from the AWS environment at request
@@ -322,7 +380,7 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
         API_BASE = f"{base}/v1/chat/completions"
     elif backend == "openai-compatible":
         # vLLM and llama-server accept any key unless started with one.
-        API_KEY = os.environ.get(spec["key_env"]) or api_key or "EMPTY"
+        API_KEY = _env_api_key(backend) or api_key or "EMPTY"
         API_BASE = f"{_openai_compatible_base()}/chat/completions"
     elif backend == "local":
         LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
@@ -337,6 +395,22 @@ def apply_backend(backend: str, model: str = "", api_key: str = "") -> None:
 # Constants & environment variables
 # -----------------------------------------------------------------------------------------------
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
+# Claude models think before answering and that counts toward max_tokens, so the
+# Claude backends get more room unless MAX_TOKENS is set explicitly.
+CLAUDE_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "16000"))
+# Optional reasoning effort for Claude models: low, medium, high, xhigh, or max.
+# Unset or unrecognized leaves the model's default (medium on Claude Opus 5.5).
+EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
+_EFFORT_LEVELS: dict[str, EffortLevel] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+CLAUDE_EFFORT: Optional[EffortLevel] = _EFFORT_LEVELS.get(
+    os.environ.get("WRENCODE_EFFORT", "").strip().lower()
+)
 HTTP_TIMEOUT = float(os.environ.get("WRENCODE_HTTP_TIMEOUT", "600"))
 HTTP_RETRIES = int(os.environ.get("WRENCODE_HTTP_RETRIES", "2"))
 # Auto-compaction: once the estimated prompt passes COMPACT_AT of the model's
@@ -424,15 +498,40 @@ def print_system(text: str, *, end: str = "\n") -> None:
 
 _INPUT_HISTORY: list[str] = []
 
+# Slash commands shown in the completion menu and /help, in display order.
+SLASH_COMMANDS: dict[str, str] = {
+    "/model": "switch model (or /model <id>)",
+    "/backend": "switch backend and model",
+    "/configure": "same as /backend",
+    "/compact": "summarize history to free context",
+    "/clear": "clear the conversation",
+    "/help": "list commands",
+    "/quit": "save history and exit",
+}
+# Short aliases: accepted and highlighted, but kept out of the menu.
+SLASH_ALIASES: dict[str, str] = {"/c": "/clear", "/q": "/quit", "/exit": "/quit"}
+MAX_SLASH_MENU = 8
+
+
+def slash_matches(text: str) -> list[str]:
+    """Commands that complete the /prefix being typed (empty once args start)."""
+    if not text.startswith("/") or " " in text:
+        return []
+    return [c for c in SLASH_COMMANDS if c.startswith(text)][:MAX_SLASH_MENU]
+
+
+def _is_slash_command(token: str) -> bool:
+    return token in SLASH_COMMANDS or token in SLASH_ALIASES
+
 
 def format_input_line(text: str) -> str:
-    """Render the ❯ prompt line; only the /command token is bold cyan while typing."""
+    """Render the ❯ prompt line; a known /command (or its prefix) is bold cyan."""
     if not colors_enabled():
         return f"❯ {text}"
     prompt = f"{BRIGHT_CYAN}❯{RESET} "
-    if not text.startswith("/"):
-        return prompt + text
     cmd, _, rest = text.partition(" ")
+    if not (_is_slash_command(cmd) or (not rest and slash_matches(cmd))):
+        return prompt + text
     s = f"{BOLD}{BRIGHT_CYAN}"
     line = prompt + s + cmd + RESET
     if rest:
@@ -459,8 +558,24 @@ def _read_input_char(fd: int) -> str:
     return first.decode("utf-8", errors="replace")
 
 
-def _redraw_input_line(text: str) -> None:
-    sys.stdout.write("\r\033[K" + format_input_line(text))
+def _redraw_input_line(
+    text: str, matches: Optional[list[str]] = None, sel: int = 0
+) -> None:
+    """Redraw the prompt line plus a completion menu below it, cursor kept on the line."""
+    line = format_input_line(text)
+    out = "\r\033[J" + line
+    for i, cmd in enumerate(matches or []):
+        desc = SLASH_COMMANDS.get(cmd, "")
+        if not colors_enabled():
+            out += f"\n{'>' if i == sel else ' '} {cmd:<12} {desc}"
+        elif i == sel:
+            out += f"\n  {BOLD}{BRIGHT_CYAN}{cmd:<12}{RESET} {desc}"
+        else:
+            out += f"\n  {DIM}{cmd:<12} {desc}{RESET}"
+    if matches:
+        col = 2 + len(text)  # "❯ " is two cells
+        out += f"\033[{len(matches)}A\r" + (f"\033[{col}C" if col else "")
+    sys.stdout.write(out)
     sys.stdout.flush()
 
 
@@ -503,8 +618,13 @@ def _read_tty_line(
     *,
     history: bool = False,
     redraw: Optional[Any] = None,
+    complete: bool = False,
 ) -> str:
-    """Read one line in cbreak mode; swallows arrow keys unless history=True."""
+    """Read one line in cbreak mode; swallows arrow keys unless history=True.
+
+    With complete=True, typing a /prefix shows matching slash commands below
+    the line: ↑↓ pick, Tab or → fills in, Enter runs the highlighted one.
+    """
     import termios
     import tty
 
@@ -512,9 +632,15 @@ def _read_tty_line(
     old = termios.tcgetattr(fd)
     buf: list[str] = []
     hist_idx = len(_INPUT_HISTORY)
+    sel = 0
+
+    def _matches() -> list[str]:
+        return slash_matches("".join(buf)) if complete else []
 
     def _redraw() -> None:
-        if redraw is not None:
+        if complete:
+            _redraw_input_line("".join(buf), _matches(), sel)
+        elif redraw is not None:
             redraw("".join(buf))
         else:
             sys.stdout.write("\r\033[K" + prompt + "".join(buf))
@@ -531,13 +657,30 @@ def _read_tty_line(
             key = _read_tty_key(fd)
             if not key:
                 raise EOFError
+            matches = _matches()
             if key == "enter":
+                text = "".join(buf).strip()
+                if matches and not _is_slash_command(text):
+                    text = matches[min(sel, len(matches) - 1)]
+                if complete:  # clear the menu, leave the final line
+                    _redraw_input_line(text)
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return "".join(buf).strip()
+                return text
+            if matches and key in {"\t", "right"}:
+                buf = list(matches[min(sel, len(matches) - 1)])
+                sel = 0
+                _redraw()
+                continue
+            if matches and key in {"up", "down"}:
+                step = -1 if key == "up" else 1
+                sel = (min(sel, len(matches) - 1) + step) % len(matches)
+                _redraw()
+                continue
             if key == "backspace":
                 if buf:
                     buf.pop()
+                    sel = 0
                     _redraw()
                 continue
             if key == "ctrl_c":
@@ -570,6 +713,7 @@ def _read_tty_line(
                 continue
             if len(key) == 1 and (key.isprintable() or key == "\t"):
                 buf.append(key)
+                sel = 0
                 _redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -582,7 +726,7 @@ def _remember_input(text: str) -> None:
 
 def _read_user_input_interactive() -> str:
     """TTY line editor with live slash-command coloring and history."""
-    text = _read_tty_line("", history=True, redraw=_redraw_input_line)
+    text = _read_tty_line("", history=True, complete=True)
     _remember_input(text)
     return text
 
@@ -1026,8 +1170,9 @@ def cancel_watch() -> Any:
 
 
 def check_cancelled() -> None:
-    """Raise UserCancelled if the user requested cancellation."""
-    if _CANCEL_REQUESTED.is_set():
+    """Raise UserCancelled if the user (or this agent's parallel batch) cancelled."""
+    batch = getattr(_AGENT_LOCAL, "cancel", None)
+    if _CANCEL_REQUESTED.is_set() or (batch is not None and batch.is_set()):
         raise UserCancelled()
 
 
@@ -1037,6 +1182,9 @@ def get_response_cancellable(
     mlx_state: Optional[tuple[Any, Any]],
 ) -> str:
     """Run get_response in a worker thread so Escape can interrupt blocking calls."""
+    if _agent_tag():  # a parallel subagent: the batch owner watches for Escape
+        check_cancelled()
+        return get_response(messages, system_prompt, mlx_state)
     if not sys.stdin.isatty():
         return get_response(messages, system_prompt, mlx_state)
 
@@ -1067,7 +1215,6 @@ def confirm(action: str = "") -> str:
     ``n`` declines and asks what to do differently. Auto-approve via
     WRENCODE_AUTO_APPROVE / --yes enables headless use and subagents.
     """
-    global _SESSION_AUTO_APPROVE
     if (
         os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes")
         or _SESSION_AUTO_APPROVE
@@ -1081,9 +1228,48 @@ def confirm(action: str = "") -> str:
             "cancelled: running headless without --yes, so this action can't be "
             "approved. Do what you can without it and say what is left to do."
         )
-    print(f"{DIM}  Enter/y   approve once{RESET}")
-    print(f"{DIM}  a         allow all for this session{RESET}")
-    print(f"{DIM}  n         decline{RESET}")
+    if _agent_tag():
+        return _confirm_from_subagent(action)
+    return _confirm_prompt()
+
+
+# One approval prompt at a time across parallel subagents.
+_APPROVAL_LOCK = threading.Lock()
+# The Escape listener of the running parallel batch, paused while a prompt reads stdin.
+_PARALLEL_ESC: Optional["_EscWatch"] = None
+
+
+def _confirm_from_subagent(action: str) -> str:
+    """Ask for approval on behalf of a parallel subagent.
+
+    Prompts take turns, the Escape listener lets go of stdin, and the other
+    agents' output is held until the answer is in, so the prompt stays readable.
+    """
+    with _APPROVAL_LOCK:
+        check_cancelled()
+        out = sys.stdout if isinstance(sys.stdout, _AgentStdout) else None
+        esc = _PARALLEL_ESC
+        if out is not None:
+            out.hold()
+        if esc is not None:
+            esc.stop()
+        try:
+            detail = getattr(_AGENT_LOCAL, "last_action", "") or action
+            print(f"{YELLOW}[{_agent_tag()}] needs approval:{RESET} {detail}")
+            return _confirm_prompt()
+        finally:
+            if esc is not None:
+                esc.start()
+            if out is not None:
+                out.release()
+
+
+def _confirm_prompt() -> str:
+    """The interactive approve / allow-all / decline prompt."""
+    global _SESSION_AUTO_APPROVE
+    print(f"{DIM}Enter/y   approve once{RESET}")
+    print(f"{DIM}a         allow all for this session{RESET}")
+    print(f"{DIM}n         decline{RESET}")
     while True:
         try:
             choice = input(f"{BLUE}❯{RESET} ").strip().lower()
@@ -1158,19 +1344,19 @@ def task(args: dict[str, Any]) -> str:
     Recursion is capped by MAX_SUBAGENT_DEPTH. For autonomous use run with
     --yes / WRENCODE_AUTO_APPROVE, else each sub-tool call still asks to confirm.
     """
-    global _SUBAGENT_DEPTH
-    if _SUBAGENT_DEPTH >= MAX_SUBAGENT_DEPTH:
+    depth = _subagent_depth()
+    if depth >= MAX_SUBAGENT_DEPTH:
         return f"error: max subagent depth ({MAX_SUBAGENT_DEPTH}) reached"
     prompt = _require_str(args, "prompt")
-    _SUBAGENT_DEPTH += 1
-    print(f"{CYAN}  ↳ subagent:{RESET}{DIM} {prompt[:70]}{RESET}")
+    _AGENT_LOCAL.depth = depth + 1
+    print(f"{CYAN}↳ subagent:{RESET}{DIM} {prompt[:70]}{RESET}")
     sub: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     try:
         run_agent_turn(sub, build_system_prompt(), _MLX_STATE, max_iters=12)
     finally:
-        _SUBAGENT_DEPTH -= 1
+        _AGENT_LOCAL.depth = depth
     texts = [flatten_content(m["content"]) for m in sub if m["role"] == "assistant"]
-    print(f"{CYAN}  ↳ subagent done{RESET}")
+    print(f"{CYAN}↳ subagent done{RESET}")
     return (texts[-1] if texts else "") or "(subagent produced no text output)"
 
 
@@ -1186,7 +1372,7 @@ def _respond_schema() -> Optional[dict[str, Any]]:
     Only the top-level agent gets it. A non-object output schema is wrapped as
     {"value": ...}, since tool arguments must be an object.
     """
-    if _OUTPUT_SCHEMA is None or _SUBAGENT_DEPTH:
+    if _OUTPUT_SCHEMA is None or _subagent_depth():
         return None
     if _OUTPUT_SCHEMA.get("type") == "object":
         return _OUTPUT_SCHEMA
@@ -1341,8 +1527,11 @@ TOOLS: dict[str, ToolEntry] = {
     ),
     "bash": ("Run shell command", {"cmd": "string"}, bash),
     "task": (
-        "Delegate a self-contained subtask to a fresh subagent (same tools, "
-        "own context); returns only its final result",
+        (
+            "Delegate a self-contained subtask to a fresh subagent (same tools, "
+            "own context); returns only its final result. Several task calls in "
+            "one reply run in parallel, so batch independent subtasks together"
+        ),
         {"prompt": "string"},
         task,
     ),
@@ -1406,6 +1595,7 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
 def print_tool_action(name: str, args: dict[str, Any]) -> None:
     """Print a tool call as plain text — no background boxes."""
     body = format_tool_action(name, args)
+    _AGENT_LOCAL.last_action = body
     first, _, rest = body.partition("\n")
     print(f"{GREEN}⏺{RESET}{DIM} {first}{RESET}")
     for line in rest.split("\n"):
@@ -1416,6 +1606,10 @@ def print_tool_action(name: str, args: dict[str, Any]) -> None:
 def print_tool_result(result: str) -> None:
     """Print tool output with enough context to see what happened."""
     lines = result.split("\n")
+    if _agent_tag():  # parallel agents: one line each, or the screen floods
+        more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+        print(f"{DIM}⎿ {lines[0][:160] or '(empty)'}{more}{RESET}")
+        return
     print(f"{DIM}⎿ result{RESET}")
     if not result:
         print(f"{DIM}│ (empty){RESET}")
@@ -1542,7 +1736,7 @@ def print_agent_message(text: str) -> None:
 @contextlib.contextmanager
 def thinking_spinner() -> Any:
     """Loader on the line below the user's input (style from /loader)."""
-    if not sys.stdout.isatty():
+    if not sys.stdout.isatty() or _agent_tag():  # parallel agents share the screen
         yield
         return
 
@@ -1753,12 +1947,26 @@ def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
     return out
 
 
-def _anthropic_headers() -> dict[str, str]:
-    return {
+def _claude_output_config() -> dict[str, Any]:
+    """Request fields for WRENCODE_EFFORT, or nothing when it's unset."""
+    return {"output_config": {"effort": CLAUDE_EFFORT}} if CLAUDE_EFFORT else {}
+
+
+def _anthropic_headers(*, api_key: str = "", workspace_id: str = "") -> dict[str, str]:
+    """Build Anthropic request headers, including workspace id when required.
+
+    Multi-workspace (identity-linked) API keys must send anthropic-workspace-id
+    on every request; workspace-scoped keys may omit it.
+    """
+    headers = {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
+        "x-api-key": api_key or API_KEY,
         "anthropic-version": "2023-06-01",
     }
+    ws = workspace_id or ANTHROPIC_WORKSPACE_ID
+    if ws:
+        headers["anthropic-workspace-id"] = ws
+    return headers
 
 
 def _openai_headers() -> dict[str, str]:
@@ -1985,7 +2193,13 @@ def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
                 )
                 time.sleep(wait)
                 continue
-            raise Exception(f"HTTP {e.code}: {body}") from e
+            hint = ""
+            if e.code == 400 and "workspace" in body.lower():
+                hint = (
+                    " Set ANTHROPIC_WORKSPACE_ID (or re-run /configure and enter a "
+                    "workspace id from Settings → Workspaces)."
+                )
+            raise Exception(f"HTTP {e.code}: {body}{hint}") from e
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             # urlopen wraps connect errors in URLError; a dropped connection while
             # waiting (RemoteDisconnected) or a read timeout comes through raw.
@@ -2332,10 +2546,13 @@ def get_response(
 
     # Anthropic native tool use API.
     if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        # Prompt caching: mark the (large, static) system block + last tool
-        # schema as ephemeral. Anthropic caches everything up to each marker
-        # for ~5 minutes; subsequent turns read at ~10% of normal input cost.
-        # Two breakpoints of the four allowed per request.
+        # Prompt caching, three of the four breakpoints allowed per request:
+        # explicit markers on the last tool schema and the static system block
+        # give the shared prefix a guaranteed read point, and the top-level
+        # cache_control (automatic caching) moves a breakpoint to the end of
+        # the growing conversation, so each agent step re-reads the whole
+        # history from cache instead of paying full input price for it.
+        # Entries live ~5 minutes and refresh on every read.
         tools = _build_tool_schemas("anthropic")
         if tools:
             tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
@@ -2351,8 +2568,10 @@ def get_response(
                     }
                 ],
                 "messages": messages,
-                "max_tokens": MAX_TOKENS,
+                "max_tokens": CLAUDE_MAX_TOKENS,
                 "tools": tools,
+                "cache_control": {"type": "ephemeral"},
+                **_claude_output_config(),
             },
             _anthropic_headers(),
         )
@@ -2439,9 +2658,8 @@ def history_file_path() -> pathlib.Path:
 
 def load_history() -> list[dict[str, Any]]:
     """Load conversation history from the JSON history file."""
-    with contextlib.suppress(Exception):
-        with open(history_file_path()) as f:
-            return list(json.load(f))
+    with contextlib.suppress(Exception), open(history_file_path()) as f:
+        return list(json.load(f))
     return []
 
 
@@ -2751,7 +2969,7 @@ Available tools:
 - glob(pat): Find files matching pattern
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
-- task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result
+- task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result. Several task calls in one reply run in parallel, so batch independent subtasks together
 
 {respond_line}{tool_format}
 
@@ -2896,10 +3114,14 @@ def run_agent_turn(
                 continue
             results: list[tuple[ToolCall, str]] = []
             stop = False
-            for tc in tool_calls:
+            parallel = _run_parallel_tasks(tool_calls)
+            for i, tc in enumerate(tool_calls):
                 check_cancelled()
-                print_tool_action(tc.name, tc.input)
-                result = run_tool(tc.name, tc.input)
+                if i in parallel:
+                    result = parallel[i]
+                else:
+                    print_tool_action(tc.name, tc.input)
+                    result = run_tool(tc.name, tc.input)
                 last_tool_error, repeated_tool_error_count, stop = _track_error(
                     result, last_tool_error, repeated_tool_error_count
                 )
@@ -2932,11 +3154,571 @@ def run_agent_turn(
             if _STRUCTURED_RESULT and _respond_schema() is not None:
                 return "done"
     except (UserCancelled, KeyboardInterrupt):
+        if _agent_tag():
+            print(f"{YELLOW}cancelled{RESET}")
+            return "cancelled"
         print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
         return "cancelled"
     finally:
+        if not _agent_tag():  # the batch owner clears the shared cancel state
+            _CANCEL_REQUESTED.clear()
+            _LISTENER_STOP.set()
+
+
+# -----------------------------------------------------------------------------------------------
+# Parallel subagents
+# -----------------------------------------------------------------------------------------------
+# When one reply makes several task calls, the subagents run at the same time,
+# each in its own thread with its own history. Their output is tagged [1], [2]...
+# and written a whole line at a time; approvals take turns (_confirm_from_subagent).
+class _AgentStdout:
+    """Stdout for a parallel batch: each subagent's lines are tagged and kept whole."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self._lock = threading.Lock()
+        self._partial: dict[int, str] = {}
+        self._owner: Optional[int] = None  # thread at an approval prompt
+        self._held: list[str] = []
+
+    def write(self, text: str) -> int:
+        tag = _agent_tag()
+        me = threading.get_ident()
+        with self._lock:
+            if not tag or me == self._owner:
+                self._real.write(text)
+                return len(text)
+            *lines, rest = (self._partial.get(me, "") + text).split("\n")
+            self._partial[me] = rest
+            for line in lines:
+                tagged = f"{DIM}[{tag}]{RESET} {line.replace(chr(13), '')}\n"
+                if self._owner is None:
+                    self._real.write(tagged)
+                else:
+                    self._held.append(tagged)
+        return len(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._real.flush()
+
+    def hold(self) -> None:
+        """Pass this thread's writes straight through; hold everyone else's."""
+        with self._lock:
+            self._owner = threading.get_ident()
+
+    def release(self) -> None:
+        with self._lock:
+            self._owner = None
+            for line in self._held:
+                self._real.write(line)
+            self._held.clear()
+            self._real.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def _parallel_subagents_enabled() -> bool:
+    # In-process weights (mlx / transformers) can't serve two agents at once.
+    return MAX_PARALLEL_SUBAGENTS > 1 and BACKEND not in LOCAL_ML_BACKENDS
+
+
+def _run_parallel_tasks(tool_calls: list[ToolCall]) -> dict[int, str]:
+    """Run a reply's task calls at once; return results by position in tool_calls.
+
+    Returns {} (run everything in order) for fewer than two task calls, when
+    parallelism is off, or at the depth limit, where task() reports the error.
+    """
+    positions = [i for i, tc in enumerate(tool_calls) if tc.name == "task"]
+    if (
+        len(positions) < 2
+        or not _parallel_subagents_enabled()
+        or _subagent_depth() >= MAX_SUBAGENT_DEPTH
+    ):
+        return {}
+    for i in positions:
+        print_tool_action("task", tool_calls[i].input)
+    calls = [tool_calls[i] for i in positions]
+    return dict(zip(positions, _run_tasks_concurrently(calls)))
+
+
+def _run_tasks_concurrently(calls: list[ToolCall]) -> list[str]:
+    """Run task calls in threads, MAX_PARALLEL_SUBAGENTS at a time, results in order."""
+    global _PARALLEL_ESC
+    parent_depth = _subagent_depth()
+    parent_tag = _agent_tag()
+    parent_cancel = getattr(_AGENT_LOCAL, "cancel", None)
+    cancel = threading.Event()
+    slots = threading.Semaphore(MAX_PARALLEL_SUBAGENTS)
+    results = ["cancelled: the parallel run was stopped"] * len(calls)
+
+    def worker(n: int, tc: ToolCall) -> None:
+        with slots:
+            _AGENT_LOCAL.depth = parent_depth
+            _AGENT_LOCAL.tag = f"{parent_tag}.{n + 1}" if parent_tag else str(n + 1)
+            _AGENT_LOCAL.cancel = cancel
+            if cancel.is_set():
+                return
+            try:
+                results[n] = run_tool(tc.name, tc.input)
+            except BaseException as err:  # noqa: BLE001 — reported as the result
+                results[n] = f"error: {err}"
+
+    threads = [
+        threading.Thread(target=worker, args=(n, tc), daemon=True)
+        for n, tc in enumerate(calls)
+    ]
+    out: Optional[_AgentStdout] = None
+    if not isinstance(sys.stdout, _AgentStdout):
+        out = _AgentStdout(sys.stdout)
+        sys.stdout = out
+    esc = None
+    if not parent_tag:  # the top-level batch owns Escape-to-cancel
+        esc = _EscWatch()
+        _PARALLEL_ESC = esc
         _CANCEL_REQUESTED.clear()
+        esc.start()
+    print(f"{CYAN}↳ running {len(calls)} subagents in parallel{RESET}")
+    try:
+        for t in threads:
+            t.start()
+        while any(t.is_alive() for t in threads):
+            if _CANCEL_REQUESTED.is_set() or (
+                parent_cancel is not None and parent_cancel.is_set()
+            ):
+                cancel.set()
+                break
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        cancel.set()
+        raise
+    finally:
+        if cancel.is_set():  # give subagents a moment to stop at their next check
+            deadline = time.monotonic() + 2
+            for t in threads:
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if esc is not None:
+            esc.stop()
+            _PARALLEL_ESC = None
+        if out is not None:
+            out.release()
+            sys.stdout = out._real
+    if cancel.is_set():
+        raise UserCancelled()
+    print(f"{CYAN}↳ {len(calls)} subagents done{RESET}")
+    return results
+
+
+# -----------------------------------------------------------------------------------------------
+# Claude Agent SDK backend
+# -----------------------------------------------------------------------------------------------
+# The SDK runs Claude Code's own agent loop and tools in a subprocess. wrencode
+# hands it each prompt, shows the stream in its own style, routes tool approvals
+# through confirm(), and reports cost per turn. Auth is forced to the API key so
+# usage bills to Console credits, never to a claude.ai subscription.
+_AGENT_SDK_SESSION: Optional["AgentSDKSession"] = None
+
+
+def _agent_sdk_sessions_file() -> pathlib.Path:
+    return CONFIG_DIR / "agent_sdk_sessions.json"
+
+
+def _load_agent_sdk_session_id() -> str:
+    """The last SDK session id saved for this workspace, or ''."""
+    with contextlib.suppress(Exception):
+        data = json.loads(_agent_sdk_sessions_file().read_text())
+        return str(data.get(str(workspace_root()), ""))
+    return ""
+
+
+def _save_agent_sdk_session_id(session_id: str) -> None:
+    path = _agent_sdk_sessions_file()
+    data: dict[str, str] = {}
+    with contextlib.suppress(Exception):
+        data = dict(json.loads(path.read_text()))
+    key = str(workspace_root())
+    if session_id:
+        data[key] = session_id
+    else:
+        data.pop(key, None)
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2))
+        os.chmod(path, 0o600)
+
+
+def _agent_sdk_env() -> dict[str, str]:
+    """Environment for the SDK's Claude Code process: API key auth only."""
+    env = {
+        "ANTHROPIC_API_KEY": API_KEY,
+        # Blank the subscription credentials so they can't take over billing.
+        "CLAUDE_CODE_OAUTH_TOKEN": "",
+        "ANTHROPIC_AUTH_TOKEN": "",
+    }
+    if ANTHROPIC_WORKSPACE_ID:
+        header = f"anthropic-workspace-id: {ANTHROPIC_WORKSPACE_ID}"
+        extra = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{extra}\n{header}" if extra else header
+    return env
+
+
+def _short(text: Any, limit: int = 80) -> str:
+    flat = str(text).replace("\n", "\\n")
+    return flat[:limit] + ("..." if len(flat) > limit else "")
+
+
+def format_sdk_tool_action(name: str, inp: dict[str, Any]) -> str:
+    """Human-readable summary of a Claude Code tool call."""
+    if name == "Bash":
+        return f"$ {str(inp.get('command', '')).strip()}"
+    if name == "Edit":
+        return (
+            f"Edit {inp.get('file_path', '?')}\n"
+            f"- {_short(inp.get('old_string', ''))}\n"
+            f"+ {_short(inp.get('new_string', ''))}"
+        )
+    if name == "Write":
+        content = str(inp.get("content", ""))
+        lines = content.count("\n") + (1 if content else 0)
+        return f"Write {inp.get('file_path', '?')}  ({lines} lines)\n{_short(content, 160)}"
+    for field in ("file_path", "notebook_path", "path", "pattern", "url", "query"):
+        if inp.get(field):
+            return f"{name} {inp[field]}"
+    if inp.get("description"):
+        return f"{name}: {_short(inp['description'], 160)}"
+    return f"{name}({json.dumps(inp, ensure_ascii=False)[:160]})"
+
+
+def _sdk_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+    return ""
+
+
+class _Spinner:
+    """The thinking loader, startable and stoppable between streamed messages."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None or not sys.stdout.isatty() or _HEADLESS:
+            return
+        self._stop.clear()
+
+        def animate() -> None:
+            step = 0
+            while not self._stop.is_set():
+                sys.stdout.write(f"\r{loader_display(step)}")
+                sys.stdout.flush()
+                step += 1
+                time.sleep(0.07)
+
+        self._thread = threading.Thread(target=animate, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=0.4)
+        self._thread = None
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
+
+
+class _EscWatch:
+    """Escape-to-cancel listener that can pause while an approval prompt reads stdin."""
+
+    def __init__(self) -> None:
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None or not sys.stdin.isatty() or _HEADLESS:
+            return
+        _LISTENER_STOP.clear()
+        self._thread = threading.Thread(target=_cancel_listener, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
         _LISTENER_STOP.set()
+        self._thread.join(timeout=0.5)
+        self._thread = None
+
+
+@dataclass
+class AgentSDKTurn:
+    """Outcome of one prompt sent through the Agent SDK."""
+
+    text: str = ""
+    is_error: bool = False
+    error: str = ""
+    cost_usd: float = 0.0
+    num_turns: int = 0
+
+
+class AgentSDKSession:
+    """One Claude Code session driven through the Agent SDK, reused across prompts."""
+
+    def __init__(self, *, persist: bool = True, max_turns: int = 0) -> None:
+        import asyncio
+
+        self._loop = asyncio.new_event_loop()
+        self._client: Any = None
+        self._model = ""
+        self._persist = persist
+        self._max_turns = max_turns
+        self.session_id = _load_agent_sdk_session_id() if persist else ""
+        self._reported_cost = 0.0  # the SDK's cost total for the current client
+        self._spinner = _Spinner()
+        self._esc = _EscWatch()
+
+    def _options(self, resume: str) -> Any:
+        from claude_agent_sdk import ClaudeAgentOptions
+        from claude_agent_sdk.types import SystemPromptPreset
+
+        system_prompt = SystemPromptPreset(type="preset", preset="claude_code")
+        if extra := agents_md_context().strip():
+            system_prompt["append"] = extra
+        return ClaudeAgentOptions(
+            model=MODEL or None,
+            cwd=str(workspace_root()),
+            system_prompt=system_prompt,
+            # Isolated from ~/.claude hooks, plugins and MCP servers; project
+            # instructions come from AGENTS.md/CLAUDE.md via the append above.
+            setting_sources=[],
+            permission_mode="default",
+            can_use_tool=self._can_use_tool,
+            env=_agent_sdk_env(),
+            resume=resume or None,
+            max_turns=self._max_turns or None,
+            effort=CLAUDE_EFFORT,
+            stderr=self._on_stderr,
+        )
+
+    @staticmethod
+    def _on_stderr(line: str) -> None:
+        if os.environ.get("WRENCODE_DEBUG"):
+            print(f"{DIM}[claude] {line.rstrip()}{RESET}", file=sys.stderr)
+
+    async def _ensure_client(self) -> None:
+        from claude_agent_sdk import ClaudeSDKClient
+
+        if self._client is not None:
+            if self._model != MODEL:
+                await self._client.set_model(MODEL or None)
+                self._model = MODEL
+            return
+        client = ClaudeSDKClient(self._options(self.session_id))
+        try:
+            await client.connect()
+        except Exception:
+            if not self.session_id:
+                raise
+            # A saved session that no longer exists: start a fresh one.
+            self.session_id = ""
+            client = ClaudeSDKClient(self._options(""))
+            await client.connect()
+        self._client = client
+        self._model = MODEL
+        self._reported_cost = 0.0
+
+    async def _disconnect(self) -> None:
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.disconnect()
+            self._client = None
+
+    def reset(self) -> None:
+        """Forget the conversation: the next prompt starts a new session."""
+        self._loop.run_until_complete(self._disconnect())
+        self.session_id = ""
+        if self._persist:
+            _save_agent_sdk_session_id("")
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._loop.run_until_complete(self._disconnect())
+        self._loop.close()
+
+    async def _can_use_tool(self, name: str, inp: dict[str, Any], context: Any) -> Any:
+        import asyncio
+
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+        self._spinner.stop()
+        self._esc.stop()  # confirm() reads stdin; the Escape listener must let go
+        try:
+            body = format_sdk_tool_action(name, inp)
+            first, _, rest = body.partition("\n")
+            print(f"{YELLOW}?{RESET} {first}")
+            for line in rest.split("\n"):
+                if line.strip():
+                    print(f"{DIM}  {line}{RESET}")
+            verdict = await asyncio.to_thread(confirm, first)
+        finally:
+            self._esc.start()
+        if verdict == "ok":
+            return PermissionResultAllow(updated_input=inp)
+        return PermissionResultDeny(message=verdict)
+
+    def run(self, prompt: str) -> AgentSDKTurn:
+        import asyncio
+
+        _CANCEL_REQUESTED.clear()
+        try:
+            return self._loop.run_until_complete(self._run(prompt))
+        except KeyboardInterrupt:
+            # The turn is abandoned mid-stream. Drop the client so leftover
+            # messages can't leak into the next prompt; the session id stays,
+            # so the next prompt resumes the same conversation.
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            with contextlib.suppress(BaseException):
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            with contextlib.suppress(BaseException):
+                self._loop.run_until_complete(self._disconnect())
+            raise
+        finally:
+            self._spinner.stop()
+            self._esc.stop()
+
+    async def _watch_cancel(self) -> None:
+        import asyncio
+
+        while not _CANCEL_REQUESTED.is_set():
+            await asyncio.sleep(0.1)
+        self._spinner.stop()
+        print(f"{YELLOW}Interrupted{RESET}")
+        with contextlib.suppress(Exception):
+            await self._client.interrupt()
+
+    async def _run(self, prompt: str) -> AgentSDKTurn:
+        import asyncio
+
+        await self._ensure_client()
+        turn = AgentSDKTurn()
+        await self._client.query(prompt)
+        self._esc.start()
+        self._spinner.start()
+        watcher = asyncio.ensure_future(self._watch_cancel())
+        try:
+            # receive_response() ends on its own at the ResultMessage; the SDK
+            # docs advise against break here (asyncio cleanup issues).
+            async for msg in self._client.receive_response():
+                self._spinner.stop()
+                if not self._handle_message(msg, turn):
+                    self._spinner.start()
+        finally:
+            watcher.cancel()
+            self._spinner.stop()
+            self._esc.stop()
+        return turn
+
+    def _handle_message(self, msg: Any, turn: AgentSDKTurn) -> bool:
+        """Print one streamed message; return True once the turn's result arrived."""
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ResultMessage,
+            SystemMessage,
+            TextBlock,
+            ToolResultBlock,
+            ToolUseBlock,
+            UserMessage,
+        )
+
+        if isinstance(msg, SystemMessage):
+            data = msg.data or {}
+            if msg.subtype == "init":
+                source = data.get("apiKeySource")
+                if source and source != "ANTHROPIC_API_KEY":
+                    print(
+                        f"{YELLOW}Warning: the Agent SDK is authenticating with "
+                        f"{source}, not ANTHROPIC_API_KEY, so usage may not bill "
+                        f"to your API credits.{RESET}"
+                    )
+                self._remember_session(str(data.get("session_id", "")))
+            elif msg.subtype == "compact_boundary":
+                print_system("Compacted conversation")
+            return False
+        if isinstance(msg, AssistantMessage):
+            nested = bool(msg.parent_tool_use_id)  # a subagent working
+            for block in msg.content:
+                if isinstance(block, TextBlock) and block.text.strip() and not nested:
+                    turn.text = block.text
+                    if not msg.error:  # an API error is reported with the result
+                        print_agent_message(block.text)
+                elif isinstance(block, ToolUseBlock):
+                    first = format_sdk_tool_action(block.name, block.input).split("\n")[
+                        0
+                    ]
+                    mark = f"{DIM}↳" if nested else f"{GREEN}⏺"  # ↳ = subagent
+                    print(f"{mark}{RESET}{DIM} {first}{RESET}")
+            if msg.error:
+                turn.error = turn.text or str(msg.error)
+            return False
+        if isinstance(msg, UserMessage) and isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, ToolResultBlock):
+                    lines = _sdk_result_text(block.content).strip().split("\n")
+                    color = RED if block.is_error else DIM
+                    head = lines[0][:200] if lines and lines[0] else "(empty)"
+                    more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+                    print(f"{color}  ⎿ {head}{more}{RESET}")
+            return False
+        if isinstance(msg, ResultMessage):
+            self._remember_session(msg.session_id)
+            total = float(msg.total_cost_usd or 0.0)
+            turn.cost_usd = max(total - self._reported_cost, 0.0)
+            self._reported_cost = total
+            turn.num_turns = msg.num_turns
+            turn.is_error = bool(msg.is_error)
+            if msg.result and not turn.text:
+                turn.text = msg.result
+            if turn.is_error:
+                turn.error = msg.result or turn.error or msg.subtype
+                print(f"{RED}Error: {turn.error}{RESET}")
+                if "workspace" in turn.error.lower():
+                    print(
+                        f"{YELLOW}Your API key spans several workspaces. Run "
+                        f"/configure and enter the workspace id from the Console "
+                        f"(Settings, Workspaces), or set ANTHROPIC_WORKSPACE_ID.{RESET}"
+                    )
+            print(
+                f"{DIM}${turn.cost_usd:.4f} this turn · ${total:.4f} this session{RESET}"
+            )
+            return True
+        return False
+
+    def _remember_session(self, session_id: str) -> None:
+        if session_id and session_id != self.session_id:
+            self.session_id = session_id
+            if self._persist:
+                _save_agent_sdk_session_id(session_id)
+
+
+def agent_sdk_session() -> AgentSDKSession:
+    """The interactive Agent SDK session, created on first use."""
+    global _AGENT_SDK_SESSION
+    if _AGENT_SDK_SESSION is None:
+        _AGENT_SDK_SESSION = AgentSDKSession()
+    return _AGENT_SDK_SESSION
+
+
+def close_agent_sdk_session() -> None:
+    global _AGENT_SDK_SESSION
+    if _AGENT_SDK_SESSION is not None:
+        _AGENT_SDK_SESSION.close()
+        _AGENT_SDK_SESSION = None
 
 
 # -----------------------------------------------------------------------------------------------
@@ -2952,10 +3734,19 @@ def handle_slash_command(
     Returns (action, mlx_state). mlx_state is _MLX_UNCHANGED unless the
     backend/model changed and the in-process model must be reloaded.
     """
-    if cmd in {"/q", "exit"}:
+    cmd = SLASH_ALIASES.get(cmd, cmd)
+    if BACKEND == AGENT_SDK_BACKEND and cmd in {"/clear", "/compact"}:
+        session = agent_sdk_session()
+        if cmd == "/clear":
+            session.reset()
+            print_system("Cleared")
+        else:
+            session.run("/compact")  # Claude Code compacts its own context
+        return "handled", _MLX_UNCHANGED
+    if cmd in {"/quit", "exit"}:
         save_history(messages)
         return "quit", _MLX_UNCHANGED
-    if cmd == "/c":
+    if cmd == "/clear":
         global _SESSION_AUTO_APPROVE
         _SESSION_AUTO_APPROVE = False
         messages.clear()
@@ -2983,9 +3774,9 @@ def handle_slash_command(
         model_id = cmd[7:].strip() if cmd.startswith("/model ") else ""
         return "handled", switch_model_runtime(model_id)
     if cmd == "/help":
-        print_system("/c — clear  /compact — summarize  /q — quit")
-        print_system("/backend — switch backend (↑↓)  /model — switch model (↑↓)")
-        print_system("/model <id> — set model directly  /configure — same as /backend")
+        for name, desc in SLASH_COMMANDS.items():
+            print_system(f"{name:<12} {desc}")
+        print_system("Type / for suggestions: ↑↓ pick, Tab completes, Enter runs.")
         return "handled", _MLX_UNCHANGED
     return None, _MLX_UNCHANGED
 
@@ -3031,7 +3822,8 @@ def available_backends() -> list[str]:
     return [
         name
         for name, spec in BACKEND_SPECS.items()
-        if not (
+        if not (spec["kind"] == "agent-sdk" and is_frozen())
+        and not (
             spec["kind"] == "local-ml"
             and (
                 is_frozen()
@@ -3075,24 +3867,57 @@ def pick_from_list(
         print(f"{RED}Enter a number between 1 and {len(options)}.{RESET}")
 
 
+def _read_models_cache(cache: pathlib.Path) -> Optional[list[str]]:
+    """Return cached model ids if the cache file is fresh (<24h), else None."""
+    if not cache.exists():
+        return None
+    with contextlib.suppress(Exception):
+        age = time.time() - cache.stat().st_mtime
+        if age < 86400:
+            cached = json.loads(cache.read_text())
+            if isinstance(cached, list) and cached:
+                return [str(m) for m in cached]
+    return None
+
+
+def _write_models_cache(cache: pathlib.Path, ids: list[str]) -> None:
+    """Persist model ids for the next configure session."""
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(ids, indent=2))
+    os.chmod(cache, 0o600)
+
+
+def _api_key_for_backend(backend: str) -> str:
+    """Resolve an API key for model fetches without requiring BACKEND == backend."""
+    if env_key := _env_api_key(backend):
+        return env_key
+    if BACKEND == backend and API_KEY:
+        return API_KEY
+    cfg = load_config()
+    if cfg.get("backend") == backend:
+        return cfg.get("api_key", "")
+    return ""
+
+
+def _workspace_id_for_anthropic() -> str:
+    """Resolve Anthropic workspace id: env > active session > saved config."""
+    if os.environ.get("ANTHROPIC_WORKSPACE_ID"):
+        return os.environ["ANTHROPIC_WORKSPACE_ID"]
+    if ANTHROPIC_WORKSPACE_ID:
+        return ANTHROPIC_WORKSPACE_ID
+    return load_config().get("anthropic_workspace_id", "")
+
+
 def _fetch_hosted_models(
     backend: str, url: str, cache: pathlib.Path, label: str
 ) -> list[str]:
     """Fetch an OpenAI-style /models list for a hosted backend, with a 24h local cache."""
     fallback = list(BACKEND_MODELS.get(backend, []))
-    if cache.exists():
-        with contextlib.suppress(Exception):
-            age = time.time() - cache.stat().st_mtime
-            if age < 86400:
-                cached = json.loads(cache.read_text())
-                if isinstance(cached, list) and cached:
-                    return [str(m) for m in cached]
+    cached = _read_models_cache(cache)
+    if cached is not None:
+        return cached
 
-    key = (
-        os.environ.get(BACKEND_SPECS[backend]["key_env"])
-        or (API_KEY if BACKEND == backend else "")
-        or load_config().get("api_key", "")
-    )
+    key = _api_key_for_backend(backend)
     if not key:
         return fallback
 
@@ -3102,12 +3927,99 @@ def _fetch_hosted_models(
             data = json.load(resp)
         ids = sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
         if ids:
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(ids, indent=2))
-            os.chmod(cache, 0o600)
+            _write_models_cache(cache, ids)
         return ids or fallback
     except Exception as err:
         print(f"{YELLOW}Could not fetch {label} models: {err}{RESET}")
+        return fallback
+
+
+def fetch_anthropic_models() -> list[str]:
+    """Fetch Anthropic model ids from GET /v1/models (newest first), with a 24h cache."""
+    fallback = list(BACKEND_MODELS.get("anthropic", []))
+    cached = _read_models_cache(ANTHROPIC_MODELS_CACHE)
+    if cached is not None:
+        return cached
+
+    key = _api_key_for_backend(
+        BACKEND if BACKEND in ANTHROPIC_KEY_BACKENDS else "anthropic"
+    )
+    if not key:
+        return fallback
+
+    headers = _anthropic_headers(
+        api_key=key, workspace_id=_workspace_id_for_anthropic()
+    )
+    try:
+        ids: list[str] = []
+        after: Optional[str] = None
+        while True:
+            query = urllib.parse.urlencode(
+                {"limit": "1000", **({"after_id": after} if after else {})}
+            )
+            req = urllib.request.Request(
+                f"https://api.anthropic.com/v1/models?{query}", headers=headers
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.load(resp)
+            page = [m["id"] for m in data.get("data", []) if m.get("id")]
+            ids.extend(page)
+            if not data.get("has_more") or not data.get("last_id"):
+                break
+            after = data["last_id"]
+        if ids:
+            _write_models_cache(ANTHROPIC_MODELS_CACHE, ids)
+        return ids or fallback
+    except Exception as err:
+        print(f"{YELLOW}Could not fetch Anthropic models: {err}{RESET}")
+        return fallback
+
+
+def fetch_openai_models() -> list[str]:
+    """Fetch OpenAI chat-oriented model ids from GET /v1/models, with a 24h cache."""
+    fallback = list(BACKEND_MODELS.get("openai", []))
+    cached = _read_models_cache(OPENAI_MODELS_CACHE)
+    if cached is not None:
+        return cached
+
+    key = _api_key_for_backend("openai")
+    if not key:
+        return fallback
+
+    # /v1/models also lists embeddings, audio, images, etc. — keep chat-ish ids.
+    skip_substrings = (
+        "embedding",
+        "whisper",
+        "tts",
+        "dall-e",
+        "moderation",
+        "transcribe",
+        "realtime",
+        "audio",
+        "image",
+        "search",
+        "babbage",
+        "davinci",
+        "curie",
+        "ada",
+    )
+    try:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        ids = sorted(
+            m["id"]
+            for m in data.get("data", [])
+            if m.get("id") and not any(s in m["id"].lower() for s in skip_substrings)
+        )
+        if ids:
+            _write_models_cache(OPENAI_MODELS_CACHE, ids)
+        return ids or fallback
+    except Exception as err:
+        print(f"{YELLOW}Could not fetch OpenAI models: {err}{RESET}")
         return fallback
 
 
@@ -3177,7 +4089,11 @@ def fetch_openai_compatible_models() -> list[str]:
 def list_models_for_backend(backend: str) -> list[str]:
     """Return selectable models for a backend (includes a custom-id option)."""
     spec = BACKEND_SPECS[backend]
-    if backend == "openrouter":
+    if backend in ANTHROPIC_KEY_BACKENDS:
+        models = fetch_anthropic_models()
+    elif backend == "openai":
+        models = fetch_openai_models()
+    elif backend == "openrouter":
         models = fetch_openrouter_models()
     elif backend == "nanogpt":
         models = fetch_nanogpt_models()
@@ -3189,7 +4105,7 @@ def list_models_for_backend(backend: str) -> list[str]:
         models = list(BACKEND_MODELS.get(backend, [spec["model"]]))
 
     if not models:
-        models = [spec["model"]]
+        models = [spec["model"]] if spec["model"] else []
     models = list(dict.fromkeys(models))
     current = MODEL if backend == BACKEND else spec["model"]
     if current and current not in models:
@@ -3215,11 +4131,19 @@ def _prompt_api_key_if_needed(
                 f"AWS_SECRET_ACCESS_KEY, and AWS_REGION.{RESET}"
             )
         return
-    if spec["kind"] != "api":
+    if spec["kind"] not in KEYED_KINDS:
         return
     key_env = spec["key_env"]
-    if os.environ.get(key_env):
-        print_system(f"✓ Using {key_env} from environment")
+    if env_key := os.environ.get(key_env):
+        key = getpass.getpass(
+            f"{BLUE}❯{RESET} {key_env} found in environment (…{env_key[-4:]}). "
+            "Enter to use it, or paste a new key (input hidden): "
+        ).strip()
+        if key:
+            _use_entered_key(key_env, key, cfg)
+        else:
+            cfg["api_key_overrides_env"] = ""
+            print_system(f"✓ Using {key_env} from environment")
         return
     saved_key = (
         existing.get("api_key", "") if existing.get("backend") == backend else ""
@@ -3229,7 +4153,7 @@ def _prompt_api_key_if_needed(
         f"{BLUE}❯{RESET} {key_env}{keep_hint} (input hidden): "
     ).strip()
     if key:
-        cfg["api_key"] = key
+        _use_entered_key(key_env, key, cfg)
     elif saved_key:
         cfg["api_key"] = saved_key
         print_system(f"✓ Keeping saved {key_env}")
@@ -3237,14 +4161,57 @@ def _prompt_api_key_if_needed(
         print(f"{YELLOW}No key entered — set {key_env} or re-run with /backend.{RESET}")
 
 
+def _use_entered_key(key_env: str, key: str, cfg: dict[str, str]) -> None:
+    """Save a key typed in /configure so it beats a stale one in the env or .env."""
+    cfg["api_key"] = key
+    if os.environ.get(key_env) and os.environ[key_env] != key:
+        cfg["api_key_overrides_env"] = "1"
+        os.environ[key_env] = key  # this process, before the config is saved
+        print_system(
+            f"✓ Saved key will be used instead of {key_env} from the environment"
+        )
+
+
+def _prompt_anthropic_workspace_if_needed(
+    existing: dict[str, str], cfg: dict[str, str]
+) -> None:
+    """Prompt for anthropic-workspace-id when using a multi-workspace API key."""
+    if os.environ.get("ANTHROPIC_WORKSPACE_ID"):
+        print_system("✓ Using ANTHROPIC_WORKSPACE_ID from environment")
+        return
+    saved = (
+        existing.get("anthropic_workspace_id", "")
+        if existing.get("backend") in ANTHROPIC_KEY_BACKENDS
+        else ""
+    )
+    keep_hint = (
+        " (leave blank to keep saved)"
+        if saved
+        else " (optional; required for multi-workspace keys)"
+    )
+    raw = input(f"{BLUE}❯{RESET} Anthropic workspace id{keep_hint}: ").strip()
+    if raw:
+        cfg["anthropic_workspace_id"] = raw
+    elif saved:
+        cfg["anthropic_workspace_id"] = saved
+        print_system("✓ Keeping saved Anthropic workspace id")
+    else:
+        # Clear a stale value if the user left it blank on a fresh anthropic setup.
+        cfg.pop("anthropic_workspace_id", None)
+
+
 def persist_backend_choice(cfg: dict[str, str]) -> None:
     """Merge cfg into saved config and apply module-level backend globals."""
     merged = {**load_config(), **cfg}
+    # Drop empty workspace id so a blank configure answer clears a prior value.
+    if "anthropic_workspace_id" in cfg and not cfg["anthropic_workspace_id"]:
+        merged.pop("anthropic_workspace_id", None)
     save_config(merged)
     apply_backend(
         merged["backend"],
         merged.get("model", ""),
         merged.get("api_key", ""),
+        anthropic_workspace_id=merged.get("anthropic_workspace_id", ""),
     )
 
 
@@ -3276,16 +4243,18 @@ def verify_api_key() -> tuple[str, str]:
             return ("unknown", f"HTTP {err.code}")
         except Exception as err:
             return ("unknown", str(err))
-    if spec["kind"] != "api":
+    if spec["kind"] not in KEYED_KINDS:
         return ("ok", "")
     if not API_KEY:
         return ("invalid", "no key")
+    anthropic_probe = (
+        "https://api.anthropic.com/v1/models",
+        _anthropic_headers(),
+        "GET",
+    )
     probes = {
-        "anthropic": (
-            "https://api.anthropic.com/v1/models",
-            _anthropic_headers(),
-            "GET",
-        ),
+        "anthropic": anthropic_probe,
+        AGENT_SDK_BACKEND: anthropic_probe,
         "openai": ("https://api.openai.com/v1/models", _openai_headers(), "GET"),
         "openrouter": ("https://openrouter.ai/api/v1/key", _openai_headers(), "GET"),
         # NanoGPT's /models is public, so check the key against the balance endpoint.
@@ -3304,8 +4273,17 @@ def verify_api_key() -> tuple[str, str]:
             resp.read(1)
         return ("ok", "")
     except urllib.error.HTTPError as err:
+        body = err.read().decode(errors="replace")
         if err.code in (401, 403):
             return ("invalid", f"HTTP {err.code}")
+        if err.code == 400 and "workspace" in body.lower():
+            return (
+                "invalid",
+                (
+                    "API key needs anthropic-workspace-id "
+                    "(set ANTHROPIC_WORKSPACE_ID or enter it in /configure)"
+                ),
+            )
         return ("unknown", f"HTTP {err.code}")
     except Exception as err:
         return ("unknown", str(err))
@@ -3339,7 +4317,7 @@ def try_reload_model() -> Any:
             return load_model()
         except SystemExit:
             return _MLX_UNCHANGED
-    if BACKEND in API_BACKENDS and not API_KEY:
+    if BACKEND in API_BACKENDS | {AGENT_SDK_BACKEND} and not API_KEY:
         key_env = BACKEND_SPECS[BACKEND]["key_env"]
         print(f"{RED}{key_env} not set — cannot use {BACKEND}.{RESET}")
         return _MLX_UNCHANGED
@@ -3368,6 +4346,24 @@ def switch_model_runtime(model_id: str = "") -> Any:
     return try_reload_model()
 
 
+def _apply_credentials_for_model_fetch(
+    backend: str, cfg: dict[str, str], existing: dict[str, str]
+) -> None:
+    """Apply key/workspace so live /models fetches can authenticate."""
+    apply_backend(
+        backend,
+        existing.get("model", "") if existing.get("backend") == backend else "",
+        cfg.get("api_key")
+        or (existing.get("api_key", "") if existing.get("backend") == backend else ""),
+        anthropic_workspace_id=cfg.get(
+            "anthropic_workspace_id",
+            existing.get("anthropic_workspace_id", "")
+            if existing.get("backend") in ANTHROPIC_KEY_BACKENDS
+            else "",
+        ),
+    )
+
+
 def switch_backend_runtime() -> Any:
     """Switch backend (and model) mid-session; reload local weights if needed."""
     if not sys.stdin.isatty():
@@ -3387,13 +4383,18 @@ def switch_backend_runtime() -> Any:
         return _MLX_UNCHANGED
 
     backend = names[idx]
+    cfg: dict[str, str] = {"backend": backend}
+    _prompt_api_key_if_needed(backend, existing, cfg)
+    if backend in ANTHROPIC_KEY_BACKENDS:
+        _prompt_anthropic_workspace_if_needed(existing, cfg)
+    # Credentials first so the model picker can fetch live /models lists.
+    _apply_credentials_for_model_fetch(backend, cfg, existing)
     model = pick_model_interactive(backend)
     if model is None:
         print_system("Cancelled.")
         return _MLX_UNCHANGED
 
-    cfg: dict[str, str] = {"backend": backend, "model": model}
-    _prompt_api_key_if_needed(backend, existing, cfg)
+    cfg["model"] = model
     persist_backend_choice(cfg)
     print_system(f"✓ Backend → {BACKEND}:{MODEL}")
     return try_reload_model()
@@ -3417,14 +4418,19 @@ def choose_backend_interactive() -> None:
         raise SystemExit(1)
 
     choice = names[idx]
+    cfg: dict[str, str] = {"backend": choice}
+    spec = BACKEND_SPECS[choice]
+    _prompt_api_key_if_needed(choice, existing, cfg)
+    if choice in ANTHROPIC_KEY_BACKENDS:
+        _prompt_anthropic_workspace_if_needed(existing, cfg)
+    # Credentials first so the model picker can fetch live /models lists.
+    _apply_credentials_for_model_fetch(choice, cfg, existing)
     model = pick_model_interactive(choice)
     if model is None:
         print(f"{RED}Model selection required.{RESET}")
         raise SystemExit(1)
 
-    cfg: dict[str, str] = {"backend": choice, "model": model}
-    spec = BACKEND_SPECS[choice]
-    _prompt_api_key_if_needed(choice, existing, cfg)
+    cfg["model"] = model
     persist_backend_choice(cfg)
     print_system(f"✓ Saved backend choice to {CONFIG_FILE}")
 
@@ -3443,18 +4449,27 @@ def choose_backend_interactive() -> None:
             print(f"{YELLOW}⚠ Couldn't verify {cred_name} ({detail}).{RESET}")
             return
         print(f"{RED}✗ {cred_name} was rejected ({detail}).{RESET}")
-        if spec["kind"] != "api" or not sys.stdin.isatty() or attempt == 2:
+        if spec["kind"] not in KEYED_KINDS or not sys.stdin.isatty() or attempt == 2:
             if spec["kind"] == "aws":
                 print(
                     f"{DIM}Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (and AWS_REGION) and re-run.{RESET}"
                 )
             return
+        if choice in ANTHROPIC_KEY_BACKENDS and "workspace" in detail.lower():
+            ws = input(
+                f"{BLUE}❯{RESET} Anthropic workspace id (from Settings → Workspaces): "
+            ).strip()
+            if not ws:
+                return
+            cfg["anthropic_workspace_id"] = ws
+            persist_backend_choice(cfg)
+            continue
         newkey = getpass.getpass(
             f"{BLUE}❯{RESET} re-enter {cred_name} (input hidden): "
         ).strip()
         if not newkey:
             return
-        cfg["api_key"] = newkey
+        _use_entered_key(spec["key_env"], newkey, cfg)
         persist_backend_choice(cfg)
 
 
@@ -3481,8 +4496,8 @@ def resolve_configuration() -> None:
         # SystemExit. In a terminal, re-run the chooser so the user can pick a
         # backend and enter a key instead of the tool exiting immediately.
         key_missing = (
-            spec["kind"] == "api"
-            and not os.environ.get(spec["key_env"])
+            spec["kind"] in KEYED_KINDS
+            and not _env_api_key(backend)
             and not cfg.get("api_key")
         )
         if key_missing and sys.stdin.isatty():
@@ -3492,7 +4507,12 @@ def resolve_configuration() -> None:
             )
             choose_backend_interactive()
             return
-        apply_backend(backend, cfg.get("model", ""), cfg.get("api_key", ""))
+        apply_backend(
+            backend,
+            cfg.get("model", ""),
+            cfg.get("api_key", ""),
+            anthropic_workspace_id=cfg.get("anthropic_workspace_id", ""),
+        )
         return
 
     # 3. First run with a real terminal — ask the user.
@@ -3515,18 +4535,28 @@ def resolve_configuration() -> None:
 def load_model() -> Optional[tuple[Any, Any]]:
     """Load model for the current backend and return mlx_state (or None for API backends)."""
     global MODEL
+    if BACKEND == AGENT_SDK_BACKEND:
+        if sys.version_info < (3, 10):
+            print(f"{RED}The Claude Agent SDK needs Python 3.10 or newer.{RESET}")
+            raise SystemExit(1)
+        import importlib.util
+
+        if importlib.util.find_spec("claude_agent_sdk") is None:
+            print(
+                f"{RED}This backend needs the Claude Agent SDK:{RESET} pip install claude-agent-sdk"
+            )
+            print(f"{DIM}Or pick another backend with /backend.{RESET}")
+            raise SystemExit(1)
+        if not API_KEY:
+            print(f"{RED}ANTHROPIC_API_KEY not set — run /configure.{RESET}")
+            raise SystemExit(1)
+        return None
     if BACKEND == "mlx":
         try:
             global load, stream_generate, make_sampler
-            from mlx_lm import (  # ty: ignore[unresolved-import]
-                load,  # type: ignore[import-not-found]
-            )
-            from mlx_lm.generate import (  # ty: ignore[unresolved-import]
-                stream_generate,  # type: ignore[import-not-found]
-            )
-            from mlx_lm.sample_utils import (  # ty: ignore[unresolved-import]
-                make_sampler,  # type: ignore[import-not-found]
-            )
+            from mlx_lm import load
+            from mlx_lm.generate import stream_generate
+            from mlx_lm.sample_utils import make_sampler
         except ImportError:
             print(f"{RED}MLX backend needs mlx-lm:{RESET} pip install mlx-lm")
             print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
@@ -3539,8 +4569,8 @@ def load_model() -> Optional[tuple[Any, Any]]:
     if BACKEND == "transformers":
         try:
             global torch, AutoModelForCausalLM, AutoTokenizer
-            import torch  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
-            from transformers import (  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
+            import torch
+            from transformers import (
                 AutoModelForCausalLM,
                 AutoTokenizer,
             )
@@ -4259,15 +5289,31 @@ def run_headless(
     reason, error = "error", ""
     verified: Optional[bool] = None
     verify_output = ""
+    sdk: Optional[AgentSDKSession] = None
+    cost_usd = 0.0
     with contextlib.redirect_stdout(sys.stderr):
         try:
             resolve_configuration()
             _MLX_STATE = load_model()
             system_prompt = build_system_prompt()
+            if BACKEND == AGENT_SDK_BACKEND:
+                if schema is not None:
+                    raise ValueError(
+                        "--json-schema isn't supported on the claude-agent-sdk backend"
+                    )
+                sdk = AgentSDKSession(persist=False, max_turns=max_turns)
             for attempt in range(VERIFY_ATTEMPTS if verify else 1):
-                reason = run_agent_turn(
-                    messages, system_prompt, _MLX_STATE, max_iters=max_turns
-                )
+                if sdk is not None:
+                    turn = sdk.run(flatten_content(messages[-1]["content"]))
+                    messages.append({"role": "assistant", "content": turn.text})
+                    cost_usd += turn.cost_usd
+                    reason = "error" if turn.is_error else "done"
+                    if turn.is_error:
+                        error = turn.error
+                else:
+                    reason = run_agent_turn(
+                        messages, system_prompt, _MLX_STATE, max_iters=max_turns
+                    )
                 if not verify or reason != "done":
                     break
                 verified, verify_output = run_verify(verify)
@@ -4294,6 +5340,9 @@ def run_headless(
         except Exception as err:  # noqa: BLE001 — reported in the result
             error = str(err)
             print(f"{RED}Error: {error}{RESET}")
+        finally:
+            if sdk is not None:
+                sdk.close()
     texts = [
         flatten_content(m["content"]) for m in messages if m["role"] == "assistant"
     ]
@@ -4310,6 +5359,8 @@ def run_headless(
             "backend": BACKEND,
             "model": MODEL,
         }
+        if sdk is not None:
+            out["cost_usd"] = round(cost_usd, 6)
         if schema is not None:
             out["structured_output"] = (
                 _STRUCTURED_RESULT[0] if _STRUCTURED_RESULT else None
@@ -4445,7 +5496,12 @@ def main() -> None:
     for path in find_agents_files():
         print(f"{DIM}Loaded {path}{RESET}")
     messages = load_history()
-    if messages:
+    if BACKEND == AGENT_SDK_BACKEND:
+        if _load_agent_sdk_session_id():
+            print(
+                f"{DIM}Resuming the Claude Agent SDK session (/clear starts fresh){RESET}"
+            )
+    elif messages:
         chats = sum(1 for m in messages if m.get("role") == "user")
         print(f"{DIM}Restored {chats} chats{RESET}")
 
@@ -4461,6 +5517,9 @@ def main() -> None:
             if action == "quit":
                 break
             if action == "handled":
+                continue
+            if BACKEND == AGENT_SDK_BACKEND:
+                agent_sdk_session().run(user_input)
                 continue
             messages.append({"role": "user", "content": user_input})
             run_agent_turn(messages, system_prompt, mlx_state)
@@ -4483,6 +5542,7 @@ def main() -> None:
                 traceback.print_exc()
             else:
                 print(f"{DIM}(set WRENCODE_DEBUG=1 for the full traceback){RESET}")
+    close_agent_sdk_session()
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from email.message import Message
+from typing import Any
 from unittest import mock
 
 import wrencode
@@ -180,6 +182,33 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertNotIn("\033[1m", chat)
         self.assertIn("hello", strip_ansi(chat))
 
+    def test_format_input_line_unknown_slash_is_plain(self):
+        with mock.patch.object(wrencode, "colors_enabled", return_value=True):
+            path = wrencode.format_input_line("/usr/bin is missing")
+            prefix = wrencode.format_input_line("/mo")
+            alias = wrencode.format_input_line("/q")
+        self.assertNotIn("\033[1m", path)
+        self.assertIn("\033[1m", prefix)
+        self.assertIn("\033[1m", alias)
+
+    def test_slash_matches_prefix(self):
+        self.assertEqual(wrencode.slash_matches("/mo"), ["/model"])
+        self.assertEqual(
+            wrencode.slash_matches("/c"), ["/configure", "/compact", "/clear"]
+        )
+        self.assertEqual(wrencode.slash_matches("/model gpt"), [])
+        self.assertEqual(wrencode.slash_matches("hello"), [])
+        self.assertIn("/help", wrencode.slash_matches("/"))
+
+    def test_slash_aliases_dispatch(self):
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "x"}]
+        with mock.patch.object(wrencode, "save_history"):
+            action, _ = wrencode.handle_slash_command("/c", msgs, None)
+            self.assertEqual((action, msgs), ("handled", []))
+            for cmd in ("/q", "/quit", "/exit"):
+                action, _ = wrencode.handle_slash_command(cmd, msgs, None)
+                self.assertEqual(action, "quit")
+
     def test_read_user_input_fallback(self):
         import io
 
@@ -291,11 +320,300 @@ class TestChooseBackendInteractive(unittest.TestCase):
                 return_value="claude-haiku-4-5-20251001",
             ),
             mock.patch("getpass.getpass", return_value=""),
+            mock.patch("builtins.input", return_value=""),
+            mock.patch.object(wrencode, "verify_api_key", return_value=("ok", "")),
         ):
             wrencode.choose_backend_interactive()
         saved = json.loads(wrencode.CONFIG_FILE.read_text())
         self.assertEqual(saved["api_key"], "sk-secret")
         self.assertEqual(wrencode.API_KEY, "sk-secret")
+
+    def test_reconfigure_saves_anthropic_workspace_id(self):
+        wrencode.save_config(
+            {
+                "backend": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "api_key": "sk-secret",
+            }
+        )
+        with (
+            mock.patch.object(wrencode, "pick_from_list", return_value=0),
+            mock.patch.object(
+                wrencode,
+                "pick_model_interactive",
+                return_value="claude-haiku-4-5-20251001",
+            ),
+            mock.patch("getpass.getpass", return_value=""),
+            mock.patch("builtins.input", return_value="wrkspc_test123"),
+            mock.patch.object(wrencode, "verify_api_key", return_value=("ok", "")),
+        ):
+            wrencode.choose_backend_interactive()
+        saved = json.loads(wrencode.CONFIG_FILE.read_text())
+        self.assertEqual(saved["anthropic_workspace_id"], "wrkspc_test123")
+        self.assertEqual(wrencode.ANTHROPIC_WORKSPACE_ID, "wrkspc_test123")
+
+    def _configure_anthropic(self, typed_key):
+        with (
+            mock.patch.object(wrencode, "pick_from_list", return_value=0),
+            mock.patch.object(
+                wrencode, "pick_model_interactive", return_value="claude-x"
+            ),
+            mock.patch("getpass.getpass", return_value=typed_key),
+            mock.patch("builtins.input", return_value=""),
+            mock.patch.object(wrencode, "verify_api_key", return_value=("ok", "")),
+        ):
+            wrencode.choose_backend_interactive()
+        return json.loads(wrencode.CONFIG_FILE.read_text())
+
+    def test_reconfigure_replaces_env_key(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-stale-from-dotenv"
+        saved = self._configure_anthropic("sk-fresh")
+        self.assertEqual(saved["api_key"], "sk-fresh")
+        self.assertEqual(saved["api_key_overrides_env"], "1")
+        self.assertEqual(wrencode.API_KEY, "sk-fresh")
+        # Next launch: .env sets the stale key again, the saved key still wins.
+        os.environ["ANTHROPIC_API_KEY"] = "sk-stale-from-dotenv"
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BACKEND", None)
+            wrencode.resolve_configuration()
+        self.assertEqual(wrencode.API_KEY, "sk-fresh")
+
+    def test_reconfigure_blank_keeps_env_key(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-from-env"
+        saved = self._configure_anthropic("")
+        self.assertFalse(saved.get("api_key_overrides_env"))
+        self.assertEqual(wrencode.API_KEY, "sk-from-env")
+
+
+class TestAnthropicPromptCaching(unittest.TestCase):
+    def test_request_caches_tools_system_and_history(self):
+        captured: dict[str, Any] = {}
+
+        def fake_post(url, body, headers):
+            captured["body"] = body
+            return {"content": [{"type": "text", "text": "ok"}], "usage": {}}
+
+        orig = (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY)
+        try:
+            wrencode.apply_backend("anthropic", model="claude-x", api_key="sk-t")
+            with mock.patch.object(wrencode, "_http_post", fake_post):
+                wrencode.get_response(
+                    [{"role": "user", "content": "hi"}], "sys-prompt", None
+                )
+        finally:
+            wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY = orig
+        body = captured["body"]
+        ephemeral = {"type": "ephemeral"}
+        self.assertEqual(body["cache_control"], ephemeral)  # growing history
+        self.assertEqual(body["system"][-1]["cache_control"], ephemeral)
+        self.assertEqual(body["tools"][-1]["cache_control"], ephemeral)
+        self.assertEqual(body["max_tokens"], wrencode.CLAUDE_MAX_TOKENS)
+
+    def test_effort_is_sent_only_when_set(self):
+        self.assertEqual(wrencode._claude_output_config(), {})
+        with mock.patch.object(wrencode, "CLAUDE_EFFORT", "high"):
+            self.assertEqual(
+                wrencode._claude_output_config(), {"output_config": {"effort": "high"}}
+            )
+
+
+try:
+    import claude_agent_sdk
+except ImportError:  # optional extra; message tests need its real types
+    claude_agent_sdk = None
+
+
+class TestAgentSDKBackend(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp())
+        self._patches = [
+            mock.patch.object(wrencode, "CONFIG_DIR", self._tmp),
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp)}),
+        ]
+        for p in self._patches:
+            p.start()
+        self._saved = (
+            wrencode.BACKEND,
+            wrencode.MODEL,
+            wrencode.API_KEY,
+            wrencode.ANTHROPIC_WORKSPACE_ID,
+        )
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID", "MODEL"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        import shutil
+
+        (
+            wrencode.BACKEND,
+            wrencode.MODEL,
+            wrencode.API_KEY,
+            wrencode.ANTHROPIC_WORKSPACE_ID,
+        ) = self._saved
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_apply_backend_uses_anthropic_key_and_workspace(self):
+        wrencode.apply_backend(
+            "claude-agent-sdk", api_key="sk-t", anthropic_workspace_id="wrkspc_1"
+        )
+        self.assertEqual(wrencode.API_KEY, "sk-t")
+        self.assertEqual(wrencode.ANTHROPIC_WORKSPACE_ID, "wrkspc_1")
+        self.assertEqual(wrencode.MODEL, "claude-opus-5-5")
+
+    def test_env_forces_api_key_billing(self):
+        wrencode.apply_backend(
+            "claude-agent-sdk", api_key="sk-t", anthropic_workspace_id="wrkspc_1"
+        )
+        with mock.patch.dict(os.environ, {"ANTHROPIC_CUSTOM_HEADERS": "x-a: 1"}):
+            env = wrencode._agent_sdk_env()
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-t")
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"], "x-a: 1\nanthropic-workspace-id: wrkspc_1"
+        )
+
+    def test_env_omits_workspace_header_when_unset(self):
+        wrencode.apply_backend("claude-agent-sdk", api_key="sk-t")
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", wrencode._agent_sdk_env())
+
+    def test_tool_action_summaries(self):
+        fmt = wrencode.format_sdk_tool_action
+        self.assertEqual(fmt("Bash", {"command": "ls -la"}), "$ ls -la")
+        self.assertEqual(fmt("Read", {"file_path": "a.py"}), "Read a.py")
+        self.assertEqual(fmt("Grep", {"pattern": "TODO"}), "Grep TODO")
+        edit = fmt("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"})
+        self.assertEqual(edit, "Edit a.py\n- x\n+ y")
+        self.assertTrue(fmt("Odd", {"k": 1}).startswith("Odd("))
+
+    def test_hidden_from_frozen_binary(self):
+        with mock.patch.object(wrencode, "is_frozen", return_value=True):
+            self.assertNotIn("claude-agent-sdk", wrencode.available_backends())
+        with mock.patch.object(wrencode, "is_frozen", return_value=False):
+            self.assertIn("claude-agent-sdk", wrencode.available_backends())
+
+    def test_session_id_saved_per_workspace(self):
+        wrencode._save_agent_sdk_session_id("sess-1")
+        self.assertEqual(wrencode._load_agent_sdk_session_id(), "sess-1")
+        wrencode._save_agent_sdk_session_id("")
+        self.assertEqual(wrencode._load_agent_sdk_session_id(), "")
+
+    def test_clear_resets_sdk_session(self):
+        session = mock.MagicMock()
+        with (
+            mock.patch.object(wrencode, "BACKEND", "claude-agent-sdk"),
+            mock.patch.object(wrencode, "agent_sdk_session", return_value=session),
+            mock.patch.object(wrencode, "save_history"),
+        ):
+            action, _ = wrencode.handle_slash_command("/clear", [], None)
+            wrencode.handle_slash_command("/compact", [], None)
+        self.assertEqual(action, "handled")
+        session.reset.assert_called_once()
+        session.run.assert_called_once_with("/compact")
+
+    def test_headless_routes_to_sdk_and_reports_cost(self):
+        fake = mock.MagicMock()
+        fake.run.return_value = wrencode.AgentSDKTurn(text="Done.", cost_usd=0.0123)
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(wrencode, "resolve_configuration", lambda: None),
+            mock.patch.object(wrencode, "load_model", lambda: None),
+            mock.patch.object(wrencode, "BACKEND", "claude-agent-sdk"),
+            mock.patch.object(wrencode, "AgentSDKSession", return_value=fake),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", err),
+        ):
+            code = wrencode.run_headless("do it", "json")
+        data = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(data["result"], "Done.")
+        self.assertEqual(data["cost_usd"], 0.0123)
+        fake.run.assert_called_once_with("do it")
+        fake.close.assert_called_once()
+
+    @staticmethod
+    def _sdk():
+        assert claude_agent_sdk is not None  # the tests below skip without it
+        return claude_agent_sdk
+
+    def _session(self):
+        with mock.patch("asyncio.new_event_loop"):
+            return wrencode.AgentSDKSession()
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_result_message_reports_turn_cost(self):
+        sdk = self._sdk()
+        session = self._session()
+        turn = wrencode.AgentSDKTurn()
+
+        def result(total, sid="s1"):
+            return sdk.ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                total_cost_usd=total,
+                result="ok",
+            )
+
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            self.assertTrue(session._handle_message(result(0.05), turn))
+            self.assertTrue(session._handle_message(result(0.08), turn))
+        self.assertAlmostEqual(turn.cost_usd, 0.03)
+        self.assertIn("$0.0300 this turn", out.getvalue())
+        self.assertEqual(wrencode._load_agent_sdk_session_id(), "s1")
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_workspace_error_gets_a_hint(self):
+        sdk = self._sdk()
+        session = self._session()
+        turn = wrencode.AgentSDKTurn()
+        msg = sdk.ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s1",
+            result="API Error: 400 must include the anthropic-workspace-id header",
+        )
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            session._handle_message(msg, turn)
+        self.assertTrue(turn.is_error)
+        self.assertIn("/configure", out.getvalue())
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_warns_when_not_billed_to_api_key(self):
+        sdk = self._sdk()
+        session = self._session()
+        msg = sdk.SystemMessage(
+            subtype="init", data={"apiKeySource": "claude.ai", "session_id": "s2"}
+        )
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            session._handle_message(msg, wrencode.AgentSDKTurn())
+        self.assertIn("may not bill", out.getvalue())
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_assistant_text_and_tool_calls_print(self):
+        sdk = self._sdk()
+        session = self._session()
+        turn = wrencode.AgentSDKTurn()
+        msg = sdk.AssistantMessage(
+            content=[
+                sdk.TextBlock(text="Looking."),
+                sdk.ToolUseBlock(id="t1", name="Bash", input={"command": "ls"}),
+            ],
+            model="claude-opus-5-5",
+        )
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            self.assertFalse(session._handle_message(msg, turn))
+        self.assertEqual(turn.text, "Looking.")
+        self.assertIn("$ ls", out.getvalue())
 
 
 class TestToolArgs(unittest.TestCase):
@@ -326,9 +644,98 @@ class TestToolArgs(unittest.TestCase):
 class TestModelPicker(unittest.TestCase):
     def test_list_models_includes_current_and_custom(self):
         wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
-        models = wrencode.list_models_for_backend("anthropic")
+        with mock.patch.object(
+            wrencode,
+            "fetch_anthropic_models",
+            return_value=["claude-haiku-4-5-20251001", "claude-sonnet-4-5"],
+        ):
+            models = wrencode.list_models_for_backend("anthropic")
         self.assertIn("claude-haiku-4-5-20251001", models)
+        self.assertIn("claude-sonnet-4-5", models)
         self.assertIn(wrencode.CUSTOM_MODEL_OPTION, models)
+
+    def test_list_models_fetches_from_anthropic(self):
+        wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
+        with mock.patch.object(
+            wrencode,
+            "fetch_anthropic_models",
+            return_value=["claude-opus-4-6", "claude-haiku-4-5-20251001"],
+        ) as fetch:
+            models = wrencode.list_models_for_backend("anthropic")
+        fetch.assert_called_once()
+        self.assertEqual(models[0], "claude-opus-4-6")
+        self.assertIn(wrencode.CUSTOM_MODEL_OPTION, models)
+
+    def test_anthropic_headers_include_workspace_id(self):
+        orig_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        orig_ws = os.environ.pop("ANTHROPIC_WORKSPACE_ID", None)
+        try:
+            wrencode.apply_backend(
+                "anthropic",
+                model="claude-haiku-4-5-20251001",
+                api_key="sk-test",
+                anthropic_workspace_id="wrkspc_abc",
+            )
+            headers = wrencode._anthropic_headers()
+            self.assertEqual(headers["anthropic-workspace-id"], "wrkspc_abc")
+            self.assertEqual(headers["x-api-key"], "sk-test")
+        finally:
+            if orig_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = orig_key
+            if orig_ws is not None:
+                os.environ["ANTHROPIC_WORKSPACE_ID"] = orig_ws
+
+    def test_anthropic_headers_omit_workspace_when_unset(self):
+        orig_ws = os.environ.pop("ANTHROPIC_WORKSPACE_ID", None)
+        try:
+            wrencode.apply_backend(
+                "anthropic", model="claude-haiku-4-5-20251001", api_key="sk-test"
+            )
+            headers = wrencode._anthropic_headers()
+            self.assertNotIn("anthropic-workspace-id", headers)
+        finally:
+            if orig_ws is not None:
+                os.environ["ANTHROPIC_WORKSPACE_ID"] = orig_ws
+
+    def test_fetch_anthropic_models_parses_provider_response(self):
+        payload = {
+            "data": [
+                {"id": "claude-opus-4-6", "type": "model"},
+                {"id": "claude-haiku-4-5-20251001", "type": "model"},
+            ],
+            "has_more": False,
+            "last_id": "claude-haiku-4-5-20251001",
+        }
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = io.BytesIO(json.dumps(payload).encode())
+        cm.__exit__.return_value = False
+        self._tmp = tempfile.mkdtemp()
+        orig_cache = wrencode.ANTHROPIC_MODELS_CACHE
+        orig_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        orig_ws = os.environ.pop("ANTHROPIC_WORKSPACE_ID", None)
+        wrencode.ANTHROPIC_MODELS_CACHE = (
+            pathlib.Path(self._tmp) / "anthropic_models.json"
+        )
+        wrencode.apply_backend(
+            "anthropic", model="x", api_key="sk-test", anthropic_workspace_id="wrkspc_1"
+        )
+        try:
+            with mock.patch("urllib.request.urlopen", return_value=cm) as urlopen:
+                ids = wrencode.fetch_anthropic_models()
+            self.assertEqual(ids, ["claude-opus-4-6", "claude-haiku-4-5-20251001"])
+            req = urlopen.call_args[0][0]
+            hdrs = {k.lower(): v for k, v in req.headers.items()}
+            self.assertEqual(hdrs.get("x-api-key"), "sk-test")
+            self.assertEqual(hdrs.get("anthropic-workspace-id"), "wrkspc_1")
+        finally:
+            wrencode.ANTHROPIC_MODELS_CACHE = orig_cache
+            if orig_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = orig_key
+            if orig_ws is not None:
+                os.environ["ANTHROPIC_WORKSPACE_ID"] = orig_ws
+            import shutil
+
+            shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_pick_from_list_numbered(self):
         with mock.patch("builtins.input", return_value="2"):
@@ -692,17 +1099,19 @@ class TestResolveConfiguration(unittest.TestCase):
             json.dump({"backend": "anthropic", "model": "claude-x"}, f)
         wrencode.CONFIG_FILE = config_path
         saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: True
         called = []
-        orig_chooser = wrencode.choose_backend_interactive
-        wrencode.choose_backend_interactive = lambda: called.append(True)
         try:
-            wrencode.resolve_configuration()
+            with (
+                mock.patch.object(sys.stdin, "isatty", return_value=True),
+                mock.patch.object(
+                    wrencode,
+                    "choose_backend_interactive",
+                    side_effect=lambda: called.append(True),
+                ),
+            ):
+                wrencode.resolve_configuration()
             self.assertEqual(called, [True])
         finally:
-            sys.stdin.isatty = orig_isatty
-            wrencode.choose_backend_interactive = orig_chooser
             if saved_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = saved_key
 
@@ -714,32 +1123,32 @@ class TestResolveConfiguration(unittest.TestCase):
             json.dump({"backend": "anthropic", "model": "claude-x"}, f)
         wrencode.CONFIG_FILE = config_path
         saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: False
         called = []
-        orig_chooser = wrencode.choose_backend_interactive
-        wrencode.choose_backend_interactive = lambda: called.append(True)
         try:
-            wrencode.resolve_configuration()
+            with (
+                mock.patch.object(sys.stdin, "isatty", return_value=False),
+                mock.patch.object(
+                    wrencode,
+                    "choose_backend_interactive",
+                    side_effect=lambda: called.append(True),
+                ),
+            ):
+                wrencode.resolve_configuration()
             self.assertEqual(called, [])
             self.assertEqual(wrencode.BACKEND, "anthropic")
         finally:
-            sys.stdin.isatty = orig_isatty
-            wrencode.choose_backend_interactive = orig_chooser
             if saved_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = saved_key
 
     def test_non_interactive_no_config_raises_system_exit(self):
         # Point to an empty tmpdir (no config.json) and make stdin non-tty
         wrencode.CONFIG_FILE = pathlib.Path(self._tmp) / "config.json"
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: False
-        try:
-            with self.assertRaises(SystemExit) as cm:
-                wrencode.resolve_configuration()
-            self.assertEqual(cm.exception.code, 1)
-        finally:
-            sys.stdin.isatty = orig_isatty
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=False),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            wrencode.resolve_configuration()
+        self.assertEqual(cm.exception.code, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1358,11 @@ class TestAgentLoopSmoke(unittest.TestCase):
         # Use ollama so the agent loop takes the XML tool-call path
         self._orig_backend = wrencode.BACKEND
         wrencode.apply_backend("ollama")
-        self._orig_get_response = wrencode.get_response
+
+    def _mock_get_response(self, fn):
+        patcher = mock.patch.object(wrencode, "get_response", fn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         import shutil
@@ -963,7 +1376,6 @@ class TestAgentLoopSmoke(unittest.TestCase):
             os.environ["WRENCODE_AUTO_APPROVE"] = self._orig_auto_approve
         elif "WRENCODE_AUTO_APPROVE" in os.environ:
             del os.environ["WRENCODE_AUTO_APPROVE"]
-        wrencode.get_response = self._orig_get_response
         wrencode.BACKEND = self._orig_backend
 
     def test_one_tool_call_then_final_answer(self):
@@ -980,9 +1392,11 @@ class TestAgentLoopSmoke(unittest.TestCase):
                 return '<tool_call>{"tool": "read", "args": {"path": "greeting.txt"}}</tool_call>'
             return "The file says: Hello from wrencode!"
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
-        messages = [{"role": "user", "content": "Read greeting.txt for me"}]
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": "Read greeting.txt for me"}
+        ]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=5)
 
         # Two get_response calls: one tool call + one final answer
@@ -1015,12 +1429,136 @@ class TestAgentLoopSmoke(unittest.TestCase):
             call_count[0] += 1
             return "Just a plain answer, no tools needed."
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
         messages = [{"role": "user", "content": "Say hello"}]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=5)
 
         self.assertEqual(call_count[0], 1)
+
+    def _task_reply(self, *prompts):
+        return "".join(
+            "<tool_call>"
+            + json.dumps({"tool": "task", "args": {"prompt": p}})
+            + "</tool_call>"
+            for p in prompts
+        )
+
+    def test_task_tool_runs_subagents(self):
+        """Two task calls in one reply each run a subagent; results reach the parent."""
+        answers = {"count a": "a is 1", "count b": "b is 2"}
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            first = wrencode.flatten_content(messages[0]["content"])
+            if first in answers:
+                return answers[first]
+            if len(messages) == 1:
+                return self._task_reply("count a", "count b")
+            return "Both counted."
+
+        self._mock_get_response(mock_get_response)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "count both"}]
+        with mock.patch("sys.stdout", io.StringIO()):
+            reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
+        self.assertEqual(reason, "done")
+        results = messages[2]["content"]
+        # Results keep the order of the calls, whichever subagent finished first.
+        self.assertIn("a is 1", results[0]["content"])
+        self.assertIn("b is 2", results[1]["content"])
+        self.assertEqual(
+            wrencode.flatten_content(messages[-1]["content"]), "Both counted."
+        )
+
+    def test_subagents_run_at_the_same_time(self):
+        """Three subagents must all be waiting at once to pass the barrier."""
+        import threading
+
+        barrier = threading.Barrier(3, timeout=5)
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            first = wrencode.flatten_content(messages[0]["content"])
+            if first.startswith("part"):
+                barrier.wait()  # raises BrokenBarrierError if they ran in turn
+                return f"{first} done"
+            if len(messages) == 1:
+                return self._task_reply("part 1", "part 2", "part 3")
+            return "All parts done."
+
+        self._mock_get_response(mock_get_response)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
+        self.assertEqual(reason, "done")
+        results = [b["content"] for b in messages[2]["content"]]
+        self.assertEqual(results, ["part 1 done", "part 2 done", "part 3 done"])
+        text = strip_ansi(out.getvalue())
+        self.assertIn("running 3 subagents in parallel", text)
+        for tag in ("[1]", "[2]", "[3]"):
+            self.assertIn(tag, text)
+
+    def test_local_weights_run_subagents_in_order(self):
+        calls = [wrencode.ToolCall(str(i), "task", {"prompt": "x"}) for i in range(2)]
+        with mock.patch.object(wrencode, "BACKEND", "mlx"):
+            self.assertEqual(wrencode._run_parallel_tasks(calls), {})
+        with mock.patch.object(wrencode, "MAX_PARALLEL_SUBAGENTS", 1):
+            self.assertEqual(wrencode._run_parallel_tasks(calls), {})
+
+    def test_cancel_stops_the_batch(self):
+        def mock_get_response(messages, system_prompt, mlx_state):
+            first = wrencode.flatten_content(messages[0]["content"])
+            if first.startswith("slow"):
+                wrencode._CANCEL_REQUESTED.set()  # as if Escape was pressed
+                return "partial"
+            return self._task_reply("slow 1", "slow 2")
+
+        self._mock_get_response(mock_get_response)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
+        with mock.patch("sys.stdout", io.StringIO()):
+            reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
+        self.assertEqual(reason, "cancelled")
+        self.assertFalse(wrencode._CANCEL_REQUESTED.is_set())
+
+    def test_subagent_depth_is_per_thread(self):
+        import threading
+
+        seen: list[int] = []
+
+        def probe():
+            seen.append(wrencode._subagent_depth())
+
+        wrencode._AGENT_LOCAL.depth = 1
+        try:
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+        finally:
+            wrencode._AGENT_LOCAL.depth = 0
+        self.assertEqual(seen, [0])
+
+    def test_approval_holds_other_agents_output(self):
+        import threading
+
+        real = io.StringIO()
+        out = wrencode._AgentStdout(real)
+        wrencode._AGENT_LOCAL.tag = "1"
+        try:
+            out.hold()  # agent 1 is at an approval prompt
+            other = threading.Thread(
+                target=lambda: (
+                    setattr(wrencode._AGENT_LOCAL, "tag", "2"),
+                    out.write("from two\n"),
+                )
+            )
+            other.start()
+            other.join()
+            out.write("Approve? ")
+            self.assertEqual(real.getvalue(), "Approve? ")  # agent 2 is held
+            out.release()
+        finally:
+            del wrencode._AGENT_LOCAL.tag
+        self.assertIn("from two", strip_ansi(real.getvalue()))
+        self.assertIn("[2] from two", strip_ansi(real.getvalue()))
 
     def test_tool_call_dispatches_real_tool(self):
         """Verify that run_tool dispatches to the real read implementation."""
@@ -1038,7 +1576,7 @@ class TestAgentLoopSmoke(unittest.TestCase):
             call_count[0] += 1
             return '<tool_call>{"tool": "glob", "args": {"pat": "*.txt"}}</tool_call>'
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
         messages = [{"role": "user", "content": "loop forever"}]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=3)
@@ -1052,7 +1590,7 @@ class TestAgentLoopSmoke(unittest.TestCase):
             call_count[0] += 1
             return '<tool_call>{"tool": "read", "args": {"path": "missing.txt"}}</tool_call>'
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
         messages = [{"role": "user", "content": "keep retrying"}]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=20)
@@ -1188,7 +1726,7 @@ class TestCertifiTrustStore(unittest.TestCase):
             import certifi
         except ImportError:
             self.skipTest("certifi not installed in this environment")
-        cert_file = os.environ.get("SSL_CERT_FILE")
+        cert_file = os.environ.get("SSL_CERT_FILE", "")
         self.assertEqual(cert_file, certifi.where())
         self.assertTrue(os.path.exists(cert_file))
 
@@ -1636,9 +2174,8 @@ class TestSynthesize(unittest.TestCase):
             self.assertEqual(out.read_text(), "# SYNTHESIS\nmerged")
 
     def test_run_synthesize_errors_when_no_transcripts(self):
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(SystemExit):
-                wrencode.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit):
+            wrencode.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
 
 
 class TestNanoGPTBackend(unittest.TestCase):
@@ -1976,7 +2513,7 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         test = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *a):
+            def log_message(self, format: str, *args: Any) -> None:
                 pass
 
             def _send(self, payload):
@@ -2105,7 +2642,7 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         def deny(*a, **k):
             import urllib.error
 
-            raise urllib.error.HTTPError("u", 401, "x", {}, io.BytesIO(b""))
+            raise urllib.error.HTTPError("u", 401, "x", Message(), io.BytesIO(b""))
 
         err = io.StringIO()
         with (
@@ -2175,7 +2712,7 @@ class TestAutoCompact(unittest.TestCase):
         self.assertEqual(wrencode._to_openai_messages(msgs), msgs)  # nothing orphaned
 
     def test_anthropic_blocks_stay_paired(self):
-        msgs = [{"role": "user", "content": "go"}]
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
         for i in range(12):
             msgs.append(
                 {
@@ -2342,7 +2879,7 @@ class TestHttpRetry(unittest.TestCase):
     def http_error(self, code):
         import urllib.error
 
-        return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b"busy"))
+        return urllib.error.HTTPError("u", code, "x", Message(), io.BytesIO(b"busy"))
 
     def test_retries_server_errors_then_succeeds(self):
         ok = mock.MagicMock()
@@ -2646,7 +3183,7 @@ class TestStructuredOutput(unittest.TestCase):
                 t["function"]["name"] for t in wrencode._build_tool_schemas("openai")
             ]
             self.assertIn("respond", names)
-            with mock.patch.object(wrencode, "_SUBAGENT_DEPTH", 1):
+            with mock.patch.object(wrencode, "_subagent_depth", return_value=1):
                 names = [
                     t["function"]["name"]
                     for t in wrencode._build_tool_schemas("openai")
@@ -2830,7 +3367,7 @@ class TestRepeatedFailingCalls(unittest.TestCase):
             f"<tool_call>{bad}</tool_call><tool_call>{bad}</tool_call><tool_call>"
             + '{"tool": "glob", "args": {"pat": "*"}}</tool_call>'
         )
-        msgs = [{"role": "user", "content": "go"}]
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
         with (
             mock.patch.object(wrencode, "TOOL_ERROR_REPEAT_LIMIT", 2),
             mock.patch.object(wrencode, "get_response", lambda *a: batch),
