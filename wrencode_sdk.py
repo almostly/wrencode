@@ -2,6 +2,8 @@
 Claude Agent SDK, with wrencode's approvals, Escape-to-interrupt and cost display.
 """
 
+from __future__ import annotations
+
 import contextlib
 import json
 import os
@@ -10,11 +12,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import wrencode_backends as backends
 import wrencode_ui as ui
-from wrencode_ui import RESET, DIM, GREEN, YELLOW, RED
+from wrencode_ui import DIM, GREEN, RED, RESET, YELLOW
 
 
 def _agent_sdk_sessions_file() -> pathlib.Path:
@@ -100,7 +102,7 @@ class _Spinner:
 
     def __init__(self) -> None:
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread is not None or not sys.stdout.isatty() or ui.HEADLESS:

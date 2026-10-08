@@ -5,6 +5,8 @@ Run (from the repo root — stdlib only, no extra deps):
     # or:  python test_wrencode.py
 """
 
+from __future__ import annotations
+
 import io
 import json
 import os
@@ -14,15 +16,15 @@ import sys
 import tempfile
 import unittest
 from email.message import Message
-from typing import Any
+from typing import Any, ClassVar
 from unittest import mock
 
 import wrencode
-import wrencode_ui as ui
 import wrencode_backends as backends
 import wrencode_configure as configure
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
+import wrencode_ui as ui
 
 # ANSI escape codes that wrencode emits
 RESET = "\033[0m"
@@ -1891,11 +1893,13 @@ class TestBedrockSigV4(unittest.TestCase):
     def test_missing_credentials_raises(self):
         # Mock the resolver empty — clearing env alone won't do it, since there's
         # a ~/.aws/credentials fallback that may exist on the dev machine.
-        with mock.patch.object(backends, "_aws_credentials", return_value=("", "", "")):
-            with self.assertRaises(Exception):
-                backends._sigv4_signed_headers(
-                    "POST", "https://x/y", b"{}", "bedrock-runtime", "us-east-1"
-                )
+        with (
+            mock.patch.object(backends, "_aws_credentials", return_value=("", "", "")),
+            self.assertRaises(RuntimeError),
+        ):
+            backends._sigv4_signed_headers(
+                "POST", "https://x/y", b"{}", "bedrock-runtime", "us-east-1"
+            )
 
 
 class TestBedrockBackend(unittest.TestCase):
@@ -2856,7 +2860,7 @@ class TestAutoCompactInLoop(unittest.TestCase):
         def get_response(*a):
             calls.append(1)
             if len(calls) == 1:
-                raise Exception(
+                raise RuntimeError(
                     "HTTP 400: prompt is too long: 210000 tokens > 200000 maximum"
                 )
             return "ok"
@@ -2871,7 +2875,7 @@ class TestAutoCompactInLoop(unittest.TestCase):
 
     def test_repeated_context_error_raises(self):
         def get_response(*a):
-            raise Exception(
+            raise RuntimeError(
                 "HTTP 400: This model's maximum context length is 8192 tokens"
             )
 
@@ -2884,7 +2888,7 @@ class TestAutoCompactInLoop(unittest.TestCase):
 
     def test_other_errors_not_retried(self):
         def get_response(*a):
-            raise Exception("HTTP 401: bad key")
+            raise RuntimeError("HTTP 401: bad key")
 
         with (
             mock.patch.object(backends, "get_response", get_response),
@@ -3060,7 +3064,7 @@ class TestTruncationRecovery(unittest.TestCase):
 
 
 class TestValidateJson(unittest.TestCase):
-    SCHEMA = {
+    SCHEMA: ClassVar[dict[str, Any]] = {
         "type": "object",
         "properties": {
             "verdict": {"enum": ["pass", "fail"]},
@@ -3115,7 +3119,7 @@ class TestValidateJson(unittest.TestCase):
 
 
 class TestStructuredOutput(unittest.TestCase):
-    SCHEMA = {
+    SCHEMA: ClassVar[dict[str, Any]] = {
         "type": "object",
         "properties": {
             "bugs": {"type": "integer"},
@@ -3165,8 +3169,8 @@ class TestStructuredOutput(unittest.TestCase):
 
     @staticmethod
     def call(args):
-        return '<tool_call>{"tool": "respond", "args": %s}</tool_call>' % json.dumps(
-            args
+        return (
+            f'<tool_call>{{"tool": "respond", "args": {json.dumps(args)}}}</tool_call>'
         )
 
     def test_valid_answer_ends_run(self):
@@ -3204,7 +3208,7 @@ class TestStructuredOutput(unittest.TestCase):
         self.assertIsNone(data["structured_output"])
 
     def test_non_object_schema_is_wrapped(self):
-        code, out, _ = self.run_headless(
+        _code, out, _ = self.run_headless(
             [self.call({"value": ["x", "y"]})],
             {"type": "array", "items": {"type": "string"}},
         )

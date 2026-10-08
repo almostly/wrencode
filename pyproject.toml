@@ -68,6 +68,23 @@ changelog_incremental = true
 # Pre-commitizen four-part tags (0.1.4.x); their history is in CHANGELOG.md.
 ignored_tag_formats = ["$major.$minor.$patch.*"]
 
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+# ruff's defaults plus the families the code is kept clean under; a deliberate
+# catch-all `except Exception` carries a `# noqa: BLE001` with its reason.
+extend-select = ["I", "UP", "B", "SIM", "BLE", "TRY", "RUF", "PLW", "FA", "FLY", "S110"]
+ignore = [
+    "PLW0603", # module-level state is set with `global` on purpose (see apply_backend)
+    "TRY003",  # exception messages are written where they are raised
+    "TRY300",  # `return` inside `try` reads fine here
+    "TRY301",  # so does `raise` inside `try`
+    "RUF001",  # em dashes, ellipses and arrows are used deliberately in UI text...
+    "RUF002",  # ...in docstrings...
+    "RUF003",  # ...and in comments
+]
+
 [tool.ty.analysis]
 # Optional at runtime, so not installed in the dev environment: certifi is
 # soft-imported for the frozen binary's CA bundle, mlx-lm and transformers/torch

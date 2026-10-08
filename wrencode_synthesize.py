@@ -2,20 +2,22 @@
 (normalize -> extract -> reconcile), with model-agnostic transcript adapters.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import pathlib
 import re
 import sys
 import time
-from typing import Any, Optional
+from typing import Any
 
 import wrencode_backends as backends
 import wrencode_ui as ui
-from wrencode_ui import RESET, BOLD, DIM, BLUE, YELLOW, RED
+from wrencode_ui import BLUE, BOLD, DIM, RED, RESET, YELLOW
 
 # The loaded local model (mlx / transformers), when this subcommand needs one.
-_MLX_STATE: Optional[tuple[Any, Any]] = None
+_MLX_STATE: tuple[Any, Any] | None = None
 
 
 # -----------------------------------------------------------------------------------------------
@@ -138,7 +140,7 @@ def _synth_complete(system_prompt: str, user_text: str, prefill: str = "") -> st
     return text.strip()
 
 
-def _parse_claude_code_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
+def _parse_claude_code_jsonl(raw: str) -> list[dict[str, str]] | None:
     """Extract user prompts + assistant text from a Claude Code JSONL log, or None.
 
     Drops tool calls, tool results, and thinking — only the user↔assistant signal
@@ -146,8 +148,8 @@ def _parse_claude_code_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
     """
     turns: list[dict[str, str]] = []
     looks_jsonl = False
-    for line in raw.splitlines():
-        line = line.strip()
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -185,7 +187,7 @@ _USER_ROLES = {"user", "human", "prompt", "you"}
 _ASSISTANT_ROLES = {"assistant", "ai", "model", "bot", "agent", "gpt", "claude"}
 
 
-def _coerce_role(o: dict[str, Any]) -> Optional[str]:
+def _coerce_role(o: dict[str, Any]) -> str | None:
     """Map any of the common role fields onto 'user'/'assistant', else None."""
     for k in _ROLE_KEYS:
         v = o.get(k)
@@ -217,7 +219,7 @@ def _coerce_text(v: Any) -> str:
     return ""
 
 
-def _record_to_turn(o: Any) -> Optional[dict[str, str]]:
+def _record_to_turn(o: Any) -> dict[str, str] | None:
     """Convert one generic message record to a {role, text} turn, or None to skip."""
     if not isinstance(o, dict):
         return None
@@ -236,12 +238,12 @@ def _record_to_turn(o: Any) -> Optional[dict[str, str]]:
     return {"role": role, "text": text}
 
 
-def _adapt_generic_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
+def _adapt_generic_jsonl(raw: str) -> list[dict[str, str]] | None:
     """Adapt a JSONL log where each line is a message-ish dict (Codex/OpenAI-style)."""
     turns: list[dict[str, str]] = []
     saw = False
-    for line in raw.splitlines():
-        line = line.strip()
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -257,7 +259,7 @@ def _adapt_generic_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
     return turns if saw and turns else None
 
 
-def _adapt_messages_json(raw: str) -> Optional[list[dict[str, str]]]:
+def _adapt_messages_json(raw: str) -> list[dict[str, str]] | None:
     """Adapt a single JSON value: a list of messages or {messages|conversation:[…]}."""
     try:
         data = json.loads(raw)
@@ -289,7 +291,7 @@ SYNTH_ADAPTERS: list[tuple[str, Any]] = [
 def _synth_normalize(path: str) -> dict[str, Any]:
     """Load a transcript into the common {id, source, turns:[{role,text}]} shape."""
     raw = pathlib.Path(path).read_text(errors="replace")
-    turns: Optional[list[dict[str, str]]] = None
+    turns: list[dict[str, str]] | None = None
     source = "text"
     for name, adapt in SYNTH_ADAPTERS:
         turns = adapt(raw)
@@ -326,8 +328,8 @@ def _synth_extract(chat: dict[str, Any]) -> dict[str, Any]:
     try:
         facts = json.loads(_json_slice(raw))
         if not isinstance(facts, dict):
-            raise ValueError("not an object")
-    except (json.JSONDecodeError, ValueError):
+            raise TypeError("not an object")
+    except (json.JSONDecodeError, ValueError, TypeError):
         facts = {
             "decisions": [],
             "problems_solved": [],
@@ -347,7 +349,7 @@ def _synth_reconcile(fact_sets: list[dict[str, Any]], mode: str = "merge") -> st
     )
 
 
-def _claude_project_dir() -> Optional[pathlib.Path]:
+def _claude_project_dir() -> pathlib.Path | None:
     """Return this workspace's Claude Code transcript dir (~/.claude/projects/...) if any."""
     cwd = os.environ.get("WRENCODE_WORKSPACE") or str(pathlib.Path.cwd().resolve())
     encoded = cwd.replace("/", "-")  # Claude Code encodes the cwd path with dashes
@@ -504,7 +506,7 @@ def _synth_pick(candidates: list[str]) -> list[str]:
 
 def run_synthesize(
     paths: list[str],
-    out: Optional[str] = None,
+    out: str | None = None,
     *,
     interactive: bool = True,
     mode: str = "merge",

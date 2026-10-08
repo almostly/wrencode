@@ -5,13 +5,15 @@ agent identity (_AGENT_LOCAL) that tags a parallel subagent's output and approva
 This module imports nothing else from wrencode.
 """
 
+from __future__ import annotations
+
 import contextlib
 import os
 import re
 import select
 import sys
 import threading
-from typing import Any, Optional
+from typing import Any
 
 _AGENT_LOCAL = threading.local()
 
@@ -152,7 +154,7 @@ def _read_input_char(fd: int) -> str:
 
 
 def _redraw_input_line(
-    text: str, matches: Optional[list[str]] = None, sel: int = 0
+    text: str, matches: list[str] | None = None, sel: int = 0
 ) -> None:
     """Redraw the prompt line plus a completion menu below it, cursor kept on the line."""
     line = format_input_line(text)
@@ -210,7 +212,7 @@ def _read_tty_line(
     prompt: str,
     *,
     history: bool = False,
-    redraw: Optional[Any] = None,
+    redraw: Any | None = None,
     complete: bool = False,
 ) -> str:
     """Read one line in cbreak mode; swallows arrow keys unless history=True.
@@ -387,7 +389,9 @@ def render_banner(color: bool) -> str:
     for row, face in zip(_BANNER_ROWS, _BANNER_FACES):
         tint = f"\033[38;5;{face}m"
         runs = re.sub(
-            r"█+|[^█ ]+", lambda m: (tint if m[0][0] == "█" else shade) + m[0], row
+            r"█+|[^█ ]+",
+            lambda m, tint=tint: (tint if m[0][0] == "█" else shade) + m[0],
+            row,
         )
         lines.append(runs + RESET)
     return "\n".join(lines)
@@ -415,7 +419,7 @@ def _cancel_listener() -> None:
                     break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — no raw stdin (or no termios): lose Escape, nothing else
         pass
 
 
@@ -471,7 +475,7 @@ def confirm(action: str = "") -> str:
 # One approval prompt at a time across parallel subagents.
 _APPROVAL_LOCK = threading.Lock()
 # The Escape listener of the running parallel batch, paused while a prompt reads stdin.
-PARALLEL_ESC: Optional["_EscWatch"] = None
+PARALLEL_ESC: _EscWatch | None = None
 
 
 def _confirm_from_subagent(action: str) -> str:
@@ -544,7 +548,7 @@ _CODE_TOKEN = re.compile(
 def _highlight_code(code: str) -> str:
     """Apply light ANSI syntax coloring to a code block (best-effort, any language)."""
 
-    def color(m: "re.Match[str]") -> str:
+    def color(m: re.Match[str]) -> str:
         g = m.lastgroup
         if g == "comment":
             return f"{DIM}{m.group()}{RESET}"
@@ -563,7 +567,7 @@ def render_markdown(text: str) -> str:
     """Render fenced code blocks (lightly highlighted), inline code, and bold."""
     blocks: list[str] = []
 
-    def stash(m: "re.Match[str]") -> str:
+    def stash(m: re.Match[str]) -> str:
         lang = m.group(1) or ""
         body = _highlight_code(m.group(2).rstrip("\n"))
         head = f"{DIM}┌─ {lang}{RESET}\n" if lang else f"{DIM}┌─{RESET}\n"
@@ -599,7 +603,7 @@ class _AgentStdout:
         self._real = real
         self._lock = threading.Lock()
         self._partial: dict[int, str] = {}
-        self._owner: Optional[int] = None  # thread at an approval prompt
+        self._owner: int | None = None  # thread at an approval prompt
         self._held: list[str] = []
 
     def write(self, text: str) -> int:
@@ -644,7 +648,7 @@ class _EscWatch:
     """Escape-to-cancel listener that can pause while an approval prompt reads stdin."""
 
     def __init__(self) -> None:
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread is not None or not sys.stdin.isatty() or HEADLESS:
@@ -665,9 +669,9 @@ def pick_from_list(
     title: str,
     options: list[str],
     *,
-    labels: Optional[list[str]] = None,
+    labels: list[str] | None = None,
     initial_index: int = 0,
-) -> Optional[int]:
+) -> int | None:
     """Pick one option from a numbered list."""
     if not options:
         print(f"{YELLOW}No options available.{RESET}")

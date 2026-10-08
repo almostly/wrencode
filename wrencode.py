@@ -33,6 +33,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
+from __future__ import annotations
+
 import ast
 import contextlib
 import difflib
@@ -48,7 +50,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 # The PyInstaller single-file binary ships no system CA trust store, so urllib's
 # TLS verification fails out of the box ("CERTIFICATE_VERIFY_FAILED") on a clean
@@ -74,19 +76,17 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                     continue
                 _line = _line.removeprefix("export ")
                 _k, _v = _line.split("=", 1)
-                try:
+                with contextlib.suppress(ValueError):  # malformed quoting: raw value
                     _v = shlex.split(_v)[0] if _v else _v
-                except ValueError:
-                    pass  # malformed quoting — use raw value
                 os.environ.setdefault(_k.strip(), _v)
 
 # The other modules read environment defaults at import, so they come after .env.
-import wrencode_backends as backends  # noqa: E402
-import wrencode_configure as configure  # noqa: E402
-import wrencode_sdk as agent_sdk  # noqa: E402
-import wrencode_synthesize as synthesize  # noqa: E402
-import wrencode_ui as ui  # noqa: E402
-from wrencode_ui import RESET, BOLD, DIM, CYAN, GREEN, YELLOW, RED  # noqa: E402
+import wrencode_backends as backends
+import wrencode_configure as configure
+import wrencode_sdk as agent_sdk
+import wrencode_synthesize as synthesize
+import wrencode_ui as ui
+from wrencode_ui import BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
@@ -100,11 +100,11 @@ MAX_AGENTS_MD_CHARS = 32_000
 # Everything that differs per agent lives in ui._AGENT_LOCAL, because parallel
 # subagents run in threads: depth, tag ("1", "2", "1.2"...), the batch's cancel
 # event, and last_action (the tool call shown, repeated when approval is needed).
-_MLX_STATE: Optional[tuple[Any, Any]] = None
+_MLX_STATE: tuple[Any, Any] | None = None
 # Set by run_headless(--json-schema): the final answer must come through the
 # `respond` tool and match this JSON Schema. _STRUCTURED_RESULT holds it once accepted.
 RESPOND_TOOL = "respond"
-_OUTPUT_SCHEMA: Optional[dict[str, Any]] = None
+_OUTPUT_SCHEMA: dict[str, Any] | None = None
 _STRUCTURED_RESULT: list[Any] = []
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
 # Task calls made in one reply run this many at a time; 1 runs them in order.
@@ -173,8 +173,8 @@ def _require_str(args: dict[str, Any], key: str) -> str:
 
 
 def _optional_int(
-    args: dict[str, Any], key: str, default: Optional[int] = None
-) -> Optional[int]:
+    args: dict[str, Any], key: str, default: int | None = None
+) -> int | None:
     """Return an optional integer from args dict, or default if absent."""
     val = args.get(key)
     if val is None:
@@ -288,7 +288,7 @@ def _indent(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
 
-def _reindented_edit(text: str, old: str, new: str) -> Optional[tuple[str, str]]:
+def _reindented_edit(text: str, old: str, new: str) -> tuple[str, str] | None:
     """Apply an edit whose `old` matches whole lines except for a uniform indent shift.
 
     Models often drop or add one indentation level when quoting a block (e.g. a
@@ -352,9 +352,12 @@ def _not_found_error(text: str, old: str) -> str:
     for i in range(max(1, len(lines) - n + 1)):
         window = "\n".join(l.strip() for l in lines[i : i + n])
         sm = difflib.SequenceMatcher(None, target, window)
-        if sm.real_quick_ratio() > best and sm.quick_ratio() > best:
-            if (r := sm.ratio()) > best:
-                best, best_i = r, i
+        if (
+            sm.real_quick_ratio() > best
+            and sm.quick_ratio() > best
+            and (r := sm.ratio()) > best
+        ):
+            best, best_i = r, i
     if best < 0.5:
         return msg + " Re-read the file and copy the text you want to replace."
     shown = "\n".join(
@@ -418,7 +421,7 @@ def grep(args: dict[str, Any]) -> str:
     target_raw = args.get("path", ".")
     try:
         target = resolve_tool_path(target_raw)
-    except Exception as exc:
+    except (ValueError, OSError, RuntimeError) as exc:  # bad path, or resolve() failed
         return f"error: invalid grep path {target_raw!r}: {exc}"
     if not target.exists():
         return f"error: grep path not found: {target}"
@@ -458,7 +461,7 @@ def grep(args: dict[str, Any]) -> str:
 def get_response_cancellable(
     messages: list[dict[str, Any]],
     system_prompt: str,
-    mlx_state: Optional[tuple[Any, Any]],
+    mlx_state: tuple[Any, Any] | None,
 ) -> str:
     """Run get_response in a worker thread so Escape can interrupt blocking calls."""
     if ui._agent_tag():  # a parallel subagent: the batch owner watches for Escape
@@ -565,7 +568,7 @@ RESPOND_DESCRIPTION = (
 )
 
 
-def _respond_schema() -> Optional[dict[str, Any]]:
+def _respond_schema() -> dict[str, Any] | None:
     """Return the respond tool's argument schema, or None when it isn't offered.
 
     Only the top-level agent gets it. A non-object output schema is wrapped as
@@ -832,7 +835,7 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
                 + f"\n... [truncated {len(result) - MAX_OUT} chars; raise MAX_TOOL_OUTPUT_CHARS]"
             )
         return result
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any tool failure is reported to the model
         return f"error: {e}"
 
 
@@ -886,7 +889,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
             # malformed block with no JSON payload; skip and keep scanning
             pos = close + len(close_tag) if close != -1 else start + len(open_tag)
             continue
-        payload: Optional[tuple[str, dict[str, Any]]] = None
+        payload: tuple[str, dict[str, Any]] | None = None
         with contextlib.suppress(Exception):
             obj, rel_end = json.JSONDecoder().raw_decode(text, brace)
             if isinstance(obj, dict):
@@ -905,7 +908,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     return calls
 
 
-def _call_payload(obj: Any) -> Optional[tuple[str, dict[str, Any]]]:
+def _call_payload(obj: Any) -> tuple[str, dict[str, Any]] | None:
     """Return (tool, args) from {"tool", "args"} or the Hermes/Qwen {"name", "arguments"} shape."""
     if not isinstance(obj, dict):
         return None
@@ -1117,7 +1120,7 @@ def _latest_request(messages: list[dict[str, Any]]) -> str:
 
 
 def auto_compact(
-    messages: list[dict[str, Any]], mlx_state: Optional[tuple[Any, Any]]
+    messages: list[dict[str, Any]], mlx_state: tuple[Any, Any] | None
 ) -> None:
     """Summarize older messages in place, keeping recent ones verbatim.
 
@@ -1169,6 +1172,7 @@ def git_context() -> str:
             capture_output=True,
             text=True,
             timeout=3,
+            check=False,
         )
         if r.returncode == 0 and r.stdout.strip():
             return f"\nGit status:\n{r.stdout.strip()}"
@@ -1294,8 +1298,8 @@ TRUNCATION_NUDGE = (
 
 
 def _track_error(
-    result: str, last: Optional[str], count: int
-) -> tuple[Optional[str], int, bool]:
+    result: str, last: str | None, count: int
+) -> tuple[str | None, int, bool]:
     """Update repeated-error state; return (last_error, count, should_stop)."""
     if result.startswith("error:"):
         count = count + 1 if result == last else 1
@@ -1311,7 +1315,7 @@ def _track_error(
 def run_agent_turn(
     messages: list[dict[str, Any]],
     system_prompt: str,
-    mlx_state: Optional[tuple[Any, Any]],
+    mlx_state: tuple[Any, Any] | None,
     max_iters: int = 0,
 ) -> str:
     """Generate a response and execute any tool calls, repeating until no tools remain.
@@ -1322,7 +1326,7 @@ def run_agent_turn(
     "no_structured_output", "malformed_tool_call", or "cancelled".
     """
     iters = 0
-    last_tool_error: Optional[str] = None
+    last_tool_error: str | None = None
     repeated_tool_error_count = 0
     retried_overflow = False
     truncations = 0
@@ -1507,7 +1511,7 @@ def _run_tasks_concurrently(calls: list[backends.ToolCall]) -> list[str]:
         threading.Thread(target=worker, args=(n, tc), daemon=True)
         for n, tc in enumerate(calls)
     ]
-    out: Optional[ui._AgentStdout] = None
+    out: ui._AgentStdout | None = None
     if not isinstance(sys.stdout, ui._AgentStdout):
         out = ui._AgentStdout(sys.stdout)
         sys.stdout = out
@@ -1553,7 +1557,7 @@ def _run_tasks_concurrently(calls: list[backends.ToolCall]) -> list[str]:
 # -----------------------------------------------------------------------------------------------
 # The backend itself is wrencode_sdk: Claude Code's own agent loop in a subprocess,
 # with approvals routed through ui.confirm(). This is the one interactive session.
-_AGENT_SDK_SESSION: Optional[agent_sdk.AgentSDKSession] = None
+_AGENT_SDK_SESSION: agent_sdk.AgentSDKSession | None = None
 
 
 def agent_sdk_session() -> agent_sdk.AgentSDKSession:
@@ -1579,8 +1583,8 @@ def close_agent_sdk_session() -> None:
 def handle_slash_command(
     cmd: str,
     messages: list[dict[str, Any]],
-    mlx_state: Optional[tuple[Any, Any]],
-) -> tuple[Optional[str], Any]:
+    mlx_state: tuple[Any, Any] | None,
+) -> tuple[str | None, Any]:
     """Handle a slash command.
 
     Returns (action, mlx_state). mlx_state is _MLX_UNCHANGED unless the
@@ -1634,7 +1638,7 @@ def handle_slash_command(
     return None, configure._MLX_UNCHANGED
 
 
-def _arg_value(args: list[str], *names: str) -> Optional[str]:
+def _arg_value(args: list[str], *names: str) -> str | None:
     """Return the value after the first of names in args (or --name=value), if any."""
     for i, a in enumerate(args):
         if a in names:
@@ -1657,6 +1661,7 @@ def run_verify(cmd: str) -> tuple[bool, str]:
             shell=True,
             cwd=workspace_root(),
             capture_output=True,
+            check=False,
             text=True,
             timeout=600,
         )
@@ -1670,7 +1675,7 @@ def run_headless(
     prompt: str,
     output_format: str = "text",
     max_turns: int = 0,
-    schema: Optional[dict[str, Any]] = None,
+    schema: dict[str, Any] | None = None,
     verify: str = "",
 ) -> int:
     """Run one prompt without the interactive UI and return the exit code (wrencode -p).
@@ -1688,9 +1693,9 @@ def run_headless(
     _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     reason, error = "error", ""
-    verified: Optional[bool] = None
+    verified: bool | None = None
     verify_output = ""
-    sdk: Optional[agent_sdk.AgentSDKSession] = None
+    sdk: agent_sdk.AgentSDKSession | None = None
     cost_usd = 0.0
     with contextlib.redirect_stdout(sys.stderr):
         try:
@@ -1940,7 +1945,7 @@ def main() -> None:
             continue
         except EOFError:
             break
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 — shown to the user; the session goes on
             msg = str(err)
             print(f"{RED}Error: {msg}{RESET}")
             if backends.BACKEND == "ollama" and (

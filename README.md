@@ -381,6 +381,17 @@ BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 wrencode.py
 BACKEND=local LOCAL_PORT=8082 python3 wrencode.py
 ```
 
+## Developing
+
+```bash
+python3 -m unittest -q test_wrencode   # the test suite (stdlib unittest)
+uvx ruff check . && uvx ruff format .  # lint and format; the rule set is in pyproject.toml
+uvx ty check wrencode*.py              # type check
+```
+
+A deliberate catch-all `except Exception` carries a `# noqa: BLE001` with its reason;
+everything else is kept clean under the pinned rules.
+
 ## Releasing
 
 Versions and [`CHANGELOG.md`](CHANGELOG.md) are managed with

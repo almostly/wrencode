@@ -2,6 +2,8 @@
 API-key prompts and verification, model lists, and the saved config in ~/.wrencode.
 """
 
+from __future__ import annotations
+
 import contextlib
 import getpass
 import json
@@ -14,11 +16,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Optional
+from typing import Any
 
 import wrencode_backends as backends
 import wrencode_ui as ui
-from wrencode_ui import RESET, DIM, BLUE, YELLOW, RED
+from wrencode_ui import BLUE, DIM, RED, RESET, YELLOW
 
 CUSTOM_MODEL_OPTION = "— type a custom model id —"
 _MLX_UNCHANGED = object()
@@ -58,7 +60,7 @@ def available_backends() -> list[str]:
     ]
 
 
-def _read_models_cache(cache: pathlib.Path) -> Optional[list[str]]:
+def _read_models_cache(cache: pathlib.Path) -> list[str] | None:
     """Return cached model ids if the cache file is fresh (<24h), else None."""
     if not cache.exists():
         return None
@@ -82,7 +84,7 @@ def _api_key_for_backend(backend: str) -> str:
     """Resolve an API key for model fetches without requiring BACKEND == backend."""
     if env_key := backends._env_api_key(backend):
         return env_key
-    if backends.BACKEND == backend and backends.API_KEY:
+    if backend == backends.BACKEND and backends.API_KEY:
         return backends.API_KEY
     cfg = backends.load_config()
     if cfg.get("backend") == backend:
@@ -120,7 +122,7 @@ def _fetch_hosted_models(
         if ids:
             _write_models_cache(cache, ids)
         return ids or fallback
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 — any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch {label} models: {err}{RESET}")
         return fallback
 
@@ -145,7 +147,7 @@ def fetch_anthropic_models() -> list[str]:
     )
     try:
         ids: list[str] = []
-        after: Optional[str] = None
+        after: str | None = None
         while True:
             query = urllib.parse.urlencode(
                 {"limit": "1000", **({"after_id": after} if after else {})}
@@ -163,7 +165,7 @@ def fetch_anthropic_models() -> list[str]:
         if ids:
             _write_models_cache(backends.ANTHROPIC_MODELS_CACHE, ids)
         return ids or fallback
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 — any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch Anthropic models: {err}{RESET}")
         return fallback
 
@@ -211,7 +213,7 @@ def fetch_openai_models() -> list[str]:
         if ids:
             _write_models_cache(backends.OPENAI_MODELS_CACHE, ids)
         return ids or fallback
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 — any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch OpenAI models: {err}{RESET}")
         return fallback
 
@@ -246,7 +248,7 @@ def fetch_ollama_models() -> list[str]:
             m.get("name", "") for m in data.get("models", []) if m.get("name")
         )
         return names or [backends.BACKEND_SPECS["ollama"]["model"]]
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 — any failure falls back to the default model
         print(f"{YELLOW}Could not reach Ollama at {base}: {err}{RESET}")
         return [backends.BACKEND_SPECS["ollama"]["model"]]
 
@@ -413,7 +415,7 @@ def verify_api_key() -> tuple[str, str]:
             if err.code in (401, 403):
                 return ("invalid", f"HTTP {err.code}")
             return ("unknown", f"HTTP {err.code}")
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 — verification is advisory
             return ("unknown", str(err))
     if spec["kind"] not in backends.KEYED_KINDS:
         return ("ok", "")
@@ -465,11 +467,11 @@ def verify_api_key() -> tuple[str, str]:
                 ),
             )
         return ("unknown", f"HTTP {err.code}")
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 — verification is advisory
         return ("unknown", str(err))
 
 
-def pick_model_interactive(backend: str) -> Optional[str]:
+def pick_model_interactive(backend: str) -> str | None:
     """Arrow-key model picker for a backend; returns model id or None."""
     models = list_models_for_backend(backend)
     labels = models[:]

@@ -5,6 +5,8 @@ _summarize() is the no-tools one-shot used for compaction. apply_backend() sets 
 module-level state (BACKEND, MODEL, API_KEY, ...) that the rest of the file reads.
 """
 
+from __future__ import annotations
+
 import contextlib
 import datetime
 import hashlib
@@ -19,10 +21,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import wrencode_ui as ui
-from wrencode_ui import RESET, DIM, YELLOW, RED
+from wrencode_ui import DIM, RED, RESET, YELLOW
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key
@@ -309,7 +311,7 @@ _EFFORT_LEVELS: dict[str, EffortLevel] = {
     "xhigh": "xhigh",
     "max": "max",
 }
-CLAUDE_EFFORT: Optional[EffortLevel] = _EFFORT_LEVELS.get(
+CLAUDE_EFFORT: EffortLevel | None = _EFFORT_LEVELS.get(
     os.environ.get("WRENCODE_EFFORT", "").strip().lower()
 )
 HTTP_TIMEOUT = float(os.environ.get("WRENCODE_HTTP_TIMEOUT", "600"))
@@ -523,7 +525,7 @@ def _log_usage_debug(data: dict[str, Any]) -> None:
         )
 
 
-def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]:
+def _parse_native_response(data: dict[str, Any]) -> tuple[str, list[ToolCall]]:
     """Parse a native (Anthropic / Bedrock Converse / OpenAI) response into text + tool calls."""
     _warn_if_truncated(data)
     _log_usage_debug(data)
@@ -669,7 +671,7 @@ def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
                     " Set ANTHROPIC_WORKSPACE_ID (or re-run /configure and enter a "
                     "workspace id from Settings → Workspaces)."
                 )
-            raise Exception(f"HTTP {e.code}: {body}{hint}") from e
+            raise RuntimeError(f"HTTP {e.code}: {body}{hint}") from e
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             # urlopen wraps connect errors in URLError; a dropped connection while
             # waiting (RemoteDisconnected) or a read timeout comes through raw.
@@ -750,15 +752,9 @@ def _sigv4_authorization(
     datestamp = amz_date[:8]
     signed_headers = ";".join(sorted(headers))
     canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
-    canonical_request = "\n".join(
-        [
-            method,
-            canonical_uri,
-            canonical_qs,
-            canonical_headers,
-            signed_headers,
-            payload_hash,
-        ]
+    canonical_request = (
+        f"{method}\n{canonical_uri}\n{canonical_qs}\n"
+        f"{canonical_headers}\n{signed_headers}\n{payload_hash}"
     )
     scope = f"{datestamp}/{region}/{service}/aws4_request"
     string_to_sign = "\n".join(
@@ -791,7 +787,7 @@ def _sigv4_signed_headers(
     """Build the full set of SigV4-signed request headers for a Bedrock call."""
     access_key, secret_key, token = _aws_credentials()
     if not (access_key and secret_key):
-        raise Exception(
+        raise RuntimeError(
             "AWS credentials not found — set AWS_ACCESS_KEY_ID and "
             "AWS_SECRET_ACCESS_KEY (and AWS_REGION)."
         )
@@ -872,10 +868,11 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in messages:
         content = m.get("content")
+        msg = m
         if isinstance(content, str) and "tool_call>" in content:
-            m = {**m, "content": _defang_tool_tags(content)}
+            msg = {**m, "content": _defang_tool_tags(content)}
         if content is None or isinstance(content, str):
-            out.append(m)
+            out.append(msg)
             continue
         texts: list[str] = []
         calls: list[dict[str, Any]] = []
@@ -963,8 +960,8 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def get_response(
     messages: list[dict[str, Any]],
     system_prompt: str,
-    mlx_state: Optional[tuple[Any, Any]],
-    tools: Optional[list[ToolSpec]] = None,
+    mlx_state: tuple[Any, Any] | None,
+    tools: list[ToolSpec] | None = None,
 ) -> str:
     """Generate a response from the configured backend given the message history.
 
@@ -981,8 +978,10 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}]
-                + _to_openai_messages(messages),
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    *_to_openai_messages(messages),
+                ],
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
                 "tools": _build_tool_schemas("openai", tools or []),
@@ -998,7 +997,7 @@ def get_response(
             API_BASE,
             {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}] + flat,
+                "messages": [{"role": "system", "content": system_prompt}, *flat],
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
             },
@@ -1074,7 +1073,7 @@ def get_response(
         assert mlx_state is not None  # load_model populates this for ML backends
         model, tokenizer = mlx_state
         inputs = tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt}] + flat,
+            [{"role": "system", "content": system_prompt}, *flat],
             add_generation_prompt=True,
             return_tensors="pt",
             return_dict=True,
@@ -1121,9 +1120,7 @@ def get_response(
     return truncate_at_turn_leak(strip_gptoss_tokens(out))
 
 
-def _summarize(
-    prompt: str, mlx_state: Optional[tuple[Any, Any]], max_tokens: int
-) -> str:
+def _summarize(prompt: str, mlx_state: tuple[Any, Any] | None, max_tokens: int) -> str:
     """Send a one-off prompt to the current backend (no tools) and return its text."""
     system = "You are a helpful assistant."
     if BACKEND == "bedrock":
@@ -1231,14 +1228,14 @@ def _list_openai_compatible_models() -> tuple[list[str], str]:
                 f"the server rejected the key (HTTP {err.code}); check OPENAI_COMPATIBLE_API_KEY",
             )
         return [], f"HTTP {err.code}"
-    except Exception as err:
+    except (OSError, ValueError) as err:  # connection, HTTP, or bad JSON
         return [], f"{err} — is the server running?"
 
 
 # -----------------------------------------------------------------------------------------------
 # Model loading
 # -----------------------------------------------------------------------------------------------
-def load_model() -> Optional[tuple[Any, Any]]:
+def load_model() -> tuple[Any, Any] | None:
     """Load model for the current backend and return mlx_state (or None for API backends)."""
     global MODEL
     if BACKEND == AGENT_SDK_BACKEND:
@@ -1266,7 +1263,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
         except ImportError:
             print(f"{RED}MLX backend needs mlx-lm:{RESET} pip install mlx-lm")
             print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
-            raise SystemExit(1)
+            raise SystemExit(1) from None
         print(f"{YELLOW}Loading model...{RESET}")
         model, tokenizer = load(MODEL)
         ui.print_system(f"✓ Loaded: {getattr(model, 'name', MODEL)}")
@@ -1286,7 +1283,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
                 "pip install transformers torch"
             )
             print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
-            raise SystemExit(1)
+            raise SystemExit(1) from None
         print(f"{YELLOW}Loading model via transformers...{RESET}")
         _device = "mps" if torch.backends.mps.is_available() else "cpu"
         _tok = AutoTokenizer.from_pretrained(MODEL)
@@ -1315,7 +1312,7 @@ def load_model() -> Optional[tuple[Any, Any]]:
                 have = ", ".join(sorted(installed)) or "none"
                 print(f"{YELLOW}⚠ Model '{MODEL}' isn't pulled into Ollama.{RESET}")
                 print(f"{DIM}  Run: ollama pull {MODEL}   (installed: {have}){RESET}")
-        except Exception:
+        except (OSError, ValueError):  # connection, HTTP, or bad JSON
             print(
                 f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
             )
