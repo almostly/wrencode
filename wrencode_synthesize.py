@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import re
 import sys
 import time
 from typing import Any
@@ -15,10 +14,6 @@ from typing import Any
 import wrencode_backends as backends
 import wrencode_ui as ui
 from wrencode_ui import BLUE, BOLD, DIM, RED, RESET, YELLOW
-
-# The loaded local model (mlx / transformers), when this subcommand needs one.
-_MLX_STATE: tuple[Any, Any] | None = None
-
 
 # -----------------------------------------------------------------------------------------------
 # synthesize — fuse multiple agent chat transcripts into one provenance-cited synthesis.
@@ -80,64 +75,20 @@ SYNTH_MODES = {
 }
 
 
-def _synth_complete(system_prompt: str, user_text: str, prefill: str = "") -> str:
-    """One-shot completion via the configured backend, with NO agent tools attached.
+def _synth_complete(
+    system_prompt: str,
+    user_text: str,
+    prefill: str = "",
+    mlx_state: tuple[Any, Any] | None = None,
+) -> str:
+    """One-shot completion on the configured backend, deterministic, no agent tools.
 
-    `prefill` anchors the model to continue from given text (used to force JSON);
-    only the Anthropic-format and Bedrock backends honor it.
+    `prefill` forces the reply to continue from given text (used for JSON); the
+    Anthropic and Bedrock APIs honor it, the others ignore it.
     """
-    if backends.BACKEND == "bedrock":
-        msgs: list[dict[str, Any]] = [
-            {"role": "user", "content": [{"text": user_text}]}
-        ]
-        if prefill:
-            msgs.append({"role": "assistant", "content": [{"text": prefill}]})
-        body = {
-            "messages": msgs,
-            "system": [{"text": system_prompt}],
-            "inferenceConfig": {"maxTokens": backends.MAX_TOKENS, "temperature": 0.0},
-        }
-        text, _ = backends._parse_native_response(backends._bedrock_converse_call(body))
-        return (prefill + text).strip()
-    if backends.BACKEND in backends.ANTHROPIC_FORMAT_BACKENDS:
-        amsgs: list[dict[str, Any]] = [{"role": "user", "content": user_text}]
-        if prefill:
-            amsgs.append({"role": "assistant", "content": prefill})
-        data = backends._http_post(
-            backends.API_BASE,
-            {
-                "model": backends.MODEL,
-                "system": system_prompt,
-                "messages": amsgs,
-                "max_tokens": backends.MAX_TOKENS,
-            },
-            backends._anthropic_headers(),
-        )
-        text, _ = backends._parse_native_response(data)
-        return (prefill + text).strip()
-    if backends.BACKEND in backends.OPENAI_FORMAT_BACKENDS:
-        data = backends._http_post(
-            backends.API_BASE,
-            {
-                "model": backends.MODEL,
-                "max_tokens": backends.MAX_TOKENS,
-                "temperature": 0.0,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-            },
-            backends._openai_headers(),
-        )
-        text, _ = backends._parse_native_response(data)
-        return text.strip()
-    # ollama / openrouter / local / mlx / transformers attach no tools — reuse get_response.
-    raw = backends.get_response(
-        [{"role": "user", "content": user_text}], system_prompt, _MLX_STATE
+    return backends.complete(
+        system_prompt, user_text, temperature=0.0, prefill=prefill, mlx_state=mlx_state
     )
-    # No tools were offered, but a local model may still emit a <tool_call> block.
-    text = re.sub(r"<tool_call>.*?</tool_call>", "", raw, flags=re.DOTALL)
-    return text.strip()
 
 
 def _parse_claude_code_jsonl(raw: str) -> list[dict[str, str]] | None:
@@ -288,7 +239,26 @@ SYNTH_ADAPTERS: list[tuple[str, Any]] = [
 ]
 
 
-def _synth_normalize(path: str) -> dict[str, Any]:
+def _chat_ids(paths: list[str]) -> list[str]:
+    """Short citation ids for the selected transcripts, unique within this run.
+
+    The first eight characters of the file name (a Claude Code session id prefix),
+    unless two transcripts share them: those get their whole name, and a numeric
+    suffix if even that collides.
+    """
+    stems = [pathlib.Path(p).stem or "chat" for p in paths]
+    short = [s[:8] for s in stems]
+    ids = [stems[i] if short.count(c) > 1 else c for i, c in enumerate(short)]
+    seen: dict[str, int] = {}
+    for i, cid in enumerate(ids):
+        n = seen.get(cid, 0)
+        seen[cid] = n + 1
+        if n:
+            ids[i] = f"{cid}-{n + 1}"
+    return ids
+
+
+def _synth_normalize(path: str, cid: str | None = None) -> dict[str, Any]:
     """Load a transcript into the common {id, source, turns:[{role,text}]} shape."""
     raw = pathlib.Path(path).read_text(errors="replace")
     turns: list[dict[str, str]] | None = None
@@ -301,14 +271,30 @@ def _synth_normalize(path: str) -> dict[str, Any]:
     if not turns:  # unknown format → treat the whole file as one block
         turns = [{"role": "user", "text": raw}]
         source = "text"
-    cid = pathlib.Path(path).stem[:8] or "chat"
+    if cid is None:
+        cid = _chat_ids([path])[0]
     return {"id": cid, "source": source, "turns": turns}
 
 
-def _synth_render(chat: dict[str, Any], max_chars: int = 110000) -> str:
-    """Flatten a normalized chat to a tagged transcript string, capped in size."""
+def _transcript_budget() -> int:
+    """Characters of transcript to send for extraction: most of the context window
+    (about 4 characters per token), leaving room for the instructions and the answer."""
+    return int(backends.CONTEXT_TOKENS * 4 * 0.6)
+
+
+def _synth_render(chat: dict[str, Any], max_chars: int | None = None) -> str:
+    """Flatten a normalized chat to a tagged transcript string that fits the budget.
+
+    A transcript over budget keeps its start (the task) and, mostly, its end: the
+    latest decisions are the ones that override earlier ones.
+    """
     s = "\n\n".join(f"[{t['role'].upper()}] {t['text']}" for t in chat["turns"])
-    return s[:max_chars]
+    limit = _transcript_budget() if max_chars is None else max_chars
+    if len(s) <= limit:
+        return s
+    head = limit // 4
+    tail = limit - head
+    return f"{s[:head]}\n\n[... {len(s) - head - tail} characters omitted ...]\n\n{s[-tail:]}"
 
 
 def _json_slice(s: str) -> str:
@@ -317,35 +303,51 @@ def _json_slice(s: str) -> str:
     return s[i : j + 1] if i != -1 and j > i else s
 
 
-def _synth_extract(chat: dict[str, Any]) -> dict[str, Any]:
-    """Extract one chat's structured facts, tagged with its chat id (provenance)."""
+_FACT_KEYS = ("decisions", "problems_solved", "files_touched", "open_questions")
+
+
+def _normalize_facts(facts: Any) -> dict[str, Any]:
+    """Keep only the expected fact lists, each a list, so reconcile gets a clean shape."""
+    src = facts if isinstance(facts, dict) else {}
+    return {k: v if isinstance(v := src.get(k), list) else [] for k in _FACT_KEYS}
+
+
+def _synth_extract(
+    chat: dict[str, Any], mlx_state: tuple[Any, Any] | None = None
+) -> dict[str, Any]:
+    """Extract one chat's structured facts, tagged with its chat id (provenance).
+
+    When the model doesn't answer with JSON, the facts are empty and `_parse_error`
+    carries the start of what it said instead.
+    """
     user = (
         f"<transcript chat_id={chat['id']}>\n{_synth_render(chat)}\n</transcript>\n\n"
         "Extract the JSON object described in your instructions from the transcript "
         "above. Do NOT continue the conversation; output only JSON."
     )
-    raw = _synth_complete(SYNTH_EXTRACT_SYS, user, prefill="{")
+    raw = _synth_complete(SYNTH_EXTRACT_SYS, user, prefill="{", mlx_state=mlx_state)
     try:
-        facts = json.loads(_json_slice(raw))
-        if not isinstance(facts, dict):
+        parsed = json.loads(_json_slice(raw))
+        if not isinstance(parsed, dict):
             raise TypeError("not an object")
+        facts = _normalize_facts(parsed)
     except (json.JSONDecodeError, ValueError, TypeError):
-        facts = {
-            "decisions": [],
-            "problems_solved": [],
-            "files_touched": [],
-            "open_questions": [],
-            "_parse_error": raw[:200],
-        }
+        facts = _normalize_facts({})
+        facts["_parse_error"] = raw[:200]
     facts["chat"] = chat["id"]
     return facts
 
 
-def _synth_reconcile(fact_sets: list[dict[str, Any]], mode: str = "merge") -> str:
+def _synth_reconcile(
+    fact_sets: list[dict[str, Any]],
+    mode: str = "merge",
+    mlx_state: tuple[Any, Any] | None = None,
+) -> str:
     """Fuse per-chat fact sets into Markdown — merge (default), diff, or log."""
     return _synth_complete(
         SYNTH_MODES.get(mode, SYNTH_RECONCILE_SYS),
         "Fact sets:\n\n" + json.dumps(fact_sets, indent=2),
+        mlx_state=mlx_state,
     )
 
 
@@ -519,7 +521,8 @@ def run_synthesize(
     `mode` selects the output: 'merge' (full synthesis), 'diff' (divergences only),
     or 'log' (chronological decision timeline).
     """
-    global _MLX_STATE
+    if mode not in SYNTH_MODES:
+        raise SystemExit(f"synthesize: unknown mode '{mode}' (merge, diff, or log)")
     file_args = [p for p in paths if pathlib.Path(p).is_file()]
     dir_args = [p for p in paths if pathlib.Path(p).is_dir()]
     for p in paths:
@@ -554,24 +557,33 @@ def run_synthesize(
         )
     if mode == "log":  # a timeline reads oldest → newest
         selected = sorted(selected, key=lambda f: pathlib.Path(f).stat().st_mtime)
-    if backends.BACKEND in backends.LOCAL_ML_BACKENDS and _MLX_STATE is None:
-        _MLX_STATE = backends.load_model()
+    mlx_state = (
+        backends.load_model()
+        if backends.BACKEND in backends.LOCAL_ML_BACKENDS
+        else None
+    )
     fact_sets = []
-    for p in selected:
-        chat = _synth_normalize(p)
+    for p, cid in zip(selected, _chat_ids(selected)):
+        chat = _synth_normalize(p, cid)
         ui.print_system(
             f"normalize {chat['id']} ({chat['source']}): {len(chat['turns'])} turns"
         )
-        facts = _synth_extract(chat)
-        ui.print_system(
-            f"extract   {chat['id']}: {len(facts.get('decisions', []))} decisions, "
-            f"{len(facts.get('problems_solved', []))} problems"
-        )
+        facts = _synth_extract(chat, mlx_state)
+        if "_parse_error" in facts:
+            print(
+                f"{YELLOW}extract   {chat['id']}: the model didn't answer with JSON, "
+                f"so this chat contributes nothing{RESET}"
+            )
+        else:
+            ui.print_system(
+                f"extract   {chat['id']}: {len(facts['decisions'])} decisions, "
+                f"{len(facts['problems_solved'])} problems"
+            )
         fact_sets.append(facts)
     ui.print_system(f"reconcile ({mode}): fusing…")
-    doc = _synth_reconcile(fact_sets, mode)
+    doc = _synth_reconcile(fact_sets, mode, mlx_state)
     if out:
         pathlib.Path(out).write_text(doc)
         ui.print_system(f"✓ wrote synthesis to {out}")
     else:
-        print("\n" + doc)
+        print("\n" + (ui.render_markdown(doc) if sys.stdout.isatty() else doc))

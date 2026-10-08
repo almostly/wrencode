@@ -2124,7 +2124,7 @@ class TestSynthesize(unittest.TestCase):
     def test_reconcile_dispatches_mode_to_system_prompt(self):
         seen = {}
 
-        def fake(system, user, prefill=""):
+        def fake(system, user, prefill="", mlx_state=None):
             seen["sys"] = system
             return "doc"
 
@@ -2213,6 +2213,193 @@ class TestSynthesize(unittest.TestCase):
     def test_run_synthesize_errors_when_no_transcripts(self):
         with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit):
             synthesize.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
+
+    def test_run_synthesize_rejects_unknown_mode(self):
+        with self.assertRaises(SystemExit):
+            synthesize.run_synthesize([], mode="rebase")
+
+    def test_chat_ids_are_unique_per_run(self):
+        # uuid-like names keep their 8-char prefix; clashing prefixes fall back to
+        # the whole name; identical names (different dirs) get a suffix.
+        ids = synthesize._chat_ids(
+            [
+                "/x/0123abcd-rest.jsonl",
+                "/x/session-2026-10-01.jsonl",
+                "/x/session-2026-10-02.jsonl",
+                "/a/notes.md",
+                "/b/notes.md",
+            ]
+        )
+        self.assertEqual(
+            ids,
+            [
+                "0123abcd",
+                "session-2026-10-01",
+                "session-2026-10-02",
+                "notes",
+                "notes-2",
+            ],
+        )
+        self.assertEqual(len(set(ids)), len(ids))
+
+    def test_run_synthesize_cites_unique_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for name in ("session-01.jsonl", "session-02.jsonl"):
+                p = pathlib.Path(d) / name
+                p.write_text(json.dumps({"role": "user", "content": "task"}))
+                paths.append(str(p))
+            seen = []
+
+            def fake(system, user, prefill="", mlx_state=None):
+                seen.append(user)
+                return '{"decisions": []}' if prefill else "doc"
+
+            with mock.patch.object(synthesize, "_synth_complete", side_effect=fake):
+                synthesize.run_synthesize(paths, out=str(pathlib.Path(d) / "o.md"))
+        self.assertIn("chat_id=session-01>", seen[0])
+        self.assertIn("chat_id=session-02>", seen[1])
+
+    def test_render_keeps_start_and_mostly_end_when_over_budget(self):
+        chat = {
+            "turns": [
+                {"role": "user", "text": "START " + "a" * 100},
+                {"role": "assistant", "text": "b" * 400},
+                {"role": "user", "text": "c" * 100 + " LATEST"},
+            ]
+        }
+        out = synthesize._synth_render(chat, max_chars=200)
+        self.assertTrue(out.startswith("[USER] START"))
+        self.assertTrue(out.endswith("LATEST"))
+        self.assertIn("characters omitted", out)
+        self.assertLess(len(out), 260)
+        # under budget: untouched
+        full = synthesize._synth_render(chat, max_chars=10_000)
+        self.assertNotIn("omitted", full)
+
+    def test_render_budget_follows_context_window(self):
+        with mock.patch.object(backends, "CONTEXT_TOKENS", 1000):
+            self.assertEqual(synthesize._transcript_budget(), 2400)
+
+    def test_extract_normalizes_fact_shapes(self):
+        chat = {"id": "abcd1234", "turns": [{"role": "user", "text": "hi"}]}
+        payload = '{"decisions": "not a list", "files_touched": ["a.py"], "extra": 1}'
+        with mock.patch.object(synthesize, "_synth_complete", return_value=payload):
+            facts = synthesize._synth_extract(chat)
+        self.assertEqual(facts["decisions"], [])
+        self.assertEqual(facts["files_touched"], ["a.py"])
+        self.assertEqual(facts["open_questions"], [])
+        self.assertNotIn("extra", facts)
+        self.assertNotIn("_parse_error", facts)
+
+    def test_synth_complete_is_deterministic_and_passes_prefill(self):
+        with mock.patch.object(backends, "complete", return_value="{}") as m:
+            synthesize._synth_complete("sys", "user", prefill="{", mlx_state=("m", "t"))
+        self.assertEqual(m.call_args.args, ("sys", "user"))
+        self.assertEqual(m.call_args.kwargs["temperature"], 0.0)
+        self.assertEqual(m.call_args.kwargs["prefill"], "{")
+        self.assertEqual(m.call_args.kwargs["mlx_state"], ("m", "t"))
+
+
+class TestComplete(unittest.TestCase):
+    """backends.complete(): one-shot completions shared by compaction and synthesize."""
+
+    def setUp(self):
+        self._orig = (
+            backends.BACKEND,
+            backends.MODEL,
+            backends.API_KEY,
+            backends.API_BASE,
+        )
+        self._env_model = os.environ.pop("MODEL", None)
+
+    def tearDown(self):
+        backends.BACKEND, backends.MODEL, backends.API_KEY, backends.API_BASE = (
+            self._orig
+        )
+        if self._env_model is not None:
+            os.environ["MODEL"] = self._env_model
+
+    def test_anthropic_prefill_is_sent_and_returned(self):
+        backends.apply_backend("anthropic", model="claude-x", api_key="sk-t")
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured["payload"] = payload
+            return {"content": [{"type": "text", "text": '"a": 1}'}]}
+
+        with mock.patch.object(backends, "_http_post", fake_post):
+            out = backends.complete("sys", "user", prefill="{", max_tokens=64)
+        self.assertEqual(out, '{"a": 1}')
+        self.assertEqual(captured["payload"]["system"], "sys")
+        self.assertEqual(captured["payload"]["max_tokens"], 64)
+        self.assertEqual(
+            captured["payload"]["messages"],
+            [
+                {"role": "user", "content": "user"},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+        self.assertNotIn("tools", captured["payload"])
+
+    def test_openai_format_sends_temperature_and_ignores_prefill(self):
+        backends.apply_backend("openai", model="gpt-x", api_key="sk-t")
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured["payload"] = payload
+            return {"choices": [{"message": {"content": "  hello  "}}]}
+
+        with mock.patch.object(backends, "_http_post", fake_post):
+            out = backends.complete("sys", "user", temperature=0.0, prefill="{")
+        self.assertEqual(out, "hello")
+        self.assertEqual(captured["payload"]["temperature"], 0.0)
+        self.assertEqual(captured["payload"]["messages"][0]["role"], "system")
+        self.assertNotIn("tools", captured["payload"])
+
+    def test_ollama_uses_chat_completions(self):
+        backends.apply_backend("ollama", model="llama3.2")
+        with mock.patch.object(
+            backends,
+            "_http_post",
+            return_value={"choices": [{"message": {"content": "ok"}}]},
+        ) as m:
+            self.assertEqual(backends.complete("sys", "user", max_tokens=5), "ok")
+        self.assertEqual(m.call_args.args[1]["max_tokens"], 5)
+
+    def test_bedrock_prefill_through_converse(self):
+        with mock.patch.object(backends, "_aws_region", return_value="us-east-1"):
+            backends.apply_backend("bedrock", model="us.anthropic.claude-x")
+        captured = {}
+
+        def fake_converse(body):
+            captured["body"] = body
+            return {"output": {"message": {"content": [{"text": '"b": 2}'}]}}}
+
+        with mock.patch.object(backends, "_bedrock_converse_call", fake_converse):
+            out = backends.complete("sys", "user", prefill="{", temperature=0.0)
+        self.assertEqual(out, '{"b": 2}')
+        self.assertEqual(captured["body"]["inferenceConfig"]["temperature"], 0.0)
+        self.assertEqual(captured["body"]["messages"][1]["role"], "assistant")
+
+    def test_local_model_goes_through_generate_local(self):
+        # The old compaction path called the mlx generator for transformers too.
+        backends.apply_backend("transformers")
+        with mock.patch.object(
+            backends, "_generate_local", return_value="<tool_call>{}</tool_call> text"
+        ) as gen:
+            out = backends.complete("sys", "user", mlx_state=("model", "tok"))
+        self.assertEqual(out, "text")
+        chat, state, max_tokens, temperature = gen.call_args.args
+        self.assertEqual([m["role"] for m in chat], ["system", "user"])
+        self.assertEqual(state, ("model", "tok"))
+        self.assertEqual(max_tokens, backends.MAX_TOKENS)
+        self.assertEqual(temperature, 0.3)
+
+    def test_local_model_without_weights_is_an_error(self):
+        backends.apply_backend("mlx")
+        with self.assertRaises(RuntimeError):
+            backends.complete("sys", "user")
 
 
 class TestNanoGPTBackend(unittest.TestCase):
@@ -2702,8 +2889,8 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
 class TestAutoCompact(unittest.TestCase):
     def setUp(self):
         self._patches = [
-            mock.patch.object(wrencode, "CONTEXT_TOKENS", 4000),
-            mock.patch.object(backends, "_summarize", return_value="SUMMARY"),
+            mock.patch.object(backends, "CONTEXT_TOKENS", 4000),
+            mock.patch.object(backends, "complete", return_value="SUMMARY"),
             mock.patch("sys.stdout", io.StringIO()),
         ]
         for p in self._patches:
@@ -2797,9 +2984,7 @@ class TestAutoCompact(unittest.TestCase):
 
     def test_summary_failure_drops_history_with_note(self):
         msgs = self.openai_history(20)
-        with mock.patch.object(
-            backends, "_summarize", side_effect=RuntimeError("nope")
-        ):
+        with mock.patch.object(backends, "complete", side_effect=RuntimeError("nope")):
             wrencode.auto_compact(msgs, None)
         self.assertIn("dropped to fit the context window", msgs[0]["content"])
         self.assertIn("build the thing", msgs[0]["content"])
@@ -2822,7 +3007,7 @@ class TestAutoCompactInLoop(unittest.TestCase):
         self._patches = [
             mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp)}),
             mock.patch.object(backends, "BACKEND", "ollama"),
-            mock.patch.object(wrencode, "CONTEXT_TOKENS", 4000),
+            mock.patch.object(backends, "CONTEXT_TOKENS", 4000),
             mock.patch("sys.stdout", io.StringIO()),
         ]
         for p in self._patches:
@@ -2847,7 +3032,7 @@ class TestAutoCompactInLoop(unittest.TestCase):
             mock.patch.object(
                 wrencode, "auto_compact", wraps=wrencode.auto_compact
             ) as ac,
-            mock.patch.object(backends, "_summarize", return_value="S"),
+            mock.patch.object(backends, "complete", return_value="S"),
         ):
             reason = wrencode.run_agent_turn(msgs, "sys", None)
         self.assertEqual(reason, "done")

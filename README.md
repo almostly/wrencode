@@ -197,7 +197,8 @@ common keywords: `type`, `enum`, `const`, `properties`, `required`,
 semantic git-merge for conversations. Each transcript is normalized to user and
 assistant turns, the model extracts its decisions, problems solved, files touched
 and open questions, and those fact sets are then reconciled across chats. Every
-claim cites the chat it came from, by the first eight characters of the file name.
+claim cites the chat it came from: the first eight characters of the file name,
+or more when two names would clash, so ids are unique within a run.
 
 ```bash
 wrencode synthesize                          # pick from this project's Claude Code history
@@ -225,9 +226,14 @@ you choose: `↑`/`↓` move, space toggles, `a` selects all, Enter confirms, Es
 cancels. `--all` skips the picker. Transcripts are recognized in three formats:
 Claude Code JSONL (tool calls, tool results and thinking are dropped), generic
 JSONL message logs (Codex/OpenAI style), and a JSON list of messages or a
-`{"messages": [...]}` object. Anything else is read as one block of text. The
-synthesis uses the configured backend; local models are loaded on demand. With a
-single transcript the result degrades to a structured summary.
+`{"messages": [...]}` object. Anything else is read as one block of text.
+
+The synthesis uses the configured backend at temperature 0; local models are
+loaded on demand. A transcript longer than the model's context window
+(`WRENCODE_CONTEXT_TOKENS`) is sent with its start and, mostly, its end, since the
+latest decisions override earlier ones. A chat whose extraction doesn't come back
+as JSON is reported and contributes nothing. With a single transcript the result
+degrades to a structured summary.
 
 ## Context management
 
@@ -444,7 +450,7 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
-|`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction|
+|`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction and `synthesize`|
 |`WRENCODE_COMPACT_AT`        |`0.75`                 |Compact at this fraction of the window (`0` disables)|
 |`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |
 |`MAX_READ_LINES`             |`800`                  |Max lines returned per read       |

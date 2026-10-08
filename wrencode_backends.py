@@ -315,6 +315,9 @@ CLAUDE_EFFORT: EffortLevel | None = _EFFORT_LEVELS.get(
     os.environ.get("WRENCODE_EFFORT", "").strip().lower()
 )
 HTTP_TIMEOUT = float(os.environ.get("WRENCODE_HTTP_TIMEOUT", "600"))
+# The model's context window, in tokens: drives auto-compaction and how much of a
+# transcript `synthesize` sends. Set it for local models with small windows.
+CONTEXT_TOKENS = int(os.environ.get("WRENCODE_CONTEXT_TOKENS", "128000"))
 HTTP_RETRIES = int(os.environ.get("WRENCODE_HTTP_RETRIES", "2"))
 
 
@@ -1068,46 +1071,53 @@ def get_response(
         )
         return strip_gptoss_tokens(text)
 
-    # Transformers (HuggingFace)
+    # In-process weights (transformers / mlx)
+    assert mlx_state is not None  # load_model populates this for ML backends
+    chat: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for m in messages:
+        if c := flatten_content(m["content"]):
+            chat.append({"role": m["role"], "content": c})
+    return _generate_local(chat, mlx_state, MAX_TOKENS)
+
+
+def _generate_local(
+    chat: list[dict[str, str]],
+    mlx_state: tuple[Any, Any],
+    max_tokens: int,
+    temperature: float = 0.3,
+) -> str:
+    """Run one chat through the in-process model (transformers or mlx); return its text.
+
+    Generation stops once a <tool_call> block is complete, and anything after a
+    leaked next turn is dropped, so the agent loop can parse the reply as-is.
+    """
+    model, tokenizer = mlx_state
     if BACKEND == "transformers":
-        assert mlx_state is not None  # load_model populates this for ML backends
-        model, tokenizer = mlx_state
         inputs = tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt}, *flat],
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
+            chat, add_generation_prompt=True, return_tensors="pt", return_dict=True
         ).to(model.device)
+        sampling = (
+            {"do_sample": True, "temperature": temperature} if temperature > 0 else {}
+        )
         with torch.no_grad():
-            out_ids = model.generate(
-                **inputs,
-                max_new_tokens=MAX_TOKENS,
-                temperature=0.3,
-                do_sample=True,
-            )
+            out_ids = model.generate(**inputs, max_new_tokens=max_tokens, **sampling)
         raw = tokenizer.decode(
-            out_ids[0][inputs["input_ids"].shape[-1] :],
-            skip_special_tokens=False,
+            out_ids[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=False
         )
         end = _tool_call_complete(raw)
         if end != -1:
             raw = raw[:end]
         return truncate_at_turn_leak(strip_gptoss_tokens(raw))
-
     # MLX (Apple Silicon)
-    assert mlx_state is not None  # load_model populates this for ML backends
-    model, tokenizer = mlx_state
-    chat: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    for m in messages:
-        if c := flatten_content(m["content"]):
-            chat.append({"role": m["role"], "content": c})
     prompt = tokenizer.apply_chat_template(
         chat, tokenize=False, add_generation_prompt=True
     )
-    sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
+    sampler = make_sampler(
+        temp=temperature, top_p=0.95, min_p=0.0, min_tokens_to_keep=1
+    )
     out = ""
     for chunk in stream_generate(
-        model, tokenizer, prompt=prompt, max_tokens=MAX_TOKENS, sampler=sampler
+        model, tokenizer, prompt=prompt, max_tokens=max_tokens, sampler=sampler
     ):
         ui.check_cancelled()
         out += chunk.text
@@ -1120,70 +1130,93 @@ def get_response(
     return truncate_at_turn_leak(strip_gptoss_tokens(out))
 
 
-def _summarize(prompt: str, mlx_state: tuple[Any, Any] | None, max_tokens: int) -> str:
-    """Send a one-off prompt to the current backend (no tools) and return its text."""
-    system = "You are a helpful assistant."
+_TOOL_CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+
+
+def complete(
+    system_prompt: str,
+    user_text: str,
+    *,
+    max_tokens: int | None = None,
+    temperature: float = 0.3,
+    prefill: str = "",
+    mlx_state: tuple[Any, Any] | None = None,
+) -> str:
+    """A one-shot completion on the configured backend, with no tools: the reply's text.
+
+    Used for compaction summaries and by `synthesize`. `prefill` is text the reply
+    must continue from (it forces JSON, for instance): the Anthropic and Bedrock
+    APIs honor it and it is returned as part of the result; other backends ignore
+    it. `temperature` applies where the API takes one. `max_tokens` defaults to
+    the backend's usual cap.
+    """
+    if max_tokens is None:
+        max_tokens = (
+            CLAUDE_MAX_TOKENS if BACKEND in ANTHROPIC_FORMAT_BACKENDS else MAX_TOKENS
+        )
     if BACKEND == "bedrock":
+        cmsgs: list[dict[str, Any]] = [
+            {"role": "user", "content": [{"text": user_text}]}
+        ]
+        if prefill:
+            cmsgs.append({"role": "assistant", "content": [{"text": prefill}]})
         data = _bedrock_converse_call(
             {
-                "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "system": [{"text": system}],
-                "inferenceConfig": {"maxTokens": max_tokens},
+                "messages": cmsgs,
+                "system": [{"text": system_prompt}],
+                "inferenceConfig": {
+                    "maxTokens": max_tokens,
+                    "temperature": temperature,
+                },
             }
         )
-        return "\n".join(
-            b["text"]
-            for b in data.get("output", {}).get("message", {}).get("content", [])
-            if "text" in b
-        ).strip()
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+        text, _ = _parse_native_response(data)
+        return (prefill + text).strip()
+    if BACKEND in ANTHROPIC_FORMAT_BACKENDS or BACKEND == "local":
+        amsgs: list[dict[str, Any]] = [{"role": "user", "content": user_text}]
+        if prefill and BACKEND != "local":
+            amsgs.append({"role": "assistant", "content": prefill})
         data = _http_post(
             API_BASE,
             {
                 "model": MODEL,
-                "system": system,
-                "messages": [{"role": "user", "content": prompt}],
+                "system": system_prompt,
+                "messages": amsgs,
                 "max_tokens": max_tokens,
             },
             _anthropic_headers(),
         )
-        return "\n".join(
-            b["text"] for b in data.get("content", []) if b.get("type") == "text"
-        ).strip()
-    if BACKEND in HOSTED_BACKENDS or BACKEND == "ollama":  # OpenAI chat format
+        if BACKEND == "local":  # a proxied local model: plain text, maybe tool tags
+            text = "".join(
+                b["text"] for b in data.get("content", []) if b.get("type") == "text"
+            )
+            return _TOOL_CALL_BLOCK.sub("", strip_gptoss_tokens(text)).strip()
+        text, _ = _parse_native_response(data)
+        return (prefill + text).strip()
+    if BACKEND in OPENAI_FORMAT_BACKENDS or BACKEND in {"openrouter", "ollama"}:
         data = _http_post(
             API_BASE,
             {
                 "model": MODEL,
                 "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
                 ],
                 "max_tokens": max_tokens,
-                "temperature": 0.3,
+                "temperature": temperature,
             },
             _openai_headers(),
         )
-        return (data["choices"][0]["message"].get("content") or "").strip()
-    if BACKEND in LOCAL_ML_BACKENDS and mlx_state:
-        model, tokenizer = mlx_state
-        chat = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
-        out = "".join(
-            c.text
-            for c in stream_generate(
-                model, tokenizer, prompt=chat, max_tokens=max_tokens, sampler=sampler
-            )
-        )
-        return out[len(chat) :].strip() if out.startswith(chat) else out.strip()
-    raise RuntimeError(f"summarizing isn't supported for backend '{BACKEND}'")
+        text, _ = _parse_native_response(data)
+        return text.strip()
+    if BACKEND in LOCAL_ML_BACKENDS and mlx_state is not None:
+        chat = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+        text = _generate_local(chat, mlx_state, max_tokens, temperature)
+        return _TOOL_CALL_BLOCK.sub("", text).strip()
+    raise RuntimeError(f"one-shot completion isn't supported for backend '{BACKEND}'")
 
 
 def load_config() -> dict[str, str]:

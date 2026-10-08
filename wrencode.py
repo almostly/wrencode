@@ -110,8 +110,7 @@ MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
 # Task calls made in one reply run this many at a time; 1 runs them in order.
 MAX_PARALLEL_SUBAGENTS = int(os.environ.get("WRENCODE_MAX_PARALLEL_SUBAGENTS", "4"))
 # Auto-compaction: once the estimated prompt passes COMPACT_AT of the model's
-# context window, older turns are summarized (0 disables it).
-CONTEXT_TOKENS = int(os.environ.get("WRENCODE_CONTEXT_TOKENS", "128000"))
+# context window (backends.CONTEXT_TOKENS), older turns are summarized (0 disables it).
 COMPACT_AT = float(os.environ.get("WRENCODE_COMPACT_AT", "0.75"))
 MAX_READ_BYTES = int(os.environ.get("MAX_READ_BYTES", str(4 * 1024 * 1024)))
 MAX_READ_LINES = int(os.environ.get("MAX_READ_LINES", "800"))
@@ -1067,9 +1066,14 @@ def compact_messages(
     prompt = (
         "Summarize this conversation in 3-5 concise bullet points, "
         "preserving any file paths, code decisions, or unresolved tasks:\n\n"
-        + _transcript(messages, CONTEXT_TOKENS * 2)
+        + _transcript(messages, backends.CONTEXT_TOKENS * 2)
     )
-    summary = backends._summarize(prompt, (model, tokenizer) if model else None, 512)
+    summary = backends.complete(
+        "You are a helpful assistant.",
+        prompt,
+        max_tokens=512,
+        mlx_state=(model, tokenizer) if model else None,
+    )
     return [
         {"role": "user", "content": f"[Conversation summary]\n{summary}"},
         {
@@ -1134,7 +1138,7 @@ def auto_compact(
         return
     cut = starts[-1]
     for i in reversed(starts):
-        if estimate_tokens(messages[i:], "") > CONTEXT_TOKENS // 4:
+        if estimate_tokens(messages[i:], "") > backends.CONTEXT_TOKENS // 4:
             break
         cut = i
     head, tail = messages[:cut], messages[cut:]
@@ -1147,10 +1151,12 @@ def auto_compact(
         "the user's request; files read, created, or changed and how; commands run "
         "and their key results; decisions made; and what remains to do. Keep exact "
         "file paths, names, and error messages.\n\n"
-        + _transcript(head, CONTEXT_TOKENS * 2)
+        + _transcript(head, backends.CONTEXT_TOKENS * 2)
     )
     try:
-        summary = backends._summarize(prompt, mlx_state, 1500)
+        summary = backends.complete(
+            "You are a helpful assistant.", prompt, max_tokens=1500, mlx_state=mlx_state
+        )
     except Exception as err:  # noqa: BLE001 — fall back to dropping history
         summary = f"(Earlier messages were dropped to fit the context window: {err})"
     note = f"{_COMPACTION_NOTE}\n{summary}"
@@ -1340,7 +1346,7 @@ def run_agent_turn(
                 return "max_turns"
             iters += 1
             if COMPACT_AT and estimate_tokens(messages, system_prompt) > (
-                CONTEXT_TOKENS * COMPACT_AT
+                backends.CONTEXT_TOKENS * COMPACT_AT
             ):
                 auto_compact(messages, mlx_state)
             try:
