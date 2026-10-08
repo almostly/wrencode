@@ -191,6 +191,44 @@ common keywords: `type`, `enum`, `const`, `properties`, `required`,
 `additionalProperties`, `items`, length and numeric bounds, `pattern`, and
 `anyOf`/`oneOf`/`allOf`.
 
+## Synthesize
+
+`wrencode synthesize` fuses several agent chat transcripts into one document: a
+semantic git-merge for conversations. Each transcript is normalized to user and
+assistant turns, the model extracts its decisions, problems solved, files touched
+and open questions, and those fact sets are then reconciled across chats. Every
+claim cites the chat it came from, by the first eight characters of the file name.
+
+```bash
+wrencode synthesize                          # pick from this project's Claude Code history
+wrencode synthesize a.jsonl b.jsonl          # fuse these transcripts
+wrencode synthesize ~/.claude/projects/-home-me-app --all   # a whole directory, no picker
+wrencode synthesize diff a.jsonl b.jsonl     # only where the chats diverge
+wrencode synthesize log --out DECISIONS.md   # a decision timeline, written to a file
+```
+
+Three modes, chosen by the first word after `synthesize`:
+
+- **merge** (default) — `Reinforced decisions` that two or more chats agree on,
+  `Unique contributions`, `⚠ Conflicts` where chats contradict each other (a
+  later chat that overrode an earlier one is marked resolved), and
+  `Open questions`.
+- **diff** — only the divergences: conflicts and what appears in just one chat,
+  like `git diff`.
+- **log** — one chronological timeline of decisions, oldest first, noting where
+  a later chat supersedes an earlier one, and ending with the net state.
+
+Inputs can be files, directories (every `*.jsonl` inside, newest first), or
+nothing, which lists this project's Claude Code transcripts from
+`~/.claude/projects/`. With a directory or no paths, an interactive picker lets
+you choose: `↑`/`↓` move, space toggles, `a` selects all, Enter confirms, Esc
+cancels. `--all` skips the picker. Transcripts are recognized in three formats:
+Claude Code JSONL (tool calls, tool results and thinking are dropped), generic
+JSONL message logs (Codex/OpenAI style), and a JSON list of messages or a
+`{"messages": [...]}` object. Anything else is read as one block of text. The
+synthesis uses the configured backend; local models are loaded on demand. With a
+single transcript the result degrades to a structured summary.
+
 ## Context management
 
 Long sessions are compacted automatically. Before each model call WrenCode
