@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """WrenCode — a minimal agentic coding assistant inspired by Harold Wren.
 
-A lightweight alternative to Claude Code in a single Python file.
+A lightweight alternative to Claude Code. This file is the agent loop: the tools,
+the system prompt, the turn loop with its subagents and compaction, headless mode
+and main(). The wrencode_*.py modules beside it are what it calls: the model
+backends, backend/model configuration, the terminal UI, the Claude Agent SDK
+backend and the synthesize subcommand.
 
 Supports multiple inference backends: local Apple Silicon via MLX,
 HuggingFace Transformers, Anthropic, OpenAI, OpenRouter, NanoGPT, and local proxy.
@@ -31,18 +35,12 @@ THE SOFTWARE.
 
 import ast
 import contextlib
-import datetime
 import difflib
-import getpass
 import glob as globlib
-import hashlib
-import hmac
 import json
 import os
 import pathlib
-import platform
 import re
-import select
 import shlex
 import shutil
 import subprocess
@@ -50,11 +48,7 @@ import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Optional
 
 # The PyInstaller single-file binary ships no system CA trust store, so urllib's
 # TLS verification fails out of the box ("CERTIFICATE_VERIFY_FAILED") on a clean
@@ -86,220 +80,27 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
                     pass  # malformed quoting — use raw value
                 os.environ.setdefault(_k.strip(), _v)
 
+# The other modules read environment defaults at import, so they come after .env.
+import wrencode_backends as backends  # noqa: E402
+import wrencode_configure as configure  # noqa: E402
+import wrencode_sdk as agent_sdk  # noqa: E402
+import wrencode_synthesize as synthesize  # noqa: E402
+import wrencode_ui as ui  # noqa: E402
+from wrencode_ui import RESET, BOLD, DIM, CYAN, GREEN, YELLOW, RED  # noqa: E402
+
 # -----------------------------------------------------------------------------------------------
-# Backend configuration
+# Version, limits and per-run state
 # -----------------------------------------------------------------------------------------------
 WRENCODE_VERSION = "0.3.0"
-
-# Per-backend defaults. "kind" controls how a backend is treated:
-#   api         - hosted HTTP API, needs an API key
-#   local-proxy - Anthropic-compatible server already running on localhost
-#   local-ml    - in-process model weights (mlx / transformers); source install only,
-#                 since the standalone binary can't bundle the ML stack
-#   agent-sdk   - Claude Agent SDK: Claude Code's own agent loop and tools, billed
-#                 to an Anthropic API key; source install with claude-agent-sdk
-BACKEND_SPECS: dict[str, dict[str, str]] = {
-    "anthropic": {
-        "kind": "api",
-        "model": "claude-opus-5-5",
-        "key_env": "ANTHROPIC_API_KEY",
-        "api_base": "https://api.anthropic.com/v1/messages",
-        "label": "Anthropic Claude (API key)",
-    },
-    "claude-agent-sdk": {
-        "kind": "agent-sdk",
-        "model": "claude-opus-5-5",
-        "key_env": "ANTHROPIC_API_KEY",
-        # One-shot helpers (/compact summaries, synthesize) use the Messages API.
-        "api_base": "https://api.anthropic.com/v1/messages",
-        "label": "Claude Agent SDK — Claude Code's agent loop (API key, source install)",
-    },
-    "openai": {
-        "kind": "api",
-        "model": "gpt-4o-mini",
-        "key_env": "OPENAI_API_KEY",
-        "api_base": "https://api.openai.com/v1/chat/completions",
-        "label": "OpenAI GPT (API key)",
-    },
-    "openrouter": {
-        "kind": "api",
-        "model": "anthropic/claude-3-haiku",
-        "key_env": "OPENROUTER_API_KEY",
-        "api_base": "https://openrouter.ai/api/v1/chat/completions",
-        "label": "OpenRouter — any model (API key)",
-    },
-    "nanogpt": {
-        "kind": "api",
-        "model": "z-ai/glm-5.3-flash",
-        "key_env": "NANOGPT_API_KEY",
-        "api_base": "https://nano-gpt.com/api/v1/chat/completions",
-        "label": "NanoGPT — any model (API key)",
-    },
-    "bedrock": {
-        # AWS Bedrock via the model-agnostic Converse API — works across Claude,
-        # Llama, Nova, Mistral, OpenAI GPT-OSS, etc. through one request/parse
-        # path. Auth is AWS SigV4 (not a bearer key), so credentials come from
-        # the AWS environment, not saved config.
-        "kind": "aws",
-        "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "label": "AWS Bedrock — any model via Converse (AWS credentials)",
-    },
-    "local": {
-        "kind": "local-proxy",
-        "model": "gpt-oss-20b",
-        "key_env": "LOCAL_API_KEY",
-        "label": "Local proxy (Anthropic-compatible server on localhost)",
-    },
-    "ollama": {
-        "kind": "local-proxy",
-        "model": "llama3.2",
-        "label": "Ollama (local models via `ollama serve`)",
-    },
-    "openai-compatible": {
-        # Any server speaking OpenAI chat completions: vLLM, llama.cpp's
-        # llama-server, Hugging Face Inference Providers, LM Studio, etc.
-        # URL from OPENAI_COMPATIBLE_BASE_URL; an empty model means "use the
-        # server's only model" (resolved in load_model).
-        "kind": "local-proxy",
-        "model": "",
-        "key_env": "OPENAI_COMPATIBLE_API_KEY",
-        "label": "OpenAI-compatible server (vLLM, llama.cpp, Hugging Face, ...)",
-    },
-    "transformers": {
-        "kind": "local-ml",
-        "model": "deburky/gpt-oss-claude-code",
-        "label": "HuggingFace Transformers (CPU/GPU, source install)",
-    },
-    "mlx": {
-        "kind": "local-ml",
-        "model": "deburky/gpt-oss-claude-mlx",
-        "label": "Apple Silicon via MLX (source install)",
-    },
-}
-
-# Offline/fallback model lists used only when a live /models fetch fails.
-# Anthropic, OpenAI, OpenRouter, NanoGPT, and Ollama are fetched from the
-# provider when a key (or local server) is available.
-BACKEND_MODELS: dict[str, list[str]] = {
-    "anthropic": [
-        "claude-opus-5-5",
-        "claude-sonnet-5-5",
-        "claude-haiku-5-5",
-    ],
-    "openai": [
-        "gpt-4o-mini",
-    ],
-    "openrouter": [
-        "anthropic/claude-3-haiku",
-        "anthropic/claude-3.5-sonnet",
-        "openai/gpt-4o-mini",
-        "google/gemini-flash-1.5",
-        "meta-llama/llama-3.1-8b-instruct",
-    ],
-    "nanogpt": [
-        "z-ai/glm-5.3-flash",
-        "z-ai/glm-5.3",
-        "z-ai/glm-5.3-flash-uncensored",
-        "z-ai/glm-5.3-uncensored",
-    ],
-    "local": ["gpt-oss-20b"],
-    "transformers": ["deburky/gpt-oss-claude-code"],
-    "mlx": ["deburky/gpt-oss-claude-mlx"],
-    "bedrock": [
-        # Converse is model-agnostic, but wrencode is a TOOL-USING agent and
-        # tool-call support varies by family. Verified end-to-end on AWS (text +
-        # tool use): Claude and Amazon Nova — the recommended choices. The "us."
-        # prefix is a cross-region inference profile; match it to your AWS_REGION's
-        # geo, or type any custom Converse model id at the prompt.
-        "us.anthropic.claude-haiku-4-5-20251001-v1:0",  # verified (default)
-        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",  # verified
-        "us.amazon.nova-pro-v1:0",  # verified
-        # Experimental — chat works but tool use is unreliable, so the agent loop
-        # may stall: Llama emits no tool_use; GPT-OSS is flaky on tools.
-        "openai.gpt-oss-20b-1:0",
-        "us.meta.llama3-3-70b-instruct-v1:0",
-        # TODO: no verified tool-using non-Claude/Nova family yet. Mistral Large
-        # 2407 was dropped (invalid Bedrock model id); revisit if a Converse
-        # tool-capable Mistral/other id is confirmed.
-    ],
-}
-
-CUSTOM_MODEL_OPTION = "— type a custom model id —"
-_MLX_UNCHANGED = object()
-API_BACKENDS: frozenset[str] = frozenset(
-    name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "api"
-)
-LOCAL_ML_BACKENDS: frozenset[str] = frozenset(
-    name for name, spec in BACKEND_SPECS.items() if spec["kind"] == "local-ml"
-)
-# Backends whose responses use the Anthropic Messages format (content blocks,
-# tool_use, usage). Bedrock speaks the model-agnostic Converse API instead, so
-# it has its own format/parse path (see _bedrock_converse_call).
-ANTHROPIC_FORMAT_BACKENDS: frozenset[str] = frozenset({"anthropic", "claude-agent-sdk"})
-AGENT_SDK_BACKEND = "claude-agent-sdk"
-# Backends authenticated with an Anthropic API key (and optional workspace id).
-ANTHROPIC_KEY_BACKENDS: frozenset[str] = frozenset({"anthropic", AGENT_SDK_BACKEND})
-# Backend kinds that need an API key prompted, saved, and verified.
-KEYED_KINDS: frozenset[str] = frozenset({"api", "agent-sdk"})
-# Backends that return JSON with native tool calls (vs. XML-in-text), parsed by
-# _parse_native_response. Bedrock/Converse is native too.
-NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset(
-    {"anthropic", "openai", "nanogpt", "openai-compatible", "bedrock"}
-)
-# Native-tool backends speaking OpenAI chat completions (tool_calls / role "tool").
-# NanoGPT must use this path: its GLM models reserve <tool_call> as a template
-# token, so the XML-in-text tool prompt makes the upstream request fail (503).
-OPENAI_FORMAT_BACKENDS: frozenset[str] = frozenset(
-    {"openai", "nanogpt", "openai-compatible"}
-)
-# Hosted backends reached over HTTP (vs. in-process local-ml weights). Bedrock
-# is kind "aws" so it isn't in API_BACKENDS, but it's still a network call, and
-# openai-compatible servers are often hosted (Hugging Face) or remote.
-HOSTED_BACKENDS: frozenset[str] = API_BACKENDS | frozenset(
-    {"bedrock", "openai-compatible"}
-)
-
-CONFIG_DIR = pathlib.Path(
-    os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
-).expanduser()
-CONFIG_FILE = CONFIG_DIR / "config.json"
-OPENROUTER_MODELS_CACHE = CONFIG_DIR / "openrouter_models.json"
-ANTHROPIC_MODELS_CACHE = CONFIG_DIR / "anthropic_models.json"
-OPENAI_MODELS_CACHE = CONFIG_DIR / "openai_models.json"
 # Project instruction files, in preference order per directory (see find_agents_files).
 AGENTS_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_AGENTS_MD_CHARS = 32_000
-NANOGPT_MODELS_CACHE = CONFIG_DIR / "nanogpt_models.json"
 
-# Populated by apply_backend() once configuration is resolved (see resolve_configuration).
-BACKEND: str = ""
-MODEL: str = ""
-API_KEY: str = ""
-API_BASE: str = ""
-AWS_REGION: str = ""
-# Multi-workspace Anthropic API keys need this on every request
-# (anthropic-workspace-id). Workspace-scoped keys can leave it empty.
-ANTHROPIC_WORKSPACE_ID: str = ""
-LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
-
-# Backend libraries are imported lazily inside load_model(); the rest of the
-# module references them as globals. Declared here as Any so the module
-# type-checks even when the heavy optional deps aren't installed.
-load: Any = None  # mlx_lm.load
-stream_generate: Any = None  # mlx_lm.generate.stream_generate
-make_sampler: Any = None  # mlx_lm.sample_utils.make_sampler
-torch: Any = None  # torch
-AutoModelForCausalLM: Any = None  # transformers.AutoModelForCausalLM
-AutoTokenizer: Any = None  # transformers.AutoTokenizer
-
-# Subagent state: the loaded model (set in main). Everything that differs per
-# agent lives in _AGENT_LOCAL, because parallel subagents run in threads:
-#   depth        subagent nesting depth (0 for the top-level agent)
-#   tag          "1", "2", "1.2"... set only in a parallel subagent's thread
-#   cancel       that parallel batch's cancel event
-#   last_action  the last tool call shown, repeated when approval is needed
+# The loaded local model (set in main / run_headless), shared with the task() tool.
+# Everything that differs per agent lives in ui._AGENT_LOCAL, because parallel
+# subagents run in threads: depth, tag ("1", "2", "1.2"...), the batch's cancel
+# event, and last_action (the tool call shown, repeated when approval is needed).
 _MLX_STATE: Optional[tuple[Any, Any]] = None
-_AGENT_LOCAL = threading.local()
 # Set by run_headless(--json-schema): the final answer must come through the
 # `respond` tool and match this JSON Schema. _STRUCTURED_RESULT holds it once accepted.
 RESPOND_TOOL = "respond"
@@ -308,111 +109,6 @@ _STRUCTURED_RESULT: list[Any] = []
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
 # Task calls made in one reply run this many at a time; 1 runs them in order.
 MAX_PARALLEL_SUBAGENTS = int(os.environ.get("WRENCODE_MAX_PARALLEL_SUBAGENTS", "4"))
-
-
-def _subagent_depth() -> int:
-    return getattr(_AGENT_LOCAL, "depth", 0)
-
-
-def _agent_tag() -> str:
-    """This thread's parallel-subagent tag, or '' outside a parallel batch."""
-    return getattr(_AGENT_LOCAL, "tag", "")
-
-
-def _openai_compatible_base() -> str:
-    """Return the openai-compatible server's base URL (ending in /v1, usually)."""
-    base = os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "http://localhost:8000/v1")
-    return base.rstrip("/").removesuffix("/chat/completions")
-
-
-def _env_api_key(backend: str) -> str:
-    """The backend's key from the environment (or .env), unless /configure saved
-    a key that should override it (config "api_key_overrides_env")."""
-    key_env = BACKEND_SPECS[backend].get("key_env", "")
-    if not key_env:
-        return ""
-    cfg = load_config()
-    if (
-        cfg.get("backend") == backend
-        and cfg.get("api_key_overrides_env")
-        and cfg.get("api_key")
-    ):
-        return ""
-    return os.environ.get(key_env, "")
-
-
-def apply_backend(
-    backend: str,
-    model: str = "",
-    api_key: str = "",
-    anthropic_workspace_id: str = "",
-) -> None:
-    """Set the module-level backend globals from a backend name plus overrides.
-
-    Precedence for each value: explicit environment variable > saved/chosen
-    value > built-in default. The one exception is an API key entered in
-    /configure to replace an environment key (see _env_api_key). Heavy backend
-    imports are deferred to load_model().
-    """
-    global BACKEND, MODEL, API_KEY, API_BASE, AWS_REGION, LOCAL_PORT
-    global ANTHROPIC_WORKSPACE_ID
-    spec = BACKEND_SPECS[backend]
-    BACKEND = backend
-    MODEL = os.environ.get("MODEL") or model or spec["model"]
-    ANTHROPIC_WORKSPACE_ID = (
-        (os.environ.get("ANTHROPIC_WORKSPACE_ID") or anthropic_workspace_id or "")
-        if backend in ANTHROPIC_KEY_BACKENDS
-        else ""
-    )
-    if spec["kind"] in KEYED_KINDS:
-        API_KEY = _env_api_key(backend) or api_key or ""
-        API_BASE = spec["api_base"]
-    elif spec["kind"] == "aws":
-        # Bedrock: creds + region come from the AWS environment at request
-        # time (SigV4), so nothing is stored in API_KEY. API_BASE is built
-        # per-request from region + model id in _bedrock_converse_call().
-        AWS_REGION = _aws_region()
-        API_KEY = ""
-        API_BASE = ""
-    elif backend == "ollama":
-        base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-        API_KEY = "ollama"  # Ollama ignores the key; kept non-empty for the loader
-        API_BASE = f"{base}/v1/chat/completions"
-    elif backend == "openai-compatible":
-        # vLLM and llama-server accept any key unless started with one.
-        API_KEY = _env_api_key(backend) or api_key or "EMPTY"
-        API_BASE = f"{_openai_compatible_base()}/chat/completions"
-    elif backend == "local":
-        LOCAL_PORT = os.environ.get("LOCAL_PORT", "8082")
-        API_KEY = os.environ.get("LOCAL_API_KEY") or api_key or "local"
-        API_BASE = f"http://localhost:{LOCAL_PORT}/v1/messages"
-    else:  # local-ml (mlx / transformers): no key, weights loaded in-process
-        API_KEY = ""
-        API_BASE = ""
-
-
-# -----------------------------------------------------------------------------------------------
-# Constants & environment variables
-# -----------------------------------------------------------------------------------------------
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
-# Claude models think before answering and that counts toward max_tokens, so the
-# Claude backends get more room unless MAX_TOKENS is set explicitly.
-CLAUDE_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "16000"))
-# Optional reasoning effort for Claude models: low, medium, high, xhigh, or max.
-# Unset or unrecognized leaves the model's default (medium on Claude Opus 5.5).
-EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
-_EFFORT_LEVELS: dict[str, EffortLevel] = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "xhigh",
-    "max": "max",
-}
-CLAUDE_EFFORT: Optional[EffortLevel] = _EFFORT_LEVELS.get(
-    os.environ.get("WRENCODE_EFFORT", "").strip().lower()
-)
-HTTP_TIMEOUT = float(os.environ.get("WRENCODE_HTTP_TIMEOUT", "600"))
-HTTP_RETRIES = int(os.environ.get("WRENCODE_HTTP_RETRIES", "2"))
 # Auto-compaction: once the estimated prompt passes COMPACT_AT of the model's
 # context window, older turns are summarized (0 disables it).
 CONTEXT_TOKENS = int(os.environ.get("WRENCODE_CONTEXT_TOKENS", "128000"))
@@ -431,373 +127,6 @@ _GLOB_SKIP: set[str] = {
     ).split(",")
     if s
 }
-
-# -----------------------------------------------------------------------------------------------
-# Terminal colors
-# -----------------------------------------------------------------------------------------------
-RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
-BLUE, CYAN, GREEN, YELLOW, RED = (
-    "\033[34m",
-    "\033[36m",
-    "\033[32m",
-    "\033[33m",
-    "\033[31m",
-)
-BRIGHT_CYAN = "\033[96m"
-AGENT_TEXT = "\033[38;5;245m"  # muted grey for agent replies (Claude Code-style)
-_COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_LOADER_MODEL_MAX = 32
-
-
-def _loader_context_text() -> str:
-    b = BACKEND or "backend"
-    if MODEL and len(MODEL) > _LOADER_MODEL_MAX:
-        keep = _LOADER_MODEL_MAX - 1
-        head = max(8, keep // 2)
-        m = f"{MODEL[:head]}…{MODEL[-(keep - head) :]}"
-    else:
-        m = MODEL or "model"
-    return f"{b} · {m} · waiting…"
-
-
-def loader_display(step: int) -> str:
-    """Render one animated loader frame for the given step."""
-    sym = _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
-    text = _loader_context_text()
-    if not colors_enabled():
-        return f"{sym} {text}"
-    return f"{BRIGHT_CYAN}{sym}{RESET} {DIM}{text}{RESET}"
-
-
-def colors_enabled() -> bool:
-    """Return True when ANSI styling should be applied.
-
-    Precedence mirrors CPython's private _colorize.can_colorize:
-    PYTHON_COLORS > NO_COLOR > FORCE_COLOR > TERM=dumb > isatty.
-    """
-    if (py_colors := os.environ.get("PYTHON_COLORS")) in {"0", "1"}:
-        return py_colors == "1"
-    if "NO_COLOR" in os.environ:
-        return False
-    if os.environ.get("FORCE_COLOR"):
-        return True
-    if os.environ.get("TERM") == "dumb":
-        return False
-    return sys.stdout.isatty()
-
-
-def print_system(text: str, *, end: str = "\n") -> None:
-    """Print slash-command / configure feedback in banner cyan."""
-    s = f"{BOLD}{BRIGHT_CYAN}" if colors_enabled() else ""
-    e = RESET if colors_enabled() else ""
-    if sys.stdout.isatty():
-        sys.stdout.write("\r")
-    sys.stdout.write(f"{s}{text}{e}{end}")
-    sys.stdout.flush()
-
-
-_INPUT_HISTORY: list[str] = []
-
-# Slash commands shown in the completion menu and /help, in display order.
-SLASH_COMMANDS: dict[str, str] = {
-    "/model": "switch model (or /model <id>)",
-    "/backend": "switch backend and model",
-    "/configure": "same as /backend",
-    "/compact": "summarize history to free context",
-    "/clear": "clear the conversation",
-    "/help": "list commands",
-    "/quit": "save history and exit",
-}
-# Short aliases: accepted and highlighted, but kept out of the menu.
-SLASH_ALIASES: dict[str, str] = {"/c": "/clear", "/q": "/quit", "/exit": "/quit"}
-MAX_SLASH_MENU = 8
-
-
-def slash_matches(text: str) -> list[str]:
-    """Commands that complete the /prefix being typed (empty once args start)."""
-    if not text.startswith("/") or " " in text:
-        return []
-    return [c for c in SLASH_COMMANDS if c.startswith(text)][:MAX_SLASH_MENU]
-
-
-def _is_slash_command(token: str) -> bool:
-    return token in SLASH_COMMANDS or token in SLASH_ALIASES
-
-
-def format_input_line(text: str) -> str:
-    """Render the ❯ prompt line; a known /command (or its prefix) is bold cyan."""
-    if not colors_enabled():
-        return f"❯ {text}"
-    prompt = f"{BRIGHT_CYAN}❯{RESET} "
-    cmd, _, rest = text.partition(" ")
-    if not (_is_slash_command(cmd) or (not rest and slash_matches(cmd))):
-        return prompt + text
-    s = f"{BOLD}{BRIGHT_CYAN}"
-    line = prompt + s + cmd + RESET
-    if rest:
-        line += " " + rest
-    return line
-
-
-def _read_input_char(fd: int) -> str:
-    """Read one UTF-8 character from fd (raw/cbreak mode)."""
-    first = os.read(fd, 1)
-    if not first:
-        return ""
-    extra = 0
-    lead = first[0]
-    if lead & 0x80:
-        if lead & 0xE0 == 0xC0:
-            extra = 1
-        elif lead & 0xF0 == 0xE0:
-            extra = 2
-        elif lead & 0xF8 == 0xF0:
-            extra = 3
-    if extra:
-        first += os.read(fd, extra)
-    return first.decode("utf-8", errors="replace")
-
-
-def _redraw_input_line(
-    text: str, matches: Optional[list[str]] = None, sel: int = 0
-) -> None:
-    """Redraw the prompt line plus a completion menu below it, cursor kept on the line."""
-    line = format_input_line(text)
-    out = "\r\033[J" + line
-    for i, cmd in enumerate(matches or []):
-        desc = SLASH_COMMANDS.get(cmd, "")
-        if not colors_enabled():
-            out += f"\n{'>' if i == sel else ' '} {cmd:<12} {desc}"
-        elif i == sel:
-            out += f"\n  {BOLD}{BRIGHT_CYAN}{cmd:<12}{RESET} {desc}"
-        else:
-            out += f"\n  {DIM}{cmd:<12} {desc}{RESET}"
-    if matches:
-        col = 2 + len(text)  # "❯ " is two cells
-        out += f"\033[{len(matches)}A\r" + (f"\033[{col}C" if col else "")
-    sys.stdout.write(out)
-    sys.stdout.flush()
-
-
-def _read_tty_key(fd: int) -> str:
-    """Read one key; arrow keys return up/down/left/right instead of escape junk."""
-    ch = _read_input_char(fd)
-    if not ch:
-        return ""
-    if ch == "\x1b":
-        if not select.select([fd], [], [], 0.02)[0]:
-            return "esc"
-        seq = os.read(fd, 1)
-        if seq != b"[":
-            return "esc"
-        if not select.select([fd], [], [], 0.02)[0]:
-            return "esc"
-        code = os.read(fd, 1)
-        if code == b"A":
-            return "up"
-        if code == b"B":
-            return "down"
-        if code == b"C":
-            return "right"
-        if code == b"D":
-            return "left"
-        return "esc"
-    if ch in "\r\n":
-        return "enter"
-    if ch in ("\x7f", "\x08"):
-        return "backspace"
-    if ch == "\x03":
-        return "ctrl_c"
-    if ch == "\x04":
-        return "ctrl_d"
-    return ch
-
-
-def _read_tty_line(
-    prompt: str,
-    *,
-    history: bool = False,
-    redraw: Optional[Any] = None,
-    complete: bool = False,
-) -> str:
-    """Read one line in cbreak mode; swallows arrow keys unless history=True.
-
-    With complete=True, typing a /prefix shows matching slash commands below
-    the line: ↑↓ pick, Tab or → fills in, Enter runs the highlighted one.
-    """
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    buf: list[str] = []
-    hist_idx = len(_INPUT_HISTORY)
-    sel = 0
-
-    def _matches() -> list[str]:
-        return slash_matches("".join(buf)) if complete else []
-
-    def _redraw() -> None:
-        if complete:
-            _redraw_input_line("".join(buf), _matches(), sel)
-        elif redraw is not None:
-            redraw("".join(buf))
-        else:
-            sys.stdout.write("\r\033[K" + prompt + "".join(buf))
-            sys.stdout.flush()
-
-    try:
-        tty.setcbreak(fd)
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-        _redraw()
-        while True:
-            if not select.select([fd], [], [], None)[0]:
-                continue
-            key = _read_tty_key(fd)
-            if not key:
-                raise EOFError
-            matches = _matches()
-            if key == "enter":
-                text = "".join(buf).strip()
-                if matches and not _is_slash_command(text):
-                    text = matches[min(sel, len(matches) - 1)]
-                if complete:  # clear the menu, leave the final line
-                    _redraw_input_line(text)
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                return text
-            if matches and key in {"\t", "right"}:
-                buf = list(matches[min(sel, len(matches) - 1)])
-                sel = 0
-                _redraw()
-                continue
-            if matches and key in {"up", "down"}:
-                step = -1 if key == "up" else 1
-                sel = (min(sel, len(matches) - 1) + step) % len(matches)
-                _redraw()
-                continue
-            if key == "backspace":
-                if buf:
-                    buf.pop()
-                    sel = 0
-                    _redraw()
-                continue
-            if key == "ctrl_c":
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                raise KeyboardInterrupt
-            if key == "ctrl_d":
-                if not buf:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    raise EOFError
-                continue
-            if key == "up" and history and _INPUT_HISTORY:
-                if hist_idx > 0:
-                    hist_idx -= 1
-                    buf = list(_INPUT_HISTORY[hist_idx])
-                    _redraw()
-                continue
-            if key == "down" and history:
-                if hist_idx < len(_INPUT_HISTORY):
-                    hist_idx += 1
-                    buf = (
-                        list(_INPUT_HISTORY[hist_idx])
-                        if hist_idx < len(_INPUT_HISTORY)
-                        else []
-                    )
-                    _redraw()
-                continue
-            if key in ("up", "down", "left", "right", "esc"):
-                continue
-            if len(key) == 1 and (key.isprintable() or key == "\t"):
-                buf.append(key)
-                sel = 0
-                _redraw()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def _remember_input(text: str) -> None:
-    if text and (not _INPUT_HISTORY or _INPUT_HISTORY[-1] != text):
-        _INPUT_HISTORY.append(text)
-
-
-def _read_user_input_interactive() -> str:
-    """TTY line editor with live slash-command coloring and history."""
-    text = _read_tty_line("", history=True, complete=True)
-    _remember_input(text)
-    return text
-
-
-def read_feedback_line() -> str:
-    """Read decline feedback after choosing n in the approval picker."""
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        sys.stdout.write(f"\n{YELLOW}What should I do differently?{RESET}\n")
-        sys.stdout.flush()
-        return _read_tty_line(f"{BRIGHT_CYAN}❯{RESET} ")
-    prompt = f"{YELLOW}What should I do differently?{RESET} "
-    return input(prompt).strip()
-
-
-def read_user_input() -> str:
-    """Read one line from the ❯ prompt with live slash-command coloring."""
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        return _read_user_input_interactive()
-
-    if colors_enabled():
-        sys.stdout.write(f"{BRIGHT_CYAN}❯{RESET} ")
-    else:
-        sys.stdout.write("❯ ")
-    sys.stdout.flush()
-    line = sys.stdin.readline()
-    if not line:
-        raise EOFError
-    return line.rstrip("\r\n").strip()
-
-
-# Set by confirm() when the user chooses "allow all" for the rest of the session.
-_SESSION_AUTO_APPROVE = False
-# Set by run_headless(): there's no one to ask, so confirm() declines instead of prompting.
-_HEADLESS = False
-
-# Escape (or Ctrl+C during a turn) sets this so the agent loop returns to the prompt.
-_CANCEL_REQUESTED = threading.Event()
-_LISTENER_STOP = threading.Event()
-
-
-class UserCancelled(Exception):
-    """Raised when the user presses Escape or Ctrl+C during an agent turn."""
-
-
-# "WRENCODE" in the ANSI Shadow figlet font. Block faces get a sky-to-deep-blue
-# gradient down the rows and the box-drawing shadow a darker blue (256-color).
-_BANNER_ROWS = (
-    "██╗    ██╗██████╗ ███████╗███╗   ██╗ ██████╗ ██████╗ ██████╗ ███████╗",
-    "██║    ██║██╔══██╗██╔════╝████╗  ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝",
-    "██║ █╗ ██║██████╔╝█████╗  ██╔██╗ ██║██║     ██║   ██║██║  ██║█████╗",
-    "██║███╗██║██╔══██╗██╔══╝  ██║╚██╗██║██║     ██║   ██║██║  ██║██╔══╝",
-    "╚███╔███╔╝██║  ██║███████╗██║ ╚████║╚██████╗╚██████╔╝██████╔╝███████╗",
-    " ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
-)
-_BANNER_FACES = (117, 111, 75, 69, 33, 27)
-_BANNER_SHADOW = 25
-
-
-def render_banner(color: bool) -> str:
-    """Return the startup banner, colored when color is True."""
-    if not color:
-        return "\n".join(_BANNER_ROWS)
-    shade = f"\033[38;5;{_BANNER_SHADOW}m"
-    lines = []
-    for row, face in zip(_BANNER_ROWS, _BANNER_FACES):
-        tint = f"\033[38;5;{face}m"
-        runs = re.sub(
-            r"█+|[^█ ]+", lambda m: (tint if m[0][0] == "█" else shade) + m[0], row
-        )
-        lines.append(runs + RESET)
-    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------------------------
@@ -899,7 +228,7 @@ def write(args: dict[str, Any]) -> str:
     if "content" not in args:
         return "error: 'content' is required (model response may have been truncated; raise MAX_TOKENS)"
     content = args["content"]
-    approval = confirm("write")
+    approval = ui.confirm("write")
     if approval != "ok":
         return approval
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -948,7 +277,7 @@ def edit(args: dict[str, Any]) -> str:
             json.loads(updated)
         except json.JSONDecodeError as exc:
             return f"error: edit would make invalid JSON: {exc}"
-    approval = confirm("edit")
+    approval = ui.confirm("edit")
     if approval != "ok":
         return approval
     path.write_text(updated, encoding="utf-8")
@@ -1126,178 +455,44 @@ def grep(args: dict[str, Any]) -> str:
     return body
 
 
-def _cancel_listener() -> None:
-    """Watch stdin for Escape while a blocking agent operation runs."""
-    if not sys.stdin.isatty():
-        return
-    try:
-        import termios
-        import tty
-
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while not _LISTENER_STOP.is_set():
-                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if not ready:
-                    continue
-                ch = os.read(fd, 1).decode("utf-8", errors="replace")
-                if ch == "\x1b":
-                    _CANCEL_REQUESTED.set()
-                    break
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:
-        pass
-
-
-@contextlib.contextmanager
-def cancel_watch() -> Any:
-    """Enable Escape-to-cancel for the duration of a blocking operation."""
-    if not sys.stdin.isatty():
-        yield
-        return
-    _CANCEL_REQUESTED.clear()
-    _LISTENER_STOP.clear()
-    listener = threading.Thread(target=_cancel_listener, daemon=True)
-    listener.start()
-    try:
-        yield
-    finally:
-        _LISTENER_STOP.set()
-        listener.join(timeout=0.5)
-
-
-def check_cancelled() -> None:
-    """Raise UserCancelled if the user (or this agent's parallel batch) cancelled."""
-    batch = getattr(_AGENT_LOCAL, "cancel", None)
-    if _CANCEL_REQUESTED.is_set() or (batch is not None and batch.is_set()):
-        raise UserCancelled()
-
-
 def get_response_cancellable(
     messages: list[dict[str, Any]],
     system_prompt: str,
     mlx_state: Optional[tuple[Any, Any]],
 ) -> str:
     """Run get_response in a worker thread so Escape can interrupt blocking calls."""
-    if _agent_tag():  # a parallel subagent: the batch owner watches for Escape
-        check_cancelled()
-        return get_response(messages, system_prompt, mlx_state)
+    if ui._agent_tag():  # a parallel subagent: the batch owner watches for Escape
+        ui.check_cancelled()
+        return backends.get_response(messages, system_prompt, mlx_state, tool_specs())
     if not sys.stdin.isatty():
-        return get_response(messages, system_prompt, mlx_state)
+        return backends.get_response(messages, system_prompt, mlx_state, tool_specs())
 
     result: list[str] = []
     error: list[BaseException] = []
 
     def worker() -> None:
         try:
-            result.append(get_response(messages, system_prompt, mlx_state))
+            result.append(
+                backends.get_response(messages, system_prompt, mlx_state, tool_specs())
+            )
         except BaseException as exc:  # noqa: BLE001 — propagate to caller
             error.append(exc)
 
-    with cancel_watch():
+    with ui.cancel_watch():
         t = threading.Thread(target=worker, daemon=True)
         t.start()
         while t.is_alive():
-            check_cancelled()
+            ui.check_cancelled()
             t.join(timeout=0.15)
     if error:
         raise error[0]
     return result[0]
 
 
-def confirm(action: str = "") -> str:
-    """Prompt for approval. Returns 'ok' or a cancellation message for the agent.
-
-    Enter/y approves once; ``a`` approves all remaining actions this session;
-    ``n`` declines and asks what to do differently. Auto-approve via
-    WRENCODE_AUTO_APPROVE / --yes enables headless use and subagents.
-    """
-    if (
-        os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes")
-        or _SESSION_AUTO_APPROVE
-    ):
-        label = action or "action"
-        print(f"{DIM}⚠ {label} [auto-approved]{RESET}")
-        return "ok"
-    if _HEADLESS:
-        print(f"{DIM}⚠ {action or 'action'} [declined: headless without --yes]{RESET}")
-        return (
-            "cancelled: running headless without --yes, so this action can't be "
-            "approved. Do what you can without it and say what is left to do."
-        )
-    if _agent_tag():
-        return _confirm_from_subagent(action)
-    return _confirm_prompt()
-
-
-# One approval prompt at a time across parallel subagents.
-_APPROVAL_LOCK = threading.Lock()
-# The Escape listener of the running parallel batch, paused while a prompt reads stdin.
-_PARALLEL_ESC: Optional["_EscWatch"] = None
-
-
-def _confirm_from_subagent(action: str) -> str:
-    """Ask for approval on behalf of a parallel subagent.
-
-    Prompts take turns, the Escape listener lets go of stdin, and the other
-    agents' output is held until the answer is in, so the prompt stays readable.
-    """
-    with _APPROVAL_LOCK:
-        check_cancelled()
-        out = sys.stdout if isinstance(sys.stdout, _AgentStdout) else None
-        esc = _PARALLEL_ESC
-        if out is not None:
-            out.hold()
-        if esc is not None:
-            esc.stop()
-        try:
-            detail = getattr(_AGENT_LOCAL, "last_action", "") or action
-            print(f"{YELLOW}[{_agent_tag()}] needs approval:{RESET} {detail}")
-            return _confirm_prompt()
-        finally:
-            if esc is not None:
-                esc.start()
-            if out is not None:
-                out.release()
-
-
-def _confirm_prompt() -> str:
-    """The interactive approve / allow-all / decline prompt."""
-    global _SESSION_AUTO_APPROVE
-    print(f"{DIM}Enter/y   approve once{RESET}")
-    print(f"{DIM}a         allow all for this session{RESET}")
-    print(f"{DIM}n         decline{RESET}")
-    while True:
-        try:
-            choice = input(f"{BLUE}❯{RESET} ").strip().lower()
-        except KeyboardInterrupt:
-            print()
-            return "cancelled: user interrupted"
-        if choice in ("", "y", "yes"):
-            return "ok"
-        if choice in ("a", "all"):
-            _SESSION_AUTO_APPROVE = True
-            print(f"{DIM}Auto-approving remaining actions this session.{RESET}")
-            return "ok"
-        if choice in ("n", "no"):
-            try:
-                feedback = read_feedback_line()
-            except KeyboardInterrupt:
-                print()
-                return "cancelled: user interrupted"
-            if feedback:
-                return f"cancelled: user declined — {feedback}"
-            return "cancelled: user declined without instructions"
-        print(f"{DIM}Choose Enter, a, or n.{RESET}")
-
-
 def bash(args: dict[str, Any]) -> str:
     """Run a shell command with a timeout, streaming output to the terminal."""
     cmd = _require_str(args, "cmd")
-    approval = confirm("run")
+    approval = ui.confirm("run")
     if approval != "ok":
         return approval
     proc = subprocess.Popen(
@@ -1346,18 +541,20 @@ def task(args: dict[str, Any]) -> str:
     Recursion is capped by MAX_SUBAGENT_DEPTH. For autonomous use run with
     --yes / WRENCODE_AUTO_APPROVE, else each sub-tool call still asks to confirm.
     """
-    depth = _subagent_depth()
+    depth = ui._subagent_depth()
     if depth >= MAX_SUBAGENT_DEPTH:
         return f"error: max subagent depth ({MAX_SUBAGENT_DEPTH}) reached"
     prompt = _require_str(args, "prompt")
-    _AGENT_LOCAL.depth = depth + 1
+    ui._AGENT_LOCAL.depth = depth + 1
     print(f"{CYAN}↳ subagent:{RESET}{DIM} {prompt[:70]}{RESET}")
     sub: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     try:
         run_agent_turn(sub, build_system_prompt(), _MLX_STATE, max_iters=12)
     finally:
-        _AGENT_LOCAL.depth = depth
-    texts = [flatten_content(m["content"]) for m in sub if m["role"] == "assistant"]
+        ui._AGENT_LOCAL.depth = depth
+    texts = [
+        backends.flatten_content(m["content"]) for m in sub if m["role"] == "assistant"
+    ]
     print(f"{CYAN}↳ subagent done{RESET}")
     return (texts[-1] if texts else "") or "(subagent produced no text output)"
 
@@ -1374,7 +571,7 @@ def _respond_schema() -> Optional[dict[str, Any]]:
     Only the top-level agent gets it. A non-object output schema is wrapped as
     {"value": ...}, since tool arguments must be an object.
     """
-    if _OUTPUT_SCHEMA is None or _subagent_depth():
+    if _OUTPUT_SCHEMA is None or ui._subagent_depth():
         return None
     if _OUTPUT_SCHEMA.get("type") == "object":
         return _OUTPUT_SCHEMA
@@ -1597,7 +794,7 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
 def print_tool_action(name: str, args: dict[str, Any]) -> None:
     """Print a tool call as plain text — no background boxes."""
     body = format_tool_action(name, args)
-    _AGENT_LOCAL.last_action = body
+    ui._AGENT_LOCAL.last_action = body
     first, _, rest = body.partition("\n")
     print(f"{GREEN}⏺{RESET}{DIM} {first}{RESET}")
     for line in rest.split("\n"):
@@ -1608,7 +805,7 @@ def print_tool_action(name: str, args: dict[str, Any]) -> None:
 def print_tool_result(result: str) -> None:
     """Print tool output with enough context to see what happened."""
     lines = result.split("\n")
-    if _agent_tag():  # parallel agents: one line each, or the screen floods
+    if ui._agent_tag():  # parallel agents: one line each, or the screen floods
         more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
         print(f"{DIM}⎿ {lines[0][:160] or '(empty)'}{more}{RESET}")
         return
@@ -1639,116 +836,21 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
         return f"error: {e}"
 
 
-# -----------------------------------------------------------------------------------------------
-# Message formatting
-# -----------------------------------------------------------------------------------------------
-def flatten_content(content: Any) -> str:
-    """Flatten a content list to plain string (Anthropic or Bedrock Converse blocks)."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        btype = block.get("type")
-        if btype == "text":
-            parts.append(block["text"])
-        elif btype == "tool_use":
-            parts.append(
-                f'<tool_call>{{"tool": "{block["name"]}", "args": {json.dumps(block["input"])}}}</tool_call>'
-            )
-        elif btype == "tool_result":
-            parts.append(f"Tool result: {block.get('content', '')}")
-        # Bedrock Converse blocks have no "type" key.
-        elif "text" in block:
-            parts.append(block["text"])
-        elif "toolUse" in block:
-            tu = block["toolUse"]
-            parts.append(
-                f'<tool_call>{{"tool": "{tu.get("name", "")}", "args": {json.dumps(tu.get("input", {}))}}}</tool_call>'
-            )
-        elif "toolResult" in block:
-            tr = block["toolResult"]
-            txt = " ".join(
-                c.get("text", "") for c in tr.get("content", []) if isinstance(c, dict)
-            )
-            parts.append(f"Tool result: {txt}")
-    return "\n".join(parts)
-
-
-# Lightweight, language-agnostic code coloring — no pygments, keeps the binary lean.
-_CODE_TOKEN = re.compile(
-    r"(?P<comment>#[^\n]*|//[^\n]*)"
-    r"|(?P<string>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`)"
-    r"|(?P<num>\b\d[\d_.]*\b)"
-    r"|(?P<kw>\b(?:def|class|return|import|from|if|elif|else|for|while|try|except|"
-    r"finally|with|as|in|not|and|or|is|lambda|yield|async|await|pass|break|continue|"
-    r"raise|global|nonlocal|assert|True|False|None|const|let|var|function|export|"
-    r"default|new|this|fn|match|struct|enum|pub|use|mut|public|private|static|void)\b)"
-)
-
-
-def _highlight_code(code: str) -> str:
-    """Apply light ANSI syntax coloring to a code block (best-effort, any language)."""
-
-    def color(m: "re.Match[str]") -> str:
-        g = m.lastgroup
-        if g == "comment":
-            return f"{DIM}{m.group()}{RESET}"
-        if g == "string":
-            return f"{GREEN}{m.group()}{RESET}"
-        if g == "num":
-            return f"{YELLOW}{m.group()}{RESET}"
-        if g == "kw":
-            return f"{BLUE}{m.group()}{RESET}"
-        return m.group()
-
-    return _CODE_TOKEN.sub(color, code)
-
-
-def render_markdown(text: str) -> str:
-    """Render fenced code blocks (lightly highlighted), inline code, and bold."""
-    blocks: list[str] = []
-
-    def stash(m: "re.Match[str]") -> str:
-        lang = m.group(1) or ""
-        body = _highlight_code(m.group(2).rstrip("\n"))
-        head = f"{DIM}┌─ {lang}{RESET}\n" if lang else f"{DIM}┌─{RESET}\n"
-        bordered = "\n".join(f"{DIM}│{RESET} {ln}" for ln in body.split("\n"))
-        blocks.append(f"\n{head}{bordered}\n{DIM}└─{RESET}")
-        return f"\x00B{len(blocks) - 1}\x00"
-
-    text = re.sub(r"```(\w*)\n?(.*?)```", stash, text, flags=re.DOTALL)
-    text = re.sub(r"`([^`\n]+)`", f"{CYAN}\\1{RESET}", text)
-    text = re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
-    for i, b in enumerate(blocks):
-        text = text.replace(f"\x00B{i}\x00", b)
-    return text
-
-
-def print_agent_message(text: str) -> None:
-    """Print the agent response in muted grey text — no label, no box."""
-    for line in render_markdown(text).split("\n"):
-        print(f"{AGENT_TEXT}{line}{RESET}")
-    print()
-
-
 @contextlib.contextmanager
 def thinking_spinner() -> Any:
     """Loader on the line below the user's input (style from /loader)."""
-    if not sys.stdout.isatty() or _agent_tag():  # parallel agents share the screen
+    if not sys.stdout.isatty() or ui._agent_tag():  # parallel agents share the screen
         yield
         return
 
     stop = threading.Event()
     step = 0
+    context = ui.loader_context(backends.BACKEND, backends.MODEL)
 
     def animate() -> None:
         nonlocal step
         while not stop.is_set():
-            bar = loader_display(step)
+            bar = ui.loader_display(step, context)
             step += 1
             sys.stdout.write(f"\r{bar}")
             sys.stdout.flush()
@@ -1763,57 +865,6 @@ def thinking_spinner() -> Any:
         thread.join(timeout=0.4)
         sys.stdout.write("\r\033[2K")
         sys.stdout.flush()
-
-
-# -----------------------------------------------------------------------------------------------
-# Token & output cleaning
-# -----------------------------------------------------------------------------------------------
-def strip_gptoss_tokens(text: str) -> str:
-    """Strip GPT-OSS special tokens and channel markers from model output."""
-    if "<|channel|>final<|message|>" in text:
-        text = text.split("<|channel|>final<|message|>")[-1]
-    return re.sub(r"<\|[^>]+\|>", "", text).strip()
-
-
-def truncate_at_turn_leak(text: str) -> str:
-    """Truncate text at the first sign of a leaked conversation turn marker."""
-    return next(
-        (
-            text.split(m)[0].strip()
-            for m in (
-                "\nUser:",
-                "\nSystem:",
-                "\nHuman:",
-                "\n\nUser:",
-                "\n\nSystem:",
-            )
-            if m in text
-        ),
-        text,
-    )
-
-
-def _tool_call_complete(text: str) -> int:
-    """Return end index of first complete <tool_call> block, or -1."""
-    start = text.find("<tool_call>")
-    if start == -1:
-        return -1
-    end_tag = text.find("</tool_call>", start)
-    if end_tag != -1:
-        return end_tag + len("</tool_call>")
-    brace_start = text.find("{", start)
-    if brace_start == -1:
-        return -1
-    depth, last = 0, -1
-    for i, ch in enumerate(text[brace_start:], brace_start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                last = i + 1
-                break
-    return last
 
 
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
@@ -1898,7 +949,7 @@ def _garbled_tool_call(text: str, native: bool) -> str:
 
 
 # -----------------------------------------------------------------------------------------------
-# Anthropic native tools
+# Tool definitions for the model
 # -----------------------------------------------------------------------------------------------
 _TYPE_MAP: dict[str, str] = {
     "string": "string",
@@ -1910,10 +961,12 @@ _TYPE_MAP: dict[str, str] = {
 }
 
 
-def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
-    """Build tool definitions for 'anthropic', 'converse', or 'openai' format."""
-    out = []
-    specs: list[tuple[str, str, dict[str, Any]]] = []
+def tool_specs() -> list[backends.ToolSpec]:
+    """The tools offered this turn as (name, description, JSON schema).
+
+    `respond` is included when a --json-schema answer is required of this agent.
+    """
+    specs: list[backends.ToolSpec] = []
     for name, (desc, params, _) in TOOLS.items():
         props = {k: {"type": _TYPE_MAP.get(v, "string")} for k, v in params.items()}
         req = [k for k, v in params.items() if not v.endswith("?")]
@@ -1922,730 +975,29 @@ def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
         )
     if (respond_schema := _respond_schema()) is not None:
         specs.append((RESPOND_TOOL, RESPOND_DESCRIPTION, respond_schema))
-    for name, desc, schema in specs:
-        if fmt == "anthropic":
-            out.append({"name": name, "description": desc, "input_schema": schema})
-        elif fmt == "converse":
-            out.append(
-                {
-                    "toolSpec": {
-                        "name": name,
-                        "description": desc,
-                        "inputSchema": {"json": schema},
-                    }
-                }
-            )
-        else:
-            out.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": desc,
-                        "parameters": schema,
-                    },
-                }
-            )
-    return out
-
-
-def _claude_output_config() -> dict[str, Any]:
-    """Request fields for WRENCODE_EFFORT, or nothing when it's unset."""
-    return {"output_config": {"effort": CLAUDE_EFFORT}} if CLAUDE_EFFORT else {}
-
-
-def _anthropic_headers(*, api_key: str = "", workspace_id: str = "") -> dict[str, str]:
-    """Build Anthropic request headers, including workspace id when required.
-
-    Multi-workspace (identity-linked) API keys must send anthropic-workspace-id
-    on every request; workspace-scoped keys may omit it.
-    """
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key or API_KEY,
-        "anthropic-version": "2023-06-01",
-    }
-    ws = workspace_id or ANTHROPIC_WORKSPACE_ID
-    if ws:
-        headers["anthropic-workspace-id"] = ws
-    return headers
-
-
-def _openai_headers() -> dict[str, str]:
-    return {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
-
-
-def _is_truncated(data: dict[str, Any]) -> bool:
-    """Return True if a native API response stopped at max_tokens."""
-    if BACKEND == "bedrock":
-        return data.get("stopReason") == "max_tokens"
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        return data.get("stop_reason") == "max_tokens"
-    return (data.get("choices") or [{}])[0].get("finish_reason") == "length"
-
-
-def _warn_if_truncated(data: dict[str, Any]) -> None:
-    """Print a stderr warning if the API truncated the response at max_tokens.
-
-    A truncated `tool_use` may be missing required fields (e.g. `content` for
-    `write`), so callers need to know to raise MAX_TOKENS rather than silently
-    treating an empty operation as success.
-    """
-    u = data.get("usage", {})
-    out_tokens = u.get(
-        "outputTokens", u.get("output_tokens", u.get("completion_tokens"))
-    )
-    if _is_truncated(data):
-        print(
-            f"{YELLOW}Warning: response truncated at MAX_TOKENS={MAX_TOKENS} "
-            f"(output_tokens={out_tokens}). Tool calls may be incomplete — "
-            f"raise MAX_TOKENS and retry.{RESET}",
-            file=sys.stderr,
-        )
-
-
-def _log_usage_debug(data: dict[str, Any]) -> None:
-    """When WRENCODE_DEBUG=1, print one stderr line per turn with token usage.
-
-    Surfaces cache_creation_input_tokens / cache_read_input_tokens so prompt-
-    cache hit rate is observable without external tooling.
-    """
-    if not os.environ.get("WRENCODE_DEBUG"):
-        return
-    u = data.get("usage", {})
-    if BACKEND == "bedrock":
-        print(
-            f"{DIM}usage: in={u.get('inputTokens')} out={u.get('outputTokens')}{RESET}",
-            file=sys.stderr,
-        )
-        return
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        print(
-            f"{DIM}usage: in={u.get('input_tokens')} out={u.get('output_tokens')} "
-            f"cache_write={u.get('cache_creation_input_tokens', 0)} "
-            f"cache_read={u.get('cache_read_input_tokens', 0)}{RESET}",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"{DIM}usage: in={u.get('prompt_tokens')} out={u.get('completion_tokens')}{RESET}",
-            file=sys.stderr,
-        )
-
-
-def _parse_native_response(data: dict[str, Any]) -> tuple[str, list["ToolCall"]]:
-    """Parse a native (Anthropic / Bedrock Converse / OpenAI) response into text + tool calls."""
-    _warn_if_truncated(data)
-    _log_usage_debug(data)
-    if BACKEND == "bedrock":
-        blocks = data.get("output", {}).get("message", {}).get("content", [])
-        text = "\n".join(b["text"] for b in blocks if "text" in b).strip()
-        calls = [
-            ToolCall(
-                b["toolUse"]["toolUseId"],
-                b["toolUse"]["name"],
-                b["toolUse"].get("input", {}),
-            )
-            for b in blocks
-            if "toolUse" in b
-        ]
-        return text, calls
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        blocks = data.get("content", [])
-        text = "\n".join(b["text"] for b in blocks if b.get("type") == "text").strip()
-        calls = [
-            ToolCall(b["id"], b["name"], b.get("input", {}))
-            for b in blocks
-            if b.get("type") == "tool_use"
-        ]
-        return text, calls
-    msg = data["choices"][0]["message"]
-    text = (msg.get("content") or "").strip()
-    calls = []
-    for tc in msg.get("tool_calls") or []:
-        with contextlib.suppress(Exception):
-            calls.append(
-                ToolCall(
-                    tc["id"],
-                    tc["function"]["name"],
-                    json.loads(tc["function"]["arguments"]),
-                )
-            )
-    return text, calls
-
-
-@dataclass
-class ToolCall:
-    """A single tool invocation parsed from a model response."""
-
-    id: str
-    name: str
-    input: dict[str, Any]
+    return specs
 
 
 def _parse_response(
     response_text: str,
-) -> tuple[str, list[ToolCall], Any]:
+) -> tuple[str, list[backends.ToolCall], Any]:
     """Parse a raw API response into (display_text, tool_calls, raw_data).
 
     raw_data is the decoded JSON for native backends (used when appending to
     history); None for XML backends.
     """
-    if BACKEND in NATIVE_TOOL_BACKENDS:
+    if backends.BACKEND in backends.NATIVE_TOOL_BACKENDS:
         data = json.loads(response_text)
-        text, calls = _parse_native_response(data)
+        text, calls = backends._parse_native_response(data)
         return text, calls, data
     text = re.sub(
         r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL
     ).strip()
     calls = [
-        ToolCall(tc["id"], tc["name"], tc["input"])
+        backends.ToolCall(tc["id"], tc["name"], tc["input"])
         for tc in parse_tool_calls(response_text)
     ]
     return text, calls, None
-
-
-def _append_assistant(
-    messages: list[dict[str, Any]],
-    text: str,
-    tool_calls: list[ToolCall],
-    raw_data: Any,
-) -> None:
-    """Append the assistant turn to message history in the correct format."""
-    if BACKEND == "bedrock":
-        content = raw_data.get("output", {}).get("message", {}).get("content", [])
-        # Keep only text + toolUse blocks; echoing other block types (e.g.
-        # reasoningContent) back into the next Converse request can 400.
-        kept = [b for b in content if "text" in b or "toolUse" in b]
-        messages.append({"role": "assistant", "content": kept})
-    elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        messages.append({"role": "assistant", "content": raw_data.get("content", [])})
-    elif BACKEND in OPENAI_FORMAT_BACKENDS:
-        messages.append(raw_data["choices"][0]["message"])  # preserve tool_calls
-    else:  # XML path
-        blocks: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
-        for tc in tool_calls:
-            blocks.append(
-                {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input}
-            )
-        messages.append({"role": "assistant", "content": blocks})
-
-
-def _append_tool_results(
-    messages: list[dict[str, Any]],
-    results: list[tuple[ToolCall, str]],
-) -> None:
-    """Append tool results to message history in the correct format."""
-    if BACKEND in OPENAI_FORMAT_BACKENDS:
-        messages.extend(
-            {"role": "tool", "tool_call_id": tc.id, "content": r} for tc, r in results
-        )
-    elif BACKEND == "bedrock":
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "toolResult": {
-                            "toolUseId": tc.id,
-                            "content": [{"text": r}],
-                            "status": "success",
-                        }
-                    }
-                    for tc, r in results
-                ],
-            }
-        )
-    else:  # anthropic + XML path both use tool_result blocks
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": tc.id, "content": r}
-                    for tc, r in results
-                ],
-            }
-        )
-
-
-# -----------------------------------------------------------------------------------------------
-# HTTP helper
-# -----------------------------------------------------------------------------------------------
-def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
-    """POST pre-encoded bytes to a URL and return the parsed JSON response.
-
-    Responses aren't streamed, so the timeout must cover a whole generation.
-    Rate limits and server errors (429/5xx) are retried with backoff, and so are
-    network failures: refused or dropped connections and timeouts. (A Bedrock
-    request is signed once, so a retry after a long timeout may be refused as
-    expired; that surfaces as an HTTP 403 rather than a hang.)
-    """
-    req = urllib.request.Request(url, data=data, headers=headers)
-    for attempt in range(HTTP_RETRIES + 1):
-        wait = 2 ** (attempt + 1)
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                return json.load(resp)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            if e.code in {429, 500, 502, 503, 504} and attempt < HTTP_RETRIES:
-                print(
-                    f"{YELLOW}HTTP {e.code}, retrying in {wait}s{RESET}",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-                continue
-            hint = ""
-            if e.code == 400 and "workspace" in body.lower():
-                hint = (
-                    " Set ANTHROPIC_WORKSPACE_ID (or re-run /configure and enter a "
-                    "workspace id from Settings → Workspaces)."
-                )
-            raise Exception(f"HTTP {e.code}: {body}{hint}") from e
-        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-            # urlopen wraps connect errors in URLError; a dropped connection while
-            # waiting (RemoteDisconnected) or a read timeout comes through raw.
-            if attempt == HTTP_RETRIES:
-                raise
-            reason = getattr(e, "reason", None) or e
-            print(
-                f"{YELLOW}Network error ({reason}), retrying in {wait}s{RESET}",
-                file=sys.stderr,
-            )
-            time.sleep(wait)
-    raise AssertionError("unreachable")
-
-
-def _http_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> Any:
-    """POST a JSON payload to a URL and return the parsed response."""
-    return _http_post_raw(url, json.dumps(payload).encode(), headers)
-
-
-# -----------------------------------------------------------------------------------------------
-# AWS Bedrock: credentials + SigV4 request signing (stdlib only — no boto3)
-# -----------------------------------------------------------------------------------------------
-def _aws_region() -> str:
-    """Resolve the AWS region: env, then ~/.aws/config for the active profile, else us-east-1."""
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    if region:
-        return region
-    with contextlib.suppress(Exception):
-        import configparser
-
-        cfg = configparser.ConfigParser()
-        cfg.read(os.path.expanduser("~/.aws/config"))
-        profile = os.environ.get("AWS_PROFILE", "default")
-        section = profile if profile == "default" else f"profile {profile}"
-        if cfg.has_option(section, "region"):
-            return cfg.get(section, "region")
-    return "us-east-1"
-
-
-def _aws_credentials() -> tuple[str, str, str]:
-    """Resolve (access_key, secret_key, session_token) from env, then ~/.aws/credentials."""
-    ak = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    sk = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    token = os.environ.get("AWS_SESSION_TOKEN", "")
-    if ak and sk:
-        return ak, sk, token
-    with contextlib.suppress(Exception):
-        import configparser
-
-        creds = configparser.ConfigParser()
-        creds.read(os.path.expanduser("~/.aws/credentials"))
-        profile = os.environ.get("AWS_PROFILE", "default")
-        if creds.has_section(profile):
-            ak = ak or creds.get(profile, "aws_access_key_id", fallback="")
-            sk = sk or creds.get(profile, "aws_secret_access_key", fallback="")
-            token = token or creds.get(profile, "aws_session_token", fallback="")
-    return ak, sk, token
-
-
-def _sigv4_authorization(
-    method: str,
-    canonical_uri: str,
-    canonical_qs: str,
-    headers: dict[str, str],
-    payload_hash: str,
-    service: str,
-    region: str,
-    amz_date: str,
-    access_key: str,
-    secret_key: str,
-) -> tuple[str, str]:
-    """Compute (Authorization header value, signed-headers list) for AWS SigV4.
-
-    `headers` keys must be lowercase. Pure stdlib hashlib/hmac — this is the
-    core algorithm, kept side-effect-free so it can be tested against AWS's
-    published signing vectors.
-    """
-    datestamp = amz_date[:8]
-    signed_headers = ";".join(sorted(headers))
-    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
-    canonical_request = "\n".join(
-        [
-            method,
-            canonical_uri,
-            canonical_qs,
-            canonical_headers,
-            signed_headers,
-            payload_hash,
-        ]
-    )
-    scope = f"{datestamp}/{region}/{service}/aws4_request"
-    string_to_sign = "\n".join(
-        [
-            "AWS4-HMAC-SHA256",
-            amz_date,
-            scope,
-            hashlib.sha256(canonical_request.encode()).hexdigest(),
-        ]
-    )
-
-    def _hmac(key: bytes, msg: str) -> bytes:
-        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
-
-    k_date = _hmac(("AWS4" + secret_key).encode(), datestamp)
-    k_region = _hmac(k_date, region)
-    k_service = _hmac(k_region, service)
-    k_signing = _hmac(k_service, "aws4_request")
-    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
-    auth = (
-        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
-    )
-    return auth, signed_headers
-
-
-def _sigv4_signed_headers(
-    method: str, url: str, body: bytes, service: str, region: str
-) -> dict[str, str]:
-    """Build the full set of SigV4-signed request headers for a Bedrock call."""
-    access_key, secret_key, token = _aws_credentials()
-    if not (access_key and secret_key):
-        raise Exception(
-            "AWS credentials not found — set AWS_ACCESS_KEY_ID and "
-            "AWS_SECRET_ACCESS_KEY (and AWS_REGION)."
-        )
-    parsed = urllib.parse.urlsplit(url)
-    payload_hash = hashlib.sha256(body).hexdigest()
-    amz_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    # SigV4 canonical URI: non-S3 services double-encode the (already
-    # percent-encoded) path — a Bedrock model id's ':' goes %3A -> %253A.
-    # Re-quoting the wire path encodes the '%' signs while leaving '/' intact.
-    canonical_uri = urllib.parse.quote(parsed.path or "/", safe="/~")
-    sign_these = {
-        "host": parsed.netloc,
-        "x-amz-content-sha256": payload_hash,
-        "x-amz-date": amz_date,
-    }
-    if token:
-        sign_these["x-amz-security-token"] = token
-    auth, _ = _sigv4_authorization(
-        method,
-        canonical_uri,
-        parsed.query,
-        sign_these,
-        payload_hash,
-        service,
-        region,
-        amz_date,
-        access_key,
-        secret_key,
-    )
-    headers = {
-        "Content-Type": "application/json",
-        "X-Amz-Date": amz_date,
-        "X-Amz-Content-Sha256": payload_hash,
-        "Authorization": auth,
-    }
-    if token:
-        headers["X-Amz-Security-Token"] = token
-    return headers
-
-
-def _bedrock_converse_call(body: dict[str, Any]) -> Any:
-    """POST a Bedrock Converse body to the signed /converse endpoint, return JSON."""
-    region = _aws_region()
-    model_id = urllib.parse.quote(MODEL, safe="")
-    url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
-    raw = json.dumps(body).encode()
-    # The runtime host is bedrock-runtime.*, but the SigV4 signing service is "bedrock".
-    headers = _sigv4_signed_headers("POST", url, raw, "bedrock", region)
-    return _http_post_raw(url, raw, headers)
-
-
-def _to_converse_message(m: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a stored message to Converse shape (string content -> [{text}])."""
-    content = m["content"]
-    if isinstance(content, str):
-        content = [{"text": content}]
-    return {"role": m["role"], "content": content}
-
-
-def _defang_tool_tags(text: str) -> str:
-    return text.replace("<tool_call>", "<tool-call>").replace(
-        "</tool_call>", "</tool-call>"
-    )
-
-
-def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Coerce history into OpenAI chat format.
-
-    History is shared across backends (~/.wrencode/history.json), so turns saved by
-    Anthropic/Bedrock backends carry content-block lists that OpenAI-compatible APIs
-    reject. tool_use/toolUse blocks become assistant tool_calls and their results
-    become role "tool" messages; other blocks are flattened to text. Native OpenAI
-    turns pass through. Tool calls left without a result are dropped, since the API
-    requires every tool_call id to be answered. Literal <tool_call> tags left in text
-    (from XML-backend turns) are defanged: GLM models treat them as template tokens
-    and NanoGPT fails the request with a 503.
-    """
-    out: list[dict[str, Any]] = []
-    for m in messages:
-        content = m.get("content")
-        if isinstance(content, str) and "tool_call>" in content:
-            m = {**m, "content": _defang_tool_tags(content)}
-        if content is None or isinstance(content, str):
-            out.append(m)
-            continue
-        texts: list[str] = []
-        calls: list[dict[str, Any]] = []
-        results: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use" or "toolUse" in block:
-                tu = block.get("toolUse", block)
-                calls.append(
-                    {
-                        "id": tu.get("id") or tu.get("toolUseId", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tu.get("name", ""),
-                            "arguments": json.dumps(tu.get("input", {})),
-                        },
-                    }
-                )
-            elif block.get("type") == "tool_result" or "toolResult" in block:
-                tr = block.get("toolResult", block)
-                body = tr.get("content", "")
-                if not isinstance(body, str):
-                    body = flatten_content(body)
-                body = _defang_tool_tags(body)
-                results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tr.get("tool_use_id")
-                        or tr.get("toolUseId", ""),
-                        "content": body,
-                    }
-                )
-            else:
-                texts.append(flatten_content([block]))
-        text = _defang_tool_tags("\n".join(t for t in texts if t))
-        if m["role"] == "assistant":
-            msg: dict[str, Any] = {"role": "assistant", "content": text}
-            if calls:
-                msg["tool_calls"] = calls
-            out.append(msg)
-        else:
-            out.extend(results)
-            if text:
-                out.append({"role": m["role"], "content": text})
-
-    # Keep only tool_calls answered by the tool messages directly after them, and
-    # only tool messages answering the assistant turn before them.
-    fixed: list[dict[str, Any]] = []
-    i = 0
-    while i < len(out):
-        m = out[i]
-        if m["role"] == "tool":  # orphan: no preceding assistant tool_calls
-            fixed.append({"role": "user", "content": f"Tool result: {m['content']}"})
-            i += 1
-            continue
-        if m["role"] == "assistant" and m.get("tool_calls"):
-            j = i + 1
-            while j < len(out) and out[j]["role"] == "tool":
-                j += 1
-            answered = {t["tool_call_id"] for t in out[i + 1 : j]}
-            calls = [c for c in m["tool_calls"] if c["id"] in answered]
-            kept = {c["id"] for c in calls}
-            msg = {k: v for k, v in m.items() if k != "tool_calls"}
-            if calls:
-                msg["tool_calls"] = calls
-            fixed.append(msg)
-            for t in out[i + 1 : j]:
-                if t["tool_call_id"] in kept:
-                    fixed.append(t)
-                else:
-                    fixed.append(
-                        {"role": "user", "content": f"Tool result: {t['content']}"}
-                    )
-            i = j
-            continue
-        fixed.append(m)
-        i += 1
-    return fixed
-
-
-# -----------------------------------------------------------------------------------------------
-# Inference
-# -----------------------------------------------------------------------------------------------
-def get_response(
-    messages: list[dict[str, Any]],
-    system_prompt: str,
-    mlx_state: Optional[tuple[Any, Any]],
-) -> str:
-    """Generate a response from the configured backend given the message history."""
-    flat = [
-        {"role": m["role"], "content": flatten_content(m["content"])} for m in messages
-    ]
-
-    # OpenAI - native function calling
-    if BACKEND in OPENAI_FORMAT_BACKENDS:
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}]
-                + _to_openai_messages(messages),
-                "max_tokens": MAX_TOKENS,
-                "temperature": 0.3,
-                "tools": _build_tool_schemas("openai"),
-                "tool_choice": "auto",
-            },
-            _openai_headers(),
-        )
-        return json.dumps(data)  # return raw for agent loop to parse natively
-
-    # OpenRouter / Ollama - OpenAI-compatible chat completions (no native tools)
-    if BACKEND in {"openrouter", "ollama"}:
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "messages": [{"role": "system", "content": system_prompt}] + flat,
-                "max_tokens": MAX_TOKENS,
-                "temperature": 0.3,
-            },
-            _openai_headers(),
-        )
-        return str(data["choices"][0]["message"]["content"])
-
-    # AWS Bedrock — model-agnostic Converse API (Claude, Llama, Nova, GPT-OSS…).
-    if BACKEND == "bedrock":
-        tools = _build_tool_schemas("converse")
-        body: dict[str, Any] = {
-            "messages": [_to_converse_message(m) for m in messages],
-            "system": [{"text": system_prompt}],
-            "inferenceConfig": {"maxTokens": MAX_TOKENS, "temperature": 0.3},
-        }
-        if tools:
-            body["toolConfig"] = {"tools": tools}
-        data = _bedrock_converse_call(body)
-        return json.dumps(data)  # return raw for agent loop to parse natively
-
-    # Anthropic native tool use API.
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        # Prompt caching, three of the four breakpoints allowed per request:
-        # explicit markers on the last tool schema and the static system block
-        # give the shared prefix a guaranteed read point, and the top-level
-        # cache_control (automatic caching) moves a breakpoint to the end of
-        # the growing conversation, so each agent step re-reads the whole
-        # history from cache instead of paying full input price for it.
-        # Entries live ~5 minutes and refresh on every read.
-        tools = _build_tool_schemas("anthropic")
-        if tools:
-            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                "messages": messages,
-                "max_tokens": CLAUDE_MAX_TOKENS,
-                "tools": tools,
-                "cache_control": {"type": "ephemeral"},
-                **_claude_output_config(),
-            },
-            _anthropic_headers(),
-        )
-        return json.dumps(data)  # return raw for agent loop to parse natively
-
-    # Local proxy - Anthropic messages API; tool calls returned as XML <tool_call> tags in text
-    if BACKEND == "local":
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "system": system_prompt,
-                "messages": flat,
-                "max_tokens": MAX_TOKENS,
-            },
-            _anthropic_headers(),
-        )
-        text = "".join(
-            b["text"] for b in data.get("content", []) if b.get("type") == "text"
-        )
-        return strip_gptoss_tokens(text)
-
-    # Transformers (HuggingFace)
-    if BACKEND == "transformers":
-        assert mlx_state is not None  # load_model populates this for ML backends
-        model, tokenizer = mlx_state
-        inputs = tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt}] + flat,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        ).to(model.device)
-        with torch.no_grad():
-            out_ids = model.generate(
-                **inputs,
-                max_new_tokens=MAX_TOKENS,
-                temperature=0.3,
-                do_sample=True,
-            )
-        raw = tokenizer.decode(
-            out_ids[0][inputs["input_ids"].shape[-1] :],
-            skip_special_tokens=False,
-        )
-        end = _tool_call_complete(raw)
-        if end != -1:
-            raw = raw[:end]
-        return truncate_at_turn_leak(strip_gptoss_tokens(raw))
-
-    # MLX (Apple Silicon)
-    assert mlx_state is not None  # load_model populates this for ML backends
-    model, tokenizer = mlx_state
-    chat: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    for m in messages:
-        if c := flatten_content(m["content"]):
-            chat.append({"role": m["role"], "content": c})
-    prompt = tokenizer.apply_chat_template(
-        chat, tokenize=False, add_generation_prompt=True
-    )
-    sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
-    out = ""
-    for chunk in stream_generate(
-        model, tokenizer, prompt=prompt, max_tokens=MAX_TOKENS, sampler=sampler
-    ):
-        check_cancelled()
-        out += chunk.text
-        end = _tool_call_complete(out)
-        if end != -1:
-            out = out[:end]
-            break
-    if out.startswith(prompt):
-        out = out[len(prompt) :].strip()
-    return truncate_at_turn_leak(strip_gptoss_tokens(out))
 
 
 # -----------------------------------------------------------------------------------------------
@@ -2674,74 +1026,6 @@ def save_history(messages: list[dict[str, Any]]) -> None:
             json.dump(messages, f)
 
 
-def _summarize(
-    prompt: str, mlx_state: Optional[tuple[Any, Any]], max_tokens: int
-) -> str:
-    """Send a one-off prompt to the current backend (no tools) and return its text."""
-    system = "You are a helpful assistant."
-    if BACKEND == "bedrock":
-        data = _bedrock_converse_call(
-            {
-                "messages": [{"role": "user", "content": [{"text": prompt}]}],
-                "system": [{"text": system}],
-                "inferenceConfig": {"maxTokens": max_tokens},
-            }
-        )
-        return "\n".join(
-            b["text"]
-            for b in data.get("output", {}).get("message", {}).get("content", [])
-            if "text" in b
-        ).strip()
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "system": system,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-            },
-            _anthropic_headers(),
-        )
-        return "\n".join(
-            b["text"] for b in data.get("content", []) if b.get("type") == "text"
-        ).strip()
-    if BACKEND in HOSTED_BACKENDS or BACKEND == "ollama":  # OpenAI chat format
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-            },
-            _openai_headers(),
-        )
-        return (data["choices"][0]["message"].get("content") or "").strip()
-    if BACKEND in LOCAL_ML_BACKENDS and mlx_state:
-        model, tokenizer = mlx_state
-        chat = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        sampler = make_sampler(temp=0.3, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
-        out = "".join(
-            c.text
-            for c in stream_generate(
-                model, tokenizer, prompt=chat, max_tokens=max_tokens, sampler=sampler
-            )
-        )
-        return out[len(chat) :].strip() if out.startswith(chat) else out.strip()
-    raise RuntimeError(f"summarizing isn't supported for backend '{BACKEND}'")
-
-
 def _transcript(messages: list[dict[str, Any]], budget_chars: int) -> str:
     """Flatten messages into a plain transcript for summarizing.
 
@@ -2751,14 +1035,14 @@ def _transcript(messages: list[dict[str, Any]], budget_chars: int) -> str:
     """
     lines = []
     for m in messages:
-        text = flatten_content(m.get("content"))
+        text = backends.flatten_content(m.get("content"))
         for c in m.get("tool_calls") or []:
             fn = c.get("function", {})
             text += f"\n[tool call] {fn.get('name')}({fn.get('arguments')})"
         if len(text) > 2000:
             text = f"{text[:2000]} ...[{len(text) - 2000} chars cut]"
         lines.append(f"{m['role']}: {text}")
-    out = _defang_tool_tags("\n".join(lines))
+    out = backends._defang_tool_tags("\n".join(lines))
     if len(out) > budget_chars:
         head = budget_chars // 4
         out = (
@@ -2782,7 +1066,7 @@ def compact_messages(
         "preserving any file paths, code decisions, or unresolved tasks:\n\n"
         + _transcript(messages, CONTEXT_TOKENS * 2)
     )
-    summary = _summarize(prompt, (model, tokenizer) if model else None, 512)
+    summary = backends._summarize(prompt, (model, tokenizer) if model else None, 512)
     return [
         {"role": "user", "content": f"[Conversation summary]\n{summary}"},
         {
@@ -2863,7 +1147,7 @@ def auto_compact(
         + _transcript(head, CONTEXT_TOKENS * 2)
     )
     try:
-        summary = _summarize(prompt, mlx_state, 1500)
+        summary = backends._summarize(prompt, mlx_state, 1500)
     except Exception as err:  # noqa: BLE001 — fall back to dropping history
         summary = f"(Earlier messages were dropped to fit the context window: {err})"
     note = f"{_COMPACTION_NOTE}\n{summary}"
@@ -2871,7 +1155,7 @@ def auto_compact(
         note += f"{_REQUEST_MARK}{task}"
     note += _CONTINUE_MARK
     messages[:] = [{"role": "user", "content": note}, *tail]
-    print_system(f"⟳ Compacted {len(head)} older messages into a summary")
+    ui.print_system(f"⟳ Compacted {len(head)} older messages into a summary")
 
 
 # -----------------------------------------------------------------------------------------------
@@ -2903,7 +1187,7 @@ def find_agents_files() -> list[pathlib.Path]:
     chain = [ws, *ws.parents]
     top = next((i for i, d in enumerate(chain) if (d / ".git").exists()), 0)
     found: list[pathlib.Path] = []
-    for d in [CONFIG_DIR, *reversed(chain[: top + 1])]:
+    for d in [backends.CONFIG_DIR, *reversed(chain[: top + 1])]:
         for name in AGENTS_FILES:
             if (p := d / name).is_file():
                 found.append(p)
@@ -2940,7 +1224,7 @@ def build_system_prompt() -> str:
         in ("1", "true", "yes")
         else "Relative paths resolve under the workspace. Absolute paths must stay inside it."
     )
-    if BACKEND in OPENAI_FORMAT_BACKENDS:
+    if backends.BACKEND in backends.OPENAI_FORMAT_BACKENDS:
         # Tool schemas travel in the request's `tools` field; XML instructions here
         # would compete with native calling (and break NanoGPT's GLM models).
         tool_format = "Call tools through the native function-calling interface."
@@ -3064,7 +1348,7 @@ def run_agent_turn(
                 # The window guess was too big: compact once and retry the round.
                 if retried_overflow or not _CONTEXT_ERROR.search(str(err)):
                     raise
-                print_system("⟳ Context limit hit, compacting and retrying")
+                ui.print_system("⟳ Context limit hit, compacting and retrying")
                 retried_overflow = True
                 auto_compact(messages, mlx_state)
                 iters -= 1
@@ -3072,8 +1356,12 @@ def run_agent_turn(
             retried_overflow = False
             display_text, tool_calls, raw_data = _parse_response(response_text)
             if display_text:
-                print_agent_message(display_text)
-            if not tool_calls and raw_data is not None and _is_truncated(raw_data):
+                ui.print_agent_message(display_text)
+            if (
+                not tool_calls
+                and raw_data is not None
+                and backends._is_truncated(raw_data)
+            ):
                 # Cut off before acting (often spent on reasoning): nudge, don't stop.
                 truncations += 1
                 if truncations > MAX_TRUNCATION_RETRIES:
@@ -3092,7 +1380,7 @@ def run_agent_turn(
                     raw_data is not None,
                 )
             )
-            _append_assistant(messages, display_text, tool_calls, raw_data)
+            backends._append_assistant(messages, display_text, tool_calls, raw_data)
             if garbled:
                 # A tool call the model meant to make but that couldn't run.
                 garbled_nudges += 1
@@ -3114,11 +1402,11 @@ def run_agent_turn(
                     return "no_structured_output"
                 messages.append({"role": "user", "content": RESPOND_NUDGE})
                 continue
-            results: list[tuple[ToolCall, str]] = []
+            results: list[tuple[backends.ToolCall, str]] = []
             stop = False
             parallel = _run_parallel_tasks(tool_calls)
             for i, tc in enumerate(tool_calls):
-                check_cancelled()
+                ui.check_cancelled()
                 if i in parallel:
                     result = parallel[i]
                 else:
@@ -3150,83 +1438,32 @@ def run_agent_turn(
                 (tc, "skipped: stopped after repeated errors")
                 for tc in tool_calls[len(results) :]
             ]
-            _append_tool_results(messages, results)
+            backends._append_tool_results(messages, results)
             if stop:
                 return "tool_errors"
             if _STRUCTURED_RESULT and _respond_schema() is not None:
                 return "done"
-    except (UserCancelled, KeyboardInterrupt):
-        if _agent_tag():
+    except (ui.UserCancelled, KeyboardInterrupt):
+        if ui._agent_tag():
             print(f"{YELLOW}cancelled{RESET}")
             return "cancelled"
         print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
         return "cancelled"
     finally:
-        if not _agent_tag():  # the batch owner clears the shared cancel state
-            _CANCEL_REQUESTED.clear()
-            _LISTENER_STOP.set()
-
-
-# -----------------------------------------------------------------------------------------------
-# Parallel subagents
-# -----------------------------------------------------------------------------------------------
-# When one reply makes several task calls, the subagents run at the same time,
-# each in its own thread with its own history. Their output is tagged [1], [2]...
-# and written a whole line at a time; approvals take turns (_confirm_from_subagent).
-class _AgentStdout:
-    """Stdout for a parallel batch: each subagent's lines are tagged and kept whole."""
-
-    def __init__(self, real: Any) -> None:
-        self._real = real
-        self._lock = threading.Lock()
-        self._partial: dict[int, str] = {}
-        self._owner: Optional[int] = None  # thread at an approval prompt
-        self._held: list[str] = []
-
-    def write(self, text: str) -> int:
-        tag = _agent_tag()
-        me = threading.get_ident()
-        with self._lock:
-            if not tag or me == self._owner:
-                self._real.write(text)
-                return len(text)
-            *lines, rest = (self._partial.get(me, "") + text).split("\n")
-            self._partial[me] = rest
-            for line in lines:
-                tagged = f"{DIM}[{tag}]{RESET} {line.replace(chr(13), '')}\n"
-                if self._owner is None:
-                    self._real.write(tagged)
-                else:
-                    self._held.append(tagged)
-        return len(text)
-
-    def flush(self) -> None:
-        with self._lock:
-            self._real.flush()
-
-    def hold(self) -> None:
-        """Pass this thread's writes straight through; hold everyone else's."""
-        with self._lock:
-            self._owner = threading.get_ident()
-
-    def release(self) -> None:
-        with self._lock:
-            self._owner = None
-            for line in self._held:
-                self._real.write(line)
-            self._held.clear()
-            self._real.flush()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._real, name)
+        if not ui._agent_tag():  # the batch owner clears the shared cancel state
+            ui._CANCEL_REQUESTED.clear()
+            ui._LISTENER_STOP.set()
 
 
 def _parallel_subagents_enabled() -> bool:
     # In-process weights (mlx / transformers) can't serve two agents at once.
-    return MAX_PARALLEL_SUBAGENTS > 1 and BACKEND not in LOCAL_ML_BACKENDS
+    return (
+        MAX_PARALLEL_SUBAGENTS > 1
+        and backends.BACKEND not in backends.LOCAL_ML_BACKENDS
+    )
 
 
-def _run_parallel_tasks(tool_calls: list[ToolCall]) -> dict[int, str]:
+def _run_parallel_tasks(tool_calls: list[backends.ToolCall]) -> dict[int, str]:
     """Run a reply's task calls at once; return results by position in tool_calls.
 
     Returns {} (run everything in order) for fewer than two task calls, when
@@ -3236,7 +1473,7 @@ def _run_parallel_tasks(tool_calls: list[ToolCall]) -> dict[int, str]:
     if (
         len(positions) < 2
         or not _parallel_subagents_enabled()
-        or _subagent_depth() >= MAX_SUBAGENT_DEPTH
+        or ui._subagent_depth() >= MAX_SUBAGENT_DEPTH
     ):
         return {}
     for i in positions:
@@ -3245,21 +1482,20 @@ def _run_parallel_tasks(tool_calls: list[ToolCall]) -> dict[int, str]:
     return dict(zip(positions, _run_tasks_concurrently(calls)))
 
 
-def _run_tasks_concurrently(calls: list[ToolCall]) -> list[str]:
+def _run_tasks_concurrently(calls: list[backends.ToolCall]) -> list[str]:
     """Run task calls in threads, MAX_PARALLEL_SUBAGENTS at a time, results in order."""
-    global _PARALLEL_ESC
-    parent_depth = _subagent_depth()
-    parent_tag = _agent_tag()
-    parent_cancel = getattr(_AGENT_LOCAL, "cancel", None)
+    parent_depth = ui._subagent_depth()
+    parent_tag = ui._agent_tag()
+    parent_cancel = getattr(ui._AGENT_LOCAL, "cancel", None)
     cancel = threading.Event()
     slots = threading.Semaphore(MAX_PARALLEL_SUBAGENTS)
     results = ["cancelled: the parallel run was stopped"] * len(calls)
 
-    def worker(n: int, tc: ToolCall) -> None:
+    def worker(n: int, tc: backends.ToolCall) -> None:
         with slots:
-            _AGENT_LOCAL.depth = parent_depth
-            _AGENT_LOCAL.tag = f"{parent_tag}.{n + 1}" if parent_tag else str(n + 1)
-            _AGENT_LOCAL.cancel = cancel
+            ui._AGENT_LOCAL.depth = parent_depth
+            ui._AGENT_LOCAL.tag = f"{parent_tag}.{n + 1}" if parent_tag else str(n + 1)
+            ui._AGENT_LOCAL.cancel = cancel
             if cancel.is_set():
                 return
             try:
@@ -3271,22 +1507,22 @@ def _run_tasks_concurrently(calls: list[ToolCall]) -> list[str]:
         threading.Thread(target=worker, args=(n, tc), daemon=True)
         for n, tc in enumerate(calls)
     ]
-    out: Optional[_AgentStdout] = None
-    if not isinstance(sys.stdout, _AgentStdout):
-        out = _AgentStdout(sys.stdout)
+    out: Optional[ui._AgentStdout] = None
+    if not isinstance(sys.stdout, ui._AgentStdout):
+        out = ui._AgentStdout(sys.stdout)
         sys.stdout = out
     esc = None
     if not parent_tag:  # the top-level batch owns Escape-to-cancel
-        esc = _EscWatch()
-        _PARALLEL_ESC = esc
-        _CANCEL_REQUESTED.clear()
+        esc = ui._EscWatch()
+        ui.PARALLEL_ESC = esc
+        ui._CANCEL_REQUESTED.clear()
         esc.start()
     print(f"{CYAN}↳ running {len(calls)} subagents in parallel{RESET}")
     try:
         for t in threads:
             t.start()
         while any(t.is_alive() for t in threads):
-            if _CANCEL_REQUESTED.is_set() or (
+            if ui._CANCEL_REQUESTED.is_set() or (
                 parent_cancel is not None and parent_cancel.is_set()
             ):
                 cancel.set()
@@ -3302,417 +1538,31 @@ def _run_tasks_concurrently(calls: list[ToolCall]) -> list[str]:
                 t.join(timeout=max(0.0, deadline - time.monotonic()))
         if esc is not None:
             esc.stop()
-            _PARALLEL_ESC = None
+            ui.PARALLEL_ESC = None
         if out is not None:
             out.release()
             sys.stdout = out._real
     if cancel.is_set():
-        raise UserCancelled()
+        raise ui.UserCancelled()
     print(f"{CYAN}↳ {len(calls)} subagents done{RESET}")
     return results
 
 
 # -----------------------------------------------------------------------------------------------
-# Claude Agent SDK backend
+# Claude Agent SDK session
 # -----------------------------------------------------------------------------------------------
-# The SDK runs Claude Code's own agent loop and tools in a subprocess. wrencode
-# hands it each prompt, shows the stream in its own style, routes tool approvals
-# through confirm(), and reports cost per turn. Auth is forced to the API key so
-# usage bills to Console credits, never to a claude.ai subscription.
-_AGENT_SDK_SESSION: Optional["AgentSDKSession"] = None
+# The backend itself is wrencode_sdk: Claude Code's own agent loop in a subprocess,
+# with approvals routed through ui.confirm(). This is the one interactive session.
+_AGENT_SDK_SESSION: Optional[agent_sdk.AgentSDKSession] = None
 
 
-def _agent_sdk_sessions_file() -> pathlib.Path:
-    return CONFIG_DIR / "agent_sdk_sessions.json"
-
-
-def _load_agent_sdk_session_id() -> str:
-    """The last SDK session id saved for this workspace, or ''."""
-    with contextlib.suppress(Exception):
-        data = json.loads(_agent_sdk_sessions_file().read_text())
-        return str(data.get(str(workspace_root()), ""))
-    return ""
-
-
-def _save_agent_sdk_session_id(session_id: str) -> None:
-    path = _agent_sdk_sessions_file()
-    data: dict[str, str] = {}
-    with contextlib.suppress(Exception):
-        data = dict(json.loads(path.read_text()))
-    key = str(workspace_root())
-    if session_id:
-        data[key] = session_id
-    else:
-        data.pop(key, None)
-    with contextlib.suppress(OSError):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2))
-        os.chmod(path, 0o600)
-
-
-def _agent_sdk_env() -> dict[str, str]:
-    """Environment for the SDK's Claude Code process: API key auth only."""
-    env = {
-        "ANTHROPIC_API_KEY": API_KEY,
-        # Blank the subscription credentials so they can't take over billing.
-        "CLAUDE_CODE_OAUTH_TOKEN": "",
-        "ANTHROPIC_AUTH_TOKEN": "",
-    }
-    if ANTHROPIC_WORKSPACE_ID:
-        header = f"anthropic-workspace-id: {ANTHROPIC_WORKSPACE_ID}"
-        extra = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
-        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{extra}\n{header}" if extra else header
-    return env
-
-
-def _short(text: Any, limit: int = 80) -> str:
-    flat = str(text).replace("\n", "\\n")
-    return flat[:limit] + ("..." if len(flat) > limit else "")
-
-
-def format_sdk_tool_action(name: str, inp: dict[str, Any]) -> str:
-    """Human-readable summary of a Claude Code tool call."""
-    if name == "Bash":
-        return f"$ {str(inp.get('command', '')).strip()}"
-    if name == "Edit":
-        return (
-            f"Edit {inp.get('file_path', '?')}\n"
-            f"- {_short(inp.get('old_string', ''))}\n"
-            f"+ {_short(inp.get('new_string', ''))}"
-        )
-    if name == "Write":
-        content = str(inp.get("content", ""))
-        lines = content.count("\n") + (1 if content else 0)
-        return f"Write {inp.get('file_path', '?')}  ({lines} lines)\n{_short(content, 160)}"
-    for field in ("file_path", "notebook_path", "path", "pattern", "url", "query"):
-        if inp.get(field):
-            return f"{name} {inp[field]}"
-    if inp.get("description"):
-        return f"{name}: {_short(inp['description'], 160)}"
-    return f"{name}({json.dumps(inp, ensure_ascii=False)[:160]})"
-
-
-def _sdk_result_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-    return ""
-
-
-class _Spinner:
-    """The thinking loader, startable and stoppable between streamed messages."""
-
-    def __init__(self) -> None:
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread is not None or not sys.stdout.isatty() or _HEADLESS:
-            return
-        self._stop.clear()
-
-        def animate() -> None:
-            step = 0
-            while not self._stop.is_set():
-                sys.stdout.write(f"\r{loader_display(step)}")
-                sys.stdout.flush()
-                step += 1
-                time.sleep(0.07)
-
-        self._thread = threading.Thread(target=animate, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        if self._thread is None:
-            return
-        self._stop.set()
-        self._thread.join(timeout=0.4)
-        self._thread = None
-        sys.stdout.write("\r\033[2K")
-        sys.stdout.flush()
-
-
-class _EscWatch:
-    """Escape-to-cancel listener that can pause while an approval prompt reads stdin."""
-
-    def __init__(self) -> None:
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread is not None or not sys.stdin.isatty() or _HEADLESS:
-            return
-        _LISTENER_STOP.clear()
-        self._thread = threading.Thread(target=_cancel_listener, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        if self._thread is None:
-            return
-        _LISTENER_STOP.set()
-        self._thread.join(timeout=0.5)
-        self._thread = None
-
-
-@dataclass
-class AgentSDKTurn:
-    """Outcome of one prompt sent through the Agent SDK."""
-
-    text: str = ""
-    is_error: bool = False
-    error: str = ""
-    cost_usd: float = 0.0
-    num_turns: int = 0
-
-
-class AgentSDKSession:
-    """One Claude Code session driven through the Agent SDK, reused across prompts."""
-
-    def __init__(self, *, persist: bool = True, max_turns: int = 0) -> None:
-        import asyncio
-
-        self._loop = asyncio.new_event_loop()
-        self._client: Any = None
-        self._model = ""
-        self._persist = persist
-        self._max_turns = max_turns
-        self.session_id = _load_agent_sdk_session_id() if persist else ""
-        self._reported_cost = 0.0  # the SDK's cost total for the current client
-        self._spinner = _Spinner()
-        self._esc = _EscWatch()
-
-    def _options(self, resume: str) -> Any:
-        from claude_agent_sdk import ClaudeAgentOptions
-        from claude_agent_sdk.types import SystemPromptPreset
-
-        system_prompt = SystemPromptPreset(type="preset", preset="claude_code")
-        if extra := agents_md_context().strip():
-            system_prompt["append"] = extra
-        return ClaudeAgentOptions(
-            model=MODEL or None,
-            cwd=str(workspace_root()),
-            system_prompt=system_prompt,
-            # Isolated from ~/.claude hooks, plugins and MCP servers; project
-            # instructions come from AGENTS.md/CLAUDE.md via the append above.
-            setting_sources=[],
-            permission_mode="default",
-            can_use_tool=self._can_use_tool,
-            env=_agent_sdk_env(),
-            resume=resume or None,
-            max_turns=self._max_turns or None,
-            effort=CLAUDE_EFFORT,
-            stderr=self._on_stderr,
-        )
-
-    @staticmethod
-    def _on_stderr(line: str) -> None:
-        if os.environ.get("WRENCODE_DEBUG"):
-            print(f"{DIM}[claude] {line.rstrip()}{RESET}", file=sys.stderr)
-
-    async def _ensure_client(self) -> None:
-        from claude_agent_sdk import ClaudeSDKClient
-
-        if self._client is not None:
-            if self._model != MODEL:
-                await self._client.set_model(MODEL or None)
-                self._model = MODEL
-            return
-        client = ClaudeSDKClient(self._options(self.session_id))
-        try:
-            await client.connect()
-        except Exception:
-            if not self.session_id:
-                raise
-            # A saved session that no longer exists: start a fresh one.
-            self.session_id = ""
-            client = ClaudeSDKClient(self._options(""))
-            await client.connect()
-        self._client = client
-        self._model = MODEL
-        self._reported_cost = 0.0
-
-    async def _disconnect(self) -> None:
-        if self._client is not None:
-            with contextlib.suppress(Exception):
-                await self._client.disconnect()
-            self._client = None
-
-    def reset(self) -> None:
-        """Forget the conversation: the next prompt starts a new session."""
-        self._loop.run_until_complete(self._disconnect())
-        self.session_id = ""
-        if self._persist:
-            _save_agent_sdk_session_id("")
-
-    def close(self) -> None:
-        with contextlib.suppress(Exception):
-            self._loop.run_until_complete(self._disconnect())
-        self._loop.close()
-
-    async def _can_use_tool(self, name: str, inp: dict[str, Any], context: Any) -> Any:
-        import asyncio
-
-        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
-
-        self._spinner.stop()
-        self._esc.stop()  # confirm() reads stdin; the Escape listener must let go
-        try:
-            body = format_sdk_tool_action(name, inp)
-            first, _, rest = body.partition("\n")
-            print(f"{YELLOW}?{RESET} {first}")
-            for line in rest.split("\n"):
-                if line.strip():
-                    print(f"{DIM}  {line}{RESET}")
-            verdict = await asyncio.to_thread(confirm, first)
-        finally:
-            self._esc.start()
-        if verdict == "ok":
-            return PermissionResultAllow(updated_input=inp)
-        return PermissionResultDeny(message=verdict)
-
-    def run(self, prompt: str) -> AgentSDKTurn:
-        import asyncio
-
-        _CANCEL_REQUESTED.clear()
-        try:
-            return self._loop.run_until_complete(self._run(prompt))
-        except KeyboardInterrupt:
-            # The turn is abandoned mid-stream. Drop the client so leftover
-            # messages can't leak into the next prompt; the session id stays,
-            # so the next prompt resumes the same conversation.
-            pending = asyncio.all_tasks(self._loop)
-            for task in pending:
-                task.cancel()
-            with contextlib.suppress(BaseException):
-                self._loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            with contextlib.suppress(BaseException):
-                self._loop.run_until_complete(self._disconnect())
-            raise
-        finally:
-            self._spinner.stop()
-            self._esc.stop()
-
-    async def _watch_cancel(self) -> None:
-        import asyncio
-
-        while not _CANCEL_REQUESTED.is_set():
-            await asyncio.sleep(0.1)
-        self._spinner.stop()
-        print(f"{YELLOW}Interrupted{RESET}")
-        with contextlib.suppress(Exception):
-            await self._client.interrupt()
-
-    async def _run(self, prompt: str) -> AgentSDKTurn:
-        import asyncio
-
-        await self._ensure_client()
-        turn = AgentSDKTurn()
-        await self._client.query(prompt)
-        self._esc.start()
-        self._spinner.start()
-        watcher = asyncio.ensure_future(self._watch_cancel())
-        try:
-            # receive_response() ends on its own at the ResultMessage; the SDK
-            # docs advise against break here (asyncio cleanup issues).
-            async for msg in self._client.receive_response():
-                self._spinner.stop()
-                if not self._handle_message(msg, turn):
-                    self._spinner.start()
-        finally:
-            watcher.cancel()
-            self._spinner.stop()
-            self._esc.stop()
-        return turn
-
-    def _handle_message(self, msg: Any, turn: AgentSDKTurn) -> bool:
-        """Print one streamed message; return True once the turn's result arrived."""
-        from claude_agent_sdk import (
-            AssistantMessage,
-            ResultMessage,
-            SystemMessage,
-            TextBlock,
-            ToolResultBlock,
-            ToolUseBlock,
-            UserMessage,
-        )
-
-        if isinstance(msg, SystemMessage):
-            data = msg.data or {}
-            if msg.subtype == "init":
-                source = data.get("apiKeySource")
-                if source and source != "ANTHROPIC_API_KEY":
-                    print(
-                        f"{YELLOW}Warning: the Agent SDK is authenticating with "
-                        f"{source}, not ANTHROPIC_API_KEY, so usage may not bill "
-                        f"to your API credits.{RESET}"
-                    )
-                self._remember_session(str(data.get("session_id", "")))
-            elif msg.subtype == "compact_boundary":
-                print_system("Compacted conversation")
-            return False
-        if isinstance(msg, AssistantMessage):
-            nested = bool(msg.parent_tool_use_id)  # a subagent working
-            for block in msg.content:
-                if isinstance(block, TextBlock) and block.text.strip() and not nested:
-                    turn.text = block.text
-                    if not msg.error:  # an API error is reported with the result
-                        print_agent_message(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    first = format_sdk_tool_action(block.name, block.input).split("\n")[
-                        0
-                    ]
-                    mark = f"{DIM}↳" if nested else f"{GREEN}⏺"  # ↳ = subagent
-                    print(f"{mark}{RESET}{DIM} {first}{RESET}")
-            if msg.error:
-                turn.error = turn.text or str(msg.error)
-            return False
-        if isinstance(msg, UserMessage) and isinstance(msg.content, list):
-            for block in msg.content:
-                if isinstance(block, ToolResultBlock):
-                    lines = _sdk_result_text(block.content).strip().split("\n")
-                    color = RED if block.is_error else DIM
-                    head = lines[0][:200] if lines and lines[0] else "(empty)"
-                    more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
-                    print(f"{color}  ⎿ {head}{more}{RESET}")
-            return False
-        if isinstance(msg, ResultMessage):
-            self._remember_session(msg.session_id)
-            total = float(msg.total_cost_usd or 0.0)
-            turn.cost_usd = max(total - self._reported_cost, 0.0)
-            self._reported_cost = total
-            turn.num_turns = msg.num_turns
-            turn.is_error = bool(msg.is_error)
-            if msg.result and not turn.text:
-                turn.text = msg.result
-            if turn.is_error:
-                turn.error = msg.result or turn.error or msg.subtype
-                print(f"{RED}Error: {turn.error}{RESET}")
-                if "workspace" in turn.error.lower():
-                    print(
-                        f"{YELLOW}Your API key spans several workspaces. Run "
-                        f"/configure and enter the workspace id from the Console "
-                        f"(Settings, Workspaces), or set ANTHROPIC_WORKSPACE_ID.{RESET}"
-                    )
-            print(
-                f"{DIM}${turn.cost_usd:.4f} this turn · ${total:.4f} this session{RESET}"
-            )
-            return True
-        return False
-
-    def _remember_session(self, session_id: str) -> None:
-        if session_id and session_id != self.session_id:
-            self.session_id = session_id
-            if self._persist:
-                _save_agent_sdk_session_id(session_id)
-
-
-def agent_sdk_session() -> AgentSDKSession:
+def agent_sdk_session() -> agent_sdk.AgentSDKSession:
     """The interactive Agent SDK session, created on first use."""
     global _AGENT_SDK_SESSION
     if _AGENT_SDK_SESSION is None:
-        _AGENT_SDK_SESSION = AgentSDKSession()
+        _AGENT_SDK_SESSION = agent_sdk.AgentSDKSession(
+            cwd=workspace_root(), instructions=agents_md_context()
+        )
     return _AGENT_SDK_SESSION
 
 
@@ -3736,1503 +1586,52 @@ def handle_slash_command(
     Returns (action, mlx_state). mlx_state is _MLX_UNCHANGED unless the
     backend/model changed and the in-process model must be reloaded.
     """
-    cmd = SLASH_ALIASES.get(cmd, cmd)
-    if BACKEND == AGENT_SDK_BACKEND and cmd in {"/clear", "/compact"}:
+    cmd = ui.SLASH_ALIASES.get(cmd, cmd)
+    if backends.BACKEND == backends.AGENT_SDK_BACKEND and cmd in {"/clear", "/compact"}:
         session = agent_sdk_session()
         if cmd == "/clear":
             session.reset()
-            print_system("Cleared")
+            ui.print_system("Cleared")
         else:
             session.run("/compact")  # Claude Code compacts its own context
-        return "handled", _MLX_UNCHANGED
+        return "handled", configure._MLX_UNCHANGED
     if cmd in {"/quit", "exit"}:
         save_history(messages)
-        return "quit", _MLX_UNCHANGED
+        return "quit", configure._MLX_UNCHANGED
     if cmd == "/clear":
-        global _SESSION_AUTO_APPROVE
-        _SESSION_AUTO_APPROVE = False
+        ui.SESSION_AUTO_APPROVE = False  # "allow all" ends with the conversation
         messages.clear()
         save_history(messages)
-        print_system("Cleared")
-        return "handled", _MLX_UNCHANGED
+        ui.print_system("Cleared")
+        return "handled", configure._MLX_UNCHANGED
     if cmd == "/compact":
         if (
-            BACKEND in HOSTED_BACKENDS
-            or BACKEND == "ollama"
-            or (BACKEND in LOCAL_ML_BACKENDS and mlx_state)
+            backends.BACKEND in backends.HOSTED_BACKENDS
+            or backends.BACKEND == "ollama"
+            or (backends.BACKEND in backends.LOCAL_ML_BACKENDS and mlx_state)
         ):
-            print_system("Compacting history...")
+            ui.print_system("Compacting history...")
             model, tokenizer = mlx_state or (None, None)
             before = len(messages)
             messages[:] = compact_messages(messages, model, tokenizer)
             save_history(messages)
-            print_system(f"Compacted {before} → {len(messages)} messages")
+            ui.print_system(f"Compacted {before} → {len(messages)} messages")
         else:
-            print(f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}")
-        return "handled", _MLX_UNCHANGED
+            print(
+                f"{YELLOW}/compact not available for backend '{backends.BACKEND}'{RESET}"
+            )
+        return "handled", configure._MLX_UNCHANGED
     if cmd in {"/backend", "/configure"}:
-        return "handled", switch_backend_runtime()
+        return "handled", configure.switch_backend_runtime()
     if cmd == "/model" or cmd.startswith("/model "):
         model_id = cmd[7:].strip() if cmd.startswith("/model ") else ""
-        return "handled", switch_model_runtime(model_id)
+        return "handled", configure.switch_model_runtime(model_id)
     if cmd == "/help":
-        for name, desc in SLASH_COMMANDS.items():
-            print_system(f"{name:<12} {desc}")
-        print_system("Type / for suggestions: ↑↓ pick, Tab completes, Enter runs.")
-        return "handled", _MLX_UNCHANGED
-    return None, _MLX_UNCHANGED
-
-
-# -----------------------------------------------------------------------------------------------
-# Backend selection & config persistence
-# -----------------------------------------------------------------------------------------------
-def is_frozen() -> bool:
-    """Set true when running as a PyInstaller standalone binary."""
-    return bool(getattr(sys, "frozen", False))
-
-
-def load_config() -> dict[str, str]:
-    """Load saved backend config from CONFIG_FILE, or {} if absent/unreadable."""
-    try:
-        with open(CONFIG_FILE) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_config(cfg: dict[str, str]) -> None:
-    """Persist backend config to CONFIG_FILE with owner-only (0600) permissions."""
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = CONFIG_FILE.with_suffix(".json.tmp")
-        with open(tmp, "w") as f:
-            json.dump(cfg, f, indent=2)
-        os.chmod(tmp, 0o600)
-        tmp.replace(CONFIG_FILE)
-    except OSError as err:
-        print(f"{YELLOW}Could not save config to {CONFIG_FILE}: {err}{RESET}")
-
-
-def available_backends() -> list[str]:
-    """Backends offerable in the current runtime.
-
-    The standalone binary can't bundle the ML stack, so local-ml backends
-    (mlx/transformers) are only offered from a source install. MLX is further
-    limited to Apple Silicon.
-    """
-    return [
-        name
-        for name, spec in BACKEND_SPECS.items()
-        if not (spec["kind"] == "agent-sdk" and is_frozen())
-        and not (
-            spec["kind"] == "local-ml"
-            and (
-                is_frozen()
-                or (
-                    name == "mlx"
-                    and not (
-                        platform.system() == "Darwin" and platform.machine() == "arm64"
-                    )
-                )
-            )
-        )
-    ]
-
-
-def pick_from_list(
-    title: str,
-    options: list[str],
-    *,
-    labels: Optional[list[str]] = None,
-    initial_index: int = 0,
-) -> Optional[int]:
-    """Pick one option from a numbered list."""
-    if not options:
-        print(f"{YELLOW}No options available.{RESET}")
-        return None
-    labels = labels if labels is not None else options
-    initial_index = max(0, min(initial_index, len(options) - 1))
-    print()
-    if title:
-        print_system(title)
-        print()
-    for i, label in enumerate(labels, 1):
-        prefix = BOLD if i - 1 == initial_index else ""
-        suffix = RESET if i - 1 == initial_index else ""
-        print("  " + prefix + str(i) + ". " + label + suffix)
-    default = str(initial_index + 1)
-    while True:
-        raw = input(f"{BLUE}❯{RESET} number [{default}]: ").strip() or default
-        if raw.isdigit() and 1 <= int(raw) <= len(options):
-            return int(raw) - 1
-        print(f"{RED}Enter a number between 1 and {len(options)}.{RESET}")
-
-
-def _read_models_cache(cache: pathlib.Path) -> Optional[list[str]]:
-    """Return cached model ids if the cache file is fresh (<24h), else None."""
-    if not cache.exists():
-        return None
-    with contextlib.suppress(Exception):
-        age = time.time() - cache.stat().st_mtime
-        if age < 86400:
-            cached = json.loads(cache.read_text())
-            if isinstance(cached, list) and cached:
-                return [str(m) for m in cached]
-    return None
-
-
-def _write_models_cache(cache: pathlib.Path, ids: list[str]) -> None:
-    """Persist model ids for the next configure session."""
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(ids, indent=2))
-    os.chmod(cache, 0o600)
-
-
-def _api_key_for_backend(backend: str) -> str:
-    """Resolve an API key for model fetches without requiring BACKEND == backend."""
-    if env_key := _env_api_key(backend):
-        return env_key
-    if BACKEND == backend and API_KEY:
-        return API_KEY
-    cfg = load_config()
-    if cfg.get("backend") == backend:
-        return cfg.get("api_key", "")
-    return ""
-
-
-def _workspace_id_for_anthropic() -> str:
-    """Resolve Anthropic workspace id: env > active session > saved config."""
-    if os.environ.get("ANTHROPIC_WORKSPACE_ID"):
-        return os.environ["ANTHROPIC_WORKSPACE_ID"]
-    if ANTHROPIC_WORKSPACE_ID:
-        return ANTHROPIC_WORKSPACE_ID
-    return load_config().get("anthropic_workspace_id", "")
-
-
-def _fetch_hosted_models(
-    backend: str, url: str, cache: pathlib.Path, label: str
-) -> list[str]:
-    """Fetch an OpenAI-style /models list for a hosted backend, with a 24h local cache."""
-    fallback = list(BACKEND_MODELS.get(backend, []))
-    cached = _read_models_cache(cache)
-    if cached is not None:
-        return cached
-
-    key = _api_key_for_backend(backend)
-    if not key:
-        return fallback
-
-    try:
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.load(resp)
-        ids = sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
-        if ids:
-            _write_models_cache(cache, ids)
-        return ids or fallback
-    except Exception as err:
-        print(f"{YELLOW}Could not fetch {label} models: {err}{RESET}")
-        return fallback
-
-
-def fetch_anthropic_models() -> list[str]:
-    """Fetch Anthropic model ids from GET /v1/models (newest first), with a 24h cache."""
-    fallback = list(BACKEND_MODELS.get("anthropic", []))
-    cached = _read_models_cache(ANTHROPIC_MODELS_CACHE)
-    if cached is not None:
-        return cached
-
-    key = _api_key_for_backend(
-        BACKEND if BACKEND in ANTHROPIC_KEY_BACKENDS else "anthropic"
-    )
-    if not key:
-        return fallback
-
-    headers = _anthropic_headers(
-        api_key=key, workspace_id=_workspace_id_for_anthropic()
-    )
-    try:
-        ids: list[str] = []
-        after: Optional[str] = None
-        while True:
-            query = urllib.parse.urlencode(
-                {"limit": "1000", **({"after_id": after} if after else {})}
-            )
-            req = urllib.request.Request(
-                f"https://api.anthropic.com/v1/models?{query}", headers=headers
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.load(resp)
-            page = [m["id"] for m in data.get("data", []) if m.get("id")]
-            ids.extend(page)
-            if not data.get("has_more") or not data.get("last_id"):
-                break
-            after = data["last_id"]
-        if ids:
-            _write_models_cache(ANTHROPIC_MODELS_CACHE, ids)
-        return ids or fallback
-    except Exception as err:
-        print(f"{YELLOW}Could not fetch Anthropic models: {err}{RESET}")
-        return fallback
-
-
-def fetch_openai_models() -> list[str]:
-    """Fetch OpenAI chat-oriented model ids from GET /v1/models, with a 24h cache."""
-    fallback = list(BACKEND_MODELS.get("openai", []))
-    cached = _read_models_cache(OPENAI_MODELS_CACHE)
-    if cached is not None:
-        return cached
-
-    key = _api_key_for_backend("openai")
-    if not key:
-        return fallback
-
-    # /v1/models also lists embeddings, audio, images, etc. — keep chat-ish ids.
-    skip_substrings = (
-        "embedding",
-        "whisper",
-        "tts",
-        "dall-e",
-        "moderation",
-        "transcribe",
-        "realtime",
-        "audio",
-        "image",
-        "search",
-        "babbage",
-        "davinci",
-        "curie",
-        "ada",
-    )
-    try:
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/models",
-            headers={"Authorization": f"Bearer {key}"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.load(resp)
-        ids = sorted(
-            m["id"]
-            for m in data.get("data", [])
-            if m.get("id") and not any(s in m["id"].lower() for s in skip_substrings)
-        )
-        if ids:
-            _write_models_cache(OPENAI_MODELS_CACHE, ids)
-        return ids or fallback
-    except Exception as err:
-        print(f"{YELLOW}Could not fetch OpenAI models: {err}{RESET}")
-        return fallback
-
-
-def fetch_openrouter_models() -> list[str]:
-    """Fetch OpenRouter model ids, with a 24h local cache."""
-    return _fetch_hosted_models(
-        "openrouter",
-        "https://openrouter.ai/api/v1/models",
-        OPENROUTER_MODELS_CACHE,
-        "OpenRouter",
-    )
-
-
-def fetch_nanogpt_models() -> list[str]:
-    """Fetch NanoGPT model ids, with a 24h local cache."""
-    return _fetch_hosted_models(
-        "nanogpt",
-        "https://nano-gpt.com/api/v1/models",
-        NANOGPT_MODELS_CACHE,
-        "NanoGPT",
-    )
-
-
-def fetch_ollama_models() -> list[str]:
-    """List models reported by a local Ollama server."""
-    base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    try:
-        with urllib.request.urlopen(f"{base}/api/tags", timeout=5) as resp:
-            data = json.load(resp)
-        names = sorted(
-            m.get("name", "") for m in data.get("models", []) if m.get("name")
-        )
-        return names or [BACKEND_SPECS["ollama"]["model"]]
-    except Exception as err:
-        print(f"{YELLOW}Could not reach Ollama at {base}: {err}{RESET}")
-        return [BACKEND_SPECS["ollama"]["model"]]
-
-
-def _list_openai_compatible_models() -> tuple[list[str], str]:
-    """Return (model ids, "") from the server's GET /models, or ([], why it failed)."""
-    key = os.environ.get("OPENAI_COMPATIBLE_API_KEY", "")
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    try:
-        req = urllib.request.Request(
-            f"{_openai_compatible_base()}/models", headers=headers
-        )
-        # Generous timeout: serverless hosts (Modal, etc.) may cold-start here.
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.load(resp)
-        return sorted(m["id"] for m in data.get("data", []) if m.get("id")), ""
-    except urllib.error.HTTPError as err:
-        if err.code in {401, 403}:
-            return (
-                [],
-                f"the server rejected the key (HTTP {err.code}); check OPENAI_COMPATIBLE_API_KEY",
-            )
-        return [], f"HTTP {err.code}"
-    except Exception as err:
-        return [], f"{err} — is the server running?"
-
-
-def fetch_openai_compatible_models() -> list[str]:
-    """Return the model ids an openai-compatible server serves, or [] if unavailable."""
-    return _list_openai_compatible_models()[0]
-
-
-def list_models_for_backend(backend: str) -> list[str]:
-    """Return selectable models for a backend (includes a custom-id option)."""
-    spec = BACKEND_SPECS[backend]
-    if backend in ANTHROPIC_KEY_BACKENDS:
-        models = fetch_anthropic_models()
-    elif backend == "openai":
-        models = fetch_openai_models()
-    elif backend == "openrouter":
-        models = fetch_openrouter_models()
-    elif backend == "nanogpt":
-        models = fetch_nanogpt_models()
-    elif backend == "ollama":
-        models = fetch_ollama_models()
-    elif backend == "openai-compatible":
-        models = fetch_openai_compatible_models()
-    else:
-        models = list(BACKEND_MODELS.get(backend, [spec["model"]]))
-
-    if not models:
-        models = [spec["model"]] if spec["model"] else []
-    models = list(dict.fromkeys(models))
-    current = MODEL if backend == BACKEND else spec["model"]
-    if current and current not in models:
-        models.insert(0, current)
-    if CUSTOM_MODEL_OPTION not in models:
-        models.append(CUSTOM_MODEL_OPTION)
-    return models
-
-
-def _prompt_api_key_if_needed(
-    backend: str, existing: dict[str, str], cfg: dict[str, str]
-) -> None:
-    """Prompt for an API key when switching to a hosted backend."""
-    spec = BACKEND_SPECS[backend]
-    if spec["kind"] == "aws":
-        # Bedrock uses AWS environment credentials, not a saved key.
-        ak, sk, _ = _aws_credentials()
-        if ak and sk:
-            print_system(f"✓ Using AWS credentials from environment @ {_aws_region()}")
-        else:
-            print(
-                f"{YELLOW}Bedrock uses your AWS credentials — set AWS_ACCESS_KEY_ID, "
-                f"AWS_SECRET_ACCESS_KEY, and AWS_REGION.{RESET}"
-            )
-        return
-    if spec["kind"] not in KEYED_KINDS:
-        return
-    key_env = spec["key_env"]
-    if env_key := os.environ.get(key_env):
-        key = getpass.getpass(
-            f"{BLUE}❯{RESET} {key_env} found in environment (…{env_key[-4:]}). "
-            "Enter to use it, or paste a new key (input hidden): "
-        ).strip()
-        if key:
-            _use_entered_key(key_env, key, cfg)
-        else:
-            cfg["api_key_overrides_env"] = ""
-            print_system(f"✓ Using {key_env} from environment")
-        return
-    saved_key = (
-        existing.get("api_key", "") if existing.get("backend") == backend else ""
-    )
-    keep_hint = " (leave blank to keep saved key)" if saved_key else ""
-    key = getpass.getpass(
-        f"{BLUE}❯{RESET} {key_env}{keep_hint} (input hidden): "
-    ).strip()
-    if key:
-        _use_entered_key(key_env, key, cfg)
-    elif saved_key:
-        cfg["api_key"] = saved_key
-        print_system(f"✓ Keeping saved {key_env}")
-    else:
-        print(f"{YELLOW}No key entered — set {key_env} or re-run with /backend.{RESET}")
-
-
-def _use_entered_key(key_env: str, key: str, cfg: dict[str, str]) -> None:
-    """Save a key typed in /configure so it beats a stale one in the env or .env."""
-    cfg["api_key"] = key
-    if os.environ.get(key_env) and os.environ[key_env] != key:
-        cfg["api_key_overrides_env"] = "1"
-        os.environ[key_env] = key  # this process, before the config is saved
-        print_system(
-            f"✓ Saved key will be used instead of {key_env} from the environment"
-        )
-
-
-def _prompt_anthropic_workspace_if_needed(
-    existing: dict[str, str], cfg: dict[str, str]
-) -> None:
-    """Prompt for anthropic-workspace-id when using a multi-workspace API key."""
-    if os.environ.get("ANTHROPIC_WORKSPACE_ID"):
-        print_system("✓ Using ANTHROPIC_WORKSPACE_ID from environment")
-        return
-    saved = (
-        existing.get("anthropic_workspace_id", "")
-        if existing.get("backend") in ANTHROPIC_KEY_BACKENDS
-        else ""
-    )
-    keep_hint = (
-        " (leave blank to keep saved)"
-        if saved
-        else " (optional; required for multi-workspace keys)"
-    )
-    raw = input(f"{BLUE}❯{RESET} Anthropic workspace id{keep_hint}: ").strip()
-    if raw:
-        cfg["anthropic_workspace_id"] = raw
-    elif saved:
-        cfg["anthropic_workspace_id"] = saved
-        print_system("✓ Keeping saved Anthropic workspace id")
-    else:
-        # Clear a stale value if the user left it blank on a fresh anthropic setup.
-        cfg.pop("anthropic_workspace_id", None)
-
-
-def persist_backend_choice(cfg: dict[str, str]) -> None:
-    """Merge cfg into saved config and apply module-level backend globals."""
-    merged = {**load_config(), **cfg}
-    # Drop empty workspace id so a blank configure answer clears a prior value.
-    if "anthropic_workspace_id" in cfg and not cfg["anthropic_workspace_id"]:
-        merged.pop("anthropic_workspace_id", None)
-    save_config(merged)
-    apply_backend(
-        merged["backend"],
-        merged.get("model", ""),
-        merged.get("api_key", ""),
-        anthropic_workspace_id=merged.get("anthropic_workspace_id", ""),
-    )
-
-
-def verify_api_key() -> tuple[str, str]:
-    """Probe the current backend with API_KEY to see if the key actually works.
-
-    Returns (state, detail): "ok" (accepted), "invalid" (rejected by the
-    service), or "unknown" (couldn't reach it — network/timeout). Local
-    backends and missing keys short-circuit to "ok"/"invalid" without a call.
-    """
-    spec = BACKEND_SPECS[BACKEND]
-    if spec["kind"] == "aws":
-        # Probe Bedrock's control plane (ListFoundationModels) with a signed
-        # GET: confirms the AWS creds + region work without invoking a model.
-        ak, sk, _ = _aws_credentials()
-        if not (ak and sk):
-            return ("invalid", "no AWS credentials")
-        region = _aws_region()
-        url = f"https://bedrock.{region}.amazonaws.com/foundation-models"
-        try:
-            headers = _sigv4_signed_headers("GET", url, b"", "bedrock", region)
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                resp.read(1)
-            return ("ok", "")
-        except urllib.error.HTTPError as err:
-            if err.code in (401, 403):
-                return ("invalid", f"HTTP {err.code}")
-            return ("unknown", f"HTTP {err.code}")
-        except Exception as err:
-            return ("unknown", str(err))
-    if spec["kind"] not in KEYED_KINDS:
-        return ("ok", "")
-    if not API_KEY:
-        return ("invalid", "no key")
-    anthropic_probe = (
-        "https://api.anthropic.com/v1/models",
-        _anthropic_headers(),
-        "GET",
-    )
-    probes = {
-        "anthropic": anthropic_probe,
-        AGENT_SDK_BACKEND: anthropic_probe,
-        "openai": ("https://api.openai.com/v1/models", _openai_headers(), "GET"),
-        "openrouter": ("https://openrouter.ai/api/v1/key", _openai_headers(), "GET"),
-        # NanoGPT's /models is public, so check the key against the balance endpoint.
-        "nanogpt": (
-            "https://nano-gpt.com/api/check-balance",
-            _openai_headers(),
-            "POST",
-        ),
-    }
-    if BACKEND not in probes:
-        return ("unknown", "")
-    url, headers, method = probes[BACKEND]
-    req = urllib.request.Request(url, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read(1)
-        return ("ok", "")
-    except urllib.error.HTTPError as err:
-        body = err.read().decode(errors="replace")
-        if err.code in (401, 403):
-            return ("invalid", f"HTTP {err.code}")
-        if err.code == 400 and "workspace" in body.lower():
-            return (
-                "invalid",
-                (
-                    "API key needs anthropic-workspace-id "
-                    "(set ANTHROPIC_WORKSPACE_ID or enter it in /configure)"
-                ),
-            )
-        return ("unknown", f"HTTP {err.code}")
-    except Exception as err:
-        return ("unknown", str(err))
-
-
-def pick_model_interactive(backend: str) -> Optional[str]:
-    """Arrow-key model picker for a backend; returns model id or None."""
-    models = list_models_for_backend(backend)
-    labels = models[:]
-    initial = models.index(MODEL) if MODEL in models else 0
-    idx = pick_from_list(
-        f"Choose model ({backend})",
-        models,
-        labels=labels,
-        initial_index=initial,
-    )
-    if idx is None:
-        return None
-    choice = models[idx]
-    if choice == CUSTOM_MODEL_OPTION:
-        default = BACKEND_SPECS[backend]["model"]
-        custom = input(f"{BLUE}❯{RESET} model id [{default}]: ").strip()
-        return custom or default
-    return choice
-
-
-def try_reload_model() -> Any:
-    """Load weights for local-ml backends; return None for API/proxy backends."""
-    if BACKEND in LOCAL_ML_BACKENDS:
-        try:
-            return load_model()
-        except SystemExit:
-            return _MLX_UNCHANGED
-    if BACKEND in API_BACKENDS | {AGENT_SDK_BACKEND} and not API_KEY:
-        key_env = BACKEND_SPECS[BACKEND]["key_env"]
-        print(f"{RED}{key_env} not set — cannot use {BACKEND}.{RESET}")
-        return _MLX_UNCHANGED
-    return None
-
-
-def switch_model_runtime(model_id: str = "") -> Any:
-    """Switch model on the current backend; reload local weights if needed."""
-    if model_id:
-        model = model_id
-    else:
-        if not sys.stdin.isatty():
-            print(f"{RED}/model needs an interactive terminal.{RESET}")
-            return _MLX_UNCHANGED
-        picked = pick_model_interactive(BACKEND)
-        if picked is None:
-            print_system("Cancelled.")
-            return _MLX_UNCHANGED
-        model = picked
-
-    if os.environ.get("MODEL"):
-        print(f"{YELLOW}MODEL env var overrides saved choice.{RESET}")
-
-    persist_backend_choice({"backend": BACKEND, "model": model})
-    print_system(f"✓ Model → {MODEL}")
-    return try_reload_model()
-
-
-def _apply_credentials_for_model_fetch(
-    backend: str, cfg: dict[str, str], existing: dict[str, str]
-) -> None:
-    """Apply key/workspace so live /models fetches can authenticate."""
-    apply_backend(
-        backend,
-        existing.get("model", "") if existing.get("backend") == backend else "",
-        cfg.get("api_key")
-        or (existing.get("api_key", "") if existing.get("backend") == backend else ""),
-        anthropic_workspace_id=cfg.get(
-            "anthropic_workspace_id",
-            existing.get("anthropic_workspace_id", "")
-            if existing.get("backend") in ANTHROPIC_KEY_BACKENDS
-            else "",
-        ),
-    )
-
-
-def switch_backend_runtime() -> Any:
-    """Switch backend (and model) mid-session; reload local weights if needed."""
-    if not sys.stdin.isatty():
-        print(f"{RED}/backend needs an interactive terminal.{RESET}")
-        return _MLX_UNCHANGED
-
-    existing = load_config()
-    names = available_backends()
-    labels = [
-        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model'] or 'server default'}]"
-        for n in names
-    ]
-    initial = names.index(BACKEND) if BACKEND in names else 0
-    idx = pick_from_list("Choose backend", names, labels=labels, initial_index=initial)
-    if idx is None:
-        print_system("Cancelled.")
-        return _MLX_UNCHANGED
-
-    backend = names[idx]
-    cfg: dict[str, str] = {"backend": backend}
-    _prompt_api_key_if_needed(backend, existing, cfg)
-    if backend in ANTHROPIC_KEY_BACKENDS:
-        _prompt_anthropic_workspace_if_needed(existing, cfg)
-    # Credentials first so the model picker can fetch live /models lists.
-    _apply_credentials_for_model_fetch(backend, cfg, existing)
-    model = pick_model_interactive(backend)
-    if model is None:
-        print_system("Cancelled.")
-        return _MLX_UNCHANGED
-
-    cfg["model"] = model
-    persist_backend_choice(cfg)
-    print_system(f"✓ Backend → {BACKEND}:{MODEL}")
-    return try_reload_model()
-
-
-def choose_backend_interactive() -> None:
-    """Prompt the user to pick a backend, persist the choice, and apply it."""
-    existing = load_config()
-    names = available_backends()
-    labels = [
-        f"{BACKEND_SPECS[n]['label']}  [{BACKEND_SPECS[n]['model'] or 'server default'}]"
-        for n in names
-    ]
-    if not is_frozen():
-        print_system("Local model backends need mlx-lm or transformers installed.")
-        print()
-
-    idx = pick_from_list("Choose backend", names, labels=labels, initial_index=0)
-    if idx is None:
-        print(f"{RED}Backend selection required.{RESET}")
-        raise SystemExit(1)
-
-    choice = names[idx]
-    cfg: dict[str, str] = {"backend": choice}
-    spec = BACKEND_SPECS[choice]
-    _prompt_api_key_if_needed(choice, existing, cfg)
-    if choice in ANTHROPIC_KEY_BACKENDS:
-        _prompt_anthropic_workspace_if_needed(existing, cfg)
-    # Credentials first so the model picker can fetch live /models lists.
-    _apply_credentials_for_model_fetch(choice, cfg, existing)
-    model = pick_model_interactive(choice)
-    if model is None:
-        print(f"{RED}Model selection required.{RESET}")
-        raise SystemExit(1)
-
-    cfg["model"] = model
-    persist_backend_choice(cfg)
-    print_system(f"✓ Saved backend choice to {CONFIG_FILE}")
-
-    # Verify the credential actually works before declaring the backend ready,
-    # so a typo/revoked key (or missing AWS creds) surfaces here instead of
-    # mid-chat. Re-prompt API keys on a hard rejection; Bedrock creds come from
-    # the environment, so there's nothing to re-prompt. Don't block on a
-    # transient network failure.
-    cred_name = spec.get("key_env", "AWS credentials")
-    for attempt in range(3):
-        state, detail = verify_api_key()
-        if state == "ok":
-            print_system(f"✓ {choice}:{MODEL} ready")
-            return
-        if state == "unknown":
-            print(f"{YELLOW}⚠ Couldn't verify {cred_name} ({detail}).{RESET}")
-            return
-        print(f"{RED}✗ {cred_name} was rejected ({detail}).{RESET}")
-        if spec["kind"] not in KEYED_KINDS or not sys.stdin.isatty() or attempt == 2:
-            if spec["kind"] == "aws":
-                print(
-                    f"{DIM}Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (and AWS_REGION) and re-run.{RESET}"
-                )
-            return
-        if choice in ANTHROPIC_KEY_BACKENDS and "workspace" in detail.lower():
-            ws = input(
-                f"{BLUE}❯{RESET} Anthropic workspace id (from Settings → Workspaces): "
-            ).strip()
-            if not ws:
-                return
-            cfg["anthropic_workspace_id"] = ws
-            persist_backend_choice(cfg)
-            continue
-        newkey = getpass.getpass(
-            f"{BLUE}❯{RESET} re-enter {cred_name} (input hidden): "
-        ).strip()
-        if not newkey:
-            return
-        _use_entered_key(spec["key_env"], newkey, cfg)
-        persist_backend_choice(cfg)
-
-
-def resolve_configuration() -> None:
-    """Decide which backend to use: env override > saved config > interactive > error."""
-    # 1. Explicit BACKEND env var — power users / CI. Unchanged from prior behaviour.
-    env_backend = os.environ.get("BACKEND")
-    if env_backend:
-        if env_backend not in BACKEND_SPECS:
-            valid = ", ".join(BACKEND_SPECS)
-            print(f"{RED}Unknown BACKEND '{env_backend}'.{RESET} Valid: {valid}")
-            raise SystemExit(1)
-        apply_backend(env_backend)
-        return
-
-    # 2. A choice saved from a previous run.
-    cfg = load_config()
-    if cfg.get("backend") in BACKEND_SPECS:
-        backend = cfg["backend"]
-        spec = BACKEND_SPECS[backend]
-        # A hosted backend with no usable key — env var unset and nothing
-        # saved (e.g. configured in a dir whose .env supplied the key, so it
-        # was never persisted) — would dead-end in load_model() with a
-        # SystemExit. In a terminal, re-run the chooser so the user can pick a
-        # backend and enter a key instead of the tool exiting immediately.
-        key_missing = (
-            spec["kind"] in KEYED_KINDS
-            and not _env_api_key(backend)
-            and not cfg.get("api_key")
-        )
-        if key_missing and sys.stdin.isatty():
-            print(
-                f"{YELLOW}Saved backend '{backend}' has no API key "
-                f"({spec['key_env']} is unset and none was saved).{RESET}"
-            )
-            choose_backend_interactive()
-            return
-        apply_backend(
-            backend,
-            cfg.get("model", ""),
-            cfg.get("api_key", ""),
-            anthropic_workspace_id=cfg.get("anthropic_workspace_id", ""),
-        )
-        return
-
-    # 3. First run with a real terminal — ask the user.
-    if sys.stdin.isatty():
-        choose_backend_interactive()
-        return
-
-    # 4. Non-interactive with nothing configured — fail with guidance.
-    print(f"{RED}No backend configured.{RESET}")
-    print(
-        "Set BACKEND=<name> (plus the matching API key), "
-        "or run `wrencode` in a terminal to choose one."
-    )
-    raise SystemExit(1)
-
-
-# -----------------------------------------------------------------------------------------------
-# Model loading
-# -----------------------------------------------------------------------------------------------
-def load_model() -> Optional[tuple[Any, Any]]:
-    """Load model for the current backend and return mlx_state (or None for API backends)."""
-    global MODEL
-    if BACKEND == AGENT_SDK_BACKEND:
-        if sys.version_info < (3, 10):
-            print(f"{RED}The Claude Agent SDK needs Python 3.10 or newer.{RESET}")
-            raise SystemExit(1)
-        import importlib.util
-
-        if importlib.util.find_spec("claude_agent_sdk") is None:
-            print(
-                f"{RED}This backend needs the Claude Agent SDK:{RESET} pip install claude-agent-sdk"
-            )
-            print(f"{DIM}Or pick another backend with /backend.{RESET}")
-            raise SystemExit(1)
-        if not API_KEY:
-            print(f"{RED}ANTHROPIC_API_KEY not set — run /configure.{RESET}")
-            raise SystemExit(1)
-        return None
-    if BACKEND == "mlx":
-        try:
-            global load, stream_generate, make_sampler
-            from mlx_lm import load
-            from mlx_lm.generate import stream_generate
-            from mlx_lm.sample_utils import make_sampler
-        except ImportError:
-            print(f"{RED}MLX backend needs mlx-lm:{RESET} pip install mlx-lm")
-            print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
-            raise SystemExit(1)
-        print(f"{YELLOW}Loading model...{RESET}")
-        model, tokenizer = load(MODEL)
-        print_system(f"✓ Loaded: {getattr(model, 'name', MODEL)}")
-        print()
-        return (model, tokenizer)
-    if BACKEND == "transformers":
-        try:
-            global torch, AutoModelForCausalLM, AutoTokenizer
-            import torch
-            from transformers import (
-                AutoModelForCausalLM,
-                AutoTokenizer,
-            )
-        except ImportError:
-            print(
-                f"{RED}transformers backend needs:{RESET} "
-                "pip install transformers torch"
-            )
-            print(f"{DIM}Or run `wrencode` to pick a hosted backend.{RESET}")
-            raise SystemExit(1)
-        print(f"{YELLOW}Loading model via transformers...{RESET}")
-        _device = "mps" if torch.backends.mps.is_available() else "cpu"
-        _tok = AutoTokenizer.from_pretrained(MODEL)
-        # Load then move to the device. device_map= is for multi-device sharding
-        # (needs accelerate, rejects a plain "mps"/"cpu" string in current transformers).
-        _mdl = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to(
-            _device
-        )
-        print_system(f"✓ Loaded on {_device}: {MODEL}")
-        print()
-        return (_mdl, _tok)
-    if BACKEND == "local":
-        print_system(f"Local proxy at {API_BASE}")
-        return None
-    if BACKEND == "ollama":
-        base = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-        try:
-            with urllib.request.urlopen(f"{base}/api/tags", timeout=3) as r:
-                installed = {m.get("name", "") for m in json.load(r).get("models", [])}
-            want = MODEL if ":" in MODEL else f"{MODEL}:latest"
-            if not (
-                MODEL in installed
-                or want in installed
-                or any(n.split(":")[0] == MODEL for n in installed)
-            ):
-                have = ", ".join(sorted(installed)) or "none"
-                print(f"{YELLOW}⚠ Model '{MODEL}' isn't pulled into Ollama.{RESET}")
-                print(f"{DIM}  Run: ollama pull {MODEL}   (installed: {have}){RESET}")
-        except Exception:
-            print(
-                f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
-            )
-        print_system(f"{BACKEND} ({MODEL})")
-        return None
-    if BACKEND == "openai-compatible":
-        base = _openai_compatible_base()
-        served, why = _list_openai_compatible_models()
-        if not served:
-            print(f"{YELLOW}⚠ Couldn't list models at {base}: {why}{RESET}")
-        elif not MODEL and len(served) == 1:
-            MODEL = served[0]
-        if not MODEL:
-            print(f"{RED}No model set for {base}.{RESET}")
-            if served:
-                print(f"{DIM}Set MODEL to one of: {', '.join(served[:10])}{RESET}")
-            raise SystemExit(1)
-        print_system(f"{BACKEND} ({MODEL}) @ {base}")
-        return None
-    # Bedrock — uses AWS environment credentials (SigV4), not an API key.
-    if BACKEND == "bedrock":
-        ak, sk, _ = _aws_credentials()
-        if not (ak and sk):
-            print(f"{RED}AWS credentials not found.{RESET}")
-            print(
-                f"{DIM}Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and "
-                f"AWS_REGION) — Bedrock uses your AWS environment.{RESET}"
-            )
-            raise SystemExit(1)
-        print_system(f"bedrock ({MODEL}) @ {_aws_region()}")
-        return None
-    # Hosted API backends — all require a key.
-    if not API_KEY:
-        key_env = BACKEND_SPECS[BACKEND]["key_env"]
-        print(f"{RED}{key_env} not set.{RESET}")
-        print(
-            f"{DIM}Set {key_env}, or run `wrencode` in a terminal to enter a key.{RESET}"
-        )
-        raise SystemExit(1)
-    print_system(f"{BACKEND} ({MODEL})")
-    return None
-
-
-# -----------------------------------------------------------------------------------------------
-# Entrypoint
-# -----------------------------------------------------------------------------------------------
-def uninstall() -> None:
-    """Delete saved state and print how to remove the program for this install."""
-    if CONFIG_DIR.exists():
-        try:
-            shutil.rmtree(CONFIG_DIR)
-            print_system(f"✓ Removed saved config {CONFIG_DIR}")
-        except OSError as err:
-            print(f"{YELLOW}Could not remove {CONFIG_DIR}: {err}{RESET}")
-    else:
-        print_system(f"No saved config at {CONFIG_DIR}")
-
-    print_system("To remove the program itself:")
-    if is_frozen():
-        # install.sh drops a standalone binary; sys.executable is that file.
-        print(f"rm {sys.executable}")
-    else:
-        print(f"{DIM}uv tool install:{RESET} uv tool uninstall wrencode")
-        print(f"{DIM}pip install:{RESET} pip uninstall wrencode")
-        print(f"{DIM}uvx cache:{RESET} uv cache clean wrencode")
-
-
-# -----------------------------------------------------------------------------------------------
-# synthesize — fuse multiple agent chat transcripts into one provenance-cited synthesis.
-# A semantic git-merge for chats: extract each chat's decisions, then reconcile them into
-# Reinforced (≥2 agree) / Unique / ⚠ Conflict, every claim carrying a chat-id citation.
-# -----------------------------------------------------------------------------------------------
-SYNTH_EXTRACT_SYS = (
-    "You analyze ONE coding-agent chat transcript and extract its substantive "
-    "engineering content. Return ONLY a JSON object, no prose, with this exact "
-    'shape: {"decisions": [{"subject": str, "conclusion": str}], '
-    '"problems_solved": [{"problem": str, "resolution": str}], '
-    '"files_touched": [str], "open_questions": [str]}. '
-    "A decision's `subject` is a short stable slug for WHAT was decided "
-    "('storage-format', 'auth-strategy') — never the answer; `conclusion` is the "
-    "chosen answer ('Iceberg'). Two chats deciding the same subject share the "
-    "same slug. Keep each value one terse phrase. Capture conclusions, not "
-    "narration. Do NOT continue the conversation — extract from a finished log."
-)
-SYNTH_RECONCILE_SYS = (
-    "You MERGE structured facts from multiple coding-agent chats, like a semantic "
-    "git merge. You are given a JSON array of per-chat fact sets, each tagged with "
-    "its chat id. Align decisions by their `subject` slug: same subject + same "
-    "conclusion → reinforced; same subject + different conclusion → CONFLICT; a "
-    "subject only one chat has → unique. Produce Markdown with EXACTLY:\n\n"
-    "## Reinforced decisions\nSubjects ≥2 chats agree on; cite ids e.g. `(a1b2, c3d4)`.\n\n"
-    "## Unique contributions\nDecisions/findings only one chat has; cite the source.\n\n"
-    "## ⚠ Conflicts\nWhere chats CONTRADICT on the same entity (different root "
-    "cause, reversed decision, incompatible approach). Show both sides with "
-    "citations. If a later chat overrode an earlier conclusion, mark it resolved "
-    "and name the winner. If genuinely none, write 'None detected.'\n\n"
-    "## Open questions\nUnresolved items across all chats, cited.\n\n"
-    "Every claim MUST carry a chat-id citation. Never invent agreement."
-)
-SYNTH_DIFF_SYS = (
-    "You compare structured facts from multiple coding-agent chats and report ONLY "
-    "where they DIVERGE, like `git diff`. Given a JSON array of per-chat fact sets "
-    "(each tagged with its chat id), align decisions by their `subject` slug (same "
-    "subject + different conclusion = a conflict). Produce Markdown with EXACTLY:\n\n"
-    "## ⚠ Conflicts\nDirect contradictions on the same subject/entity (different root cause, "
-    "reversed decision, incompatible approach); show both sides and cite ids. If a "
-    "later chat overrode an earlier one, mark it resolved and name the winner.\n\n"
-    "## Only in one chat\nDecisions/findings present in just one chat, grouped by id.\n\n"
-    "Omit everything the chats agree on. Every claim cites a chat id. If there is no "
-    "divergence at all, write 'No divergence — the chats agree.'"
-)
-SYNTH_LOG_SYS = (
-    "You build a CHRONOLOGICAL decision log from multiple coding-agent chats, like "
-    "`git log`. The JSON array of per-chat fact sets is ordered OLDEST→NEWEST. Emit a "
-    "single Markdown timeline, oldest first, one bullet per decision or resolved "
-    "problem:\n\n- **<chat id>** — <what was decided/resolved>\n\n"
-    "Keep the listed order within a chat. When a later chat reverses or supersedes an "
-    "earlier decision, add '↳ supersedes <id>: …'. Cite the chat id on every line. "
-    "End with '## Net state' summarizing where things landed."
-)
-SYNTH_MODES = {
-    "merge": SYNTH_RECONCILE_SYS,
-    "diff": SYNTH_DIFF_SYS,
-    "log": SYNTH_LOG_SYS,
-}
-
-
-def _synth_complete(system_prompt: str, user_text: str, prefill: str = "") -> str:
-    """One-shot completion via the configured backend, with NO agent tools attached.
-
-    `prefill` anchors the model to continue from given text (used to force JSON);
-    only the Anthropic-format and Bedrock backends honor it.
-    """
-    if BACKEND == "bedrock":
-        msgs: list[dict[str, Any]] = [
-            {"role": "user", "content": [{"text": user_text}]}
-        ]
-        if prefill:
-            msgs.append({"role": "assistant", "content": [{"text": prefill}]})
-        body = {
-            "messages": msgs,
-            "system": [{"text": system_prompt}],
-            "inferenceConfig": {"maxTokens": MAX_TOKENS, "temperature": 0.0},
-        }
-        text, _ = _parse_native_response(_bedrock_converse_call(body))
-        return (prefill + text).strip()
-    if BACKEND in ANTHROPIC_FORMAT_BACKENDS:
-        amsgs: list[dict[str, Any]] = [{"role": "user", "content": user_text}]
-        if prefill:
-            amsgs.append({"role": "assistant", "content": prefill})
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "system": system_prompt,
-                "messages": amsgs,
-                "max_tokens": MAX_TOKENS,
-            },
-            _anthropic_headers(),
-        )
-        text, _ = _parse_native_response(data)
-        return (prefill + text).strip()
-    if BACKEND in OPENAI_FORMAT_BACKENDS:
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "max_tokens": MAX_TOKENS,
-                "temperature": 0.0,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-            },
-            _openai_headers(),
-        )
-        text, _ = _parse_native_response(data)
-        return text.strip()
-    # ollama / openrouter / local / mlx / transformers attach no tools — reuse get_response.
-    raw = get_response(
-        [{"role": "user", "content": user_text}], system_prompt, _MLX_STATE
-    )
-    text, _calls, _data = _parse_response(raw)
-    return text.strip()
-
-
-def _parse_claude_code_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
-    """Extract user prompts + assistant text from a Claude Code JSONL log, or None.
-
-    Drops tool calls, tool results, and thinking — only the user↔assistant signal
-    survives. Returns None when the input isn't Claude Code JSONL.
-    """
-    turns: list[dict[str, str]] = []
-    looks_jsonl = False
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            o = json.loads(line)
-        except json.JSONDecodeError:
-            return None  # a non-JSON line means this isn't a JSONL transcript
-        if not isinstance(o, dict) or "type" not in o:
-            return None
-        looks_jsonl = True
-        m = o.get("message")
-        if not isinstance(m, dict):
-            continue
-        role, content = o.get("type"), m.get("content")
-        if role == "user" and isinstance(content, str):
-            t = content.strip()
-            if t and not t.startswith("<"):  # skip injected/system-ish prompts
-                turns.append({"role": "user", "text": t})
-        elif role == "assistant" and isinstance(content, list):
-            text = "\n".join(
-                b.get("text", "")
-                for b in content
-                if isinstance(b, dict) and b.get("type") == "text"
-            ).strip()
-            if text:
-                turns.append({"role": "assistant", "text": text})
-    return turns if looks_jsonl else None
-
-
-# Common key names different agents use for a message's role and its content. The
-# generic adapters sniff these so wrencode stays tool-agnostic (Codex, OpenAI-style
-# logs, ChatGPT exports, …) without a hand-written schema per tool.
-_ROLE_KEYS = ("role", "type", "sender", "author")
-_CONTENT_KEYS = ("content", "text", "message", "body", "parts")
-_USER_ROLES = {"user", "human", "prompt", "you"}
-_ASSISTANT_ROLES = {"assistant", "ai", "model", "bot", "agent", "gpt", "claude"}
-
-
-def _coerce_role(o: dict[str, Any]) -> Optional[str]:
-    """Map any of the common role fields onto 'user'/'assistant', else None."""
-    for k in _ROLE_KEYS:
-        v = o.get(k)
-        if isinstance(v, str):
-            r = v.lower()
-            if r in _USER_ROLES:
-                return "user"
-            if r in _ASSISTANT_ROLES:
-                return "assistant"
-    return None
-
-
-def _coerce_text(v: Any) -> str:
-    """Flatten a content value (str / list of blocks / nested dict) to plain text."""
-    if isinstance(v, str):
-        return v.strip()
-    if isinstance(v, list):
-        parts = []
-        for b in v:
-            if isinstance(b, str):
-                parts.append(b)
-            elif isinstance(b, dict):
-                t = b.get("text") or b.get("content") or b.get("value")
-                if isinstance(t, str):
-                    parts.append(t)
-        return "\n".join(parts).strip()
-    if isinstance(v, dict):
-        return _coerce_text(v.get("text") or v.get("content") or "")
-    return ""
-
-
-def _record_to_turn(o: Any) -> Optional[dict[str, str]]:
-    """Convert one generic message record to a {role, text} turn, or None to skip."""
-    if not isinstance(o, dict):
-        return None
-    m = o.get("message") if isinstance(o.get("message"), dict) else o
-    role = _coerce_role(m) or _coerce_role(o)
-    if role not in {"user", "assistant"}:
-        return None
-    text = ""
-    for k in _CONTENT_KEYS:
-        if k in m:
-            text = _coerce_text(m[k])
-            if text:
-                break
-    if not text or (role == "user" and text.startswith("<")):
-        return None
-    return {"role": role, "text": text}
-
-
-def _adapt_generic_jsonl(raw: str) -> Optional[list[dict[str, str]]]:
-    """Adapt a JSONL log where each line is a message-ish dict (Codex/OpenAI-style)."""
-    turns: list[dict[str, str]] = []
-    saw = False
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            o = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(o, dict):
-            return None
-        saw = True
-        t = _record_to_turn(o)
-        if t:
-            turns.append(t)
-    return turns if saw and turns else None
-
-
-def _adapt_messages_json(raw: str) -> Optional[list[dict[str, str]]]:
-    """Adapt a single JSON value: a list of messages or {messages|conversation:[…]}."""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    seq: Any = None
-    if isinstance(data, list):
-        seq = data
-    elif isinstance(data, dict):
-        for k in ("messages", "conversation", "turns", "history", "chat"):
-            if isinstance(data.get(k), list):
-                seq = data[k]
-                break
-    if not isinstance(seq, list):
-        return None
-    turns = [t for t in (_record_to_turn(o) for o in seq) if t]
-    return turns or None
-
-
-# Tried in order; the precise Claude Code adapter wins before the generic sniffers
-# (it correctly drops thinking/tool blocks that the generic one would keep).
-SYNTH_ADAPTERS: list[tuple[str, Any]] = [
-    ("claude-code", _parse_claude_code_jsonl),
-    ("jsonl", _adapt_generic_jsonl),
-    ("messages-json", _adapt_messages_json),
-]
-
-
-def _synth_normalize(path: str) -> dict[str, Any]:
-    """Load a transcript into the common {id, source, turns:[{role,text}]} shape."""
-    raw = pathlib.Path(path).read_text(errors="replace")
-    turns: Optional[list[dict[str, str]]] = None
-    source = "text"
-    for name, adapt in SYNTH_ADAPTERS:
-        turns = adapt(raw)
-        if turns:
-            source = name
-            break
-    if not turns:  # unknown format → treat the whole file as one block
-        turns = [{"role": "user", "text": raw}]
-        source = "text"
-    cid = pathlib.Path(path).stem[:8] or "chat"
-    return {"id": cid, "source": source, "turns": turns}
-
-
-def _synth_render(chat: dict[str, Any], max_chars: int = 110000) -> str:
-    """Flatten a normalized chat to a tagged transcript string, capped in size."""
-    s = "\n\n".join(f"[{t['role'].upper()}] {t['text']}" for t in chat["turns"])
-    return s[:max_chars]
-
-
-def _json_slice(s: str) -> str:
-    """Return the outermost {...} span of s (tolerates prose around the JSON)."""
-    i, j = s.find("{"), s.rfind("}")
-    return s[i : j + 1] if i != -1 and j > i else s
-
-
-def _synth_extract(chat: dict[str, Any]) -> dict[str, Any]:
-    """Extract one chat's structured facts, tagged with its chat id (provenance)."""
-    user = (
-        f"<transcript chat_id={chat['id']}>\n{_synth_render(chat)}\n</transcript>\n\n"
-        "Extract the JSON object described in your instructions from the transcript "
-        "above. Do NOT continue the conversation; output only JSON."
-    )
-    raw = _synth_complete(SYNTH_EXTRACT_SYS, user, prefill="{")
-    try:
-        facts = json.loads(_json_slice(raw))
-        if not isinstance(facts, dict):
-            raise ValueError("not an object")
-    except (json.JSONDecodeError, ValueError):
-        facts = {
-            "decisions": [],
-            "problems_solved": [],
-            "files_touched": [],
-            "open_questions": [],
-            "_parse_error": raw[:200],
-        }
-    facts["chat"] = chat["id"]
-    return facts
-
-
-def _synth_reconcile(fact_sets: list[dict[str, Any]], mode: str = "merge") -> str:
-    """Fuse per-chat fact sets into Markdown — merge (default), diff, or log."""
-    return _synth_complete(
-        SYNTH_MODES.get(mode, SYNTH_RECONCILE_SYS),
-        "Fact sets:\n\n" + json.dumps(fact_sets, indent=2),
-    )
-
-
-def _claude_project_dir() -> Optional[pathlib.Path]:
-    """Return this workspace's Claude Code transcript dir (~/.claude/projects/...) if any."""
-    cwd = os.environ.get("WRENCODE_WORKSPACE") or str(pathlib.Path.cwd().resolve())
-    encoded = cwd.replace("/", "-")  # Claude Code encodes the cwd path with dashes
-    d = pathlib.Path.home() / ".claude" / "projects" / encoded
-    return d if d.is_dir() else None
-
-
-def _discover_transcripts(dirs: list[str]) -> list[str]:
-    """Find *.jsonl transcripts in the given directories, newest first."""
-    found: list[str] = []
-    for d in dirs:
-        found += [str(x) for x in pathlib.Path(d).glob("*.jsonl")]
-    found.sort(key=lambda f: pathlib.Path(f).stat().st_mtime, reverse=True)
-    return found
-
-
-def _ago(seconds: float) -> str:
-    """Compact relative age: 5m, 3h, 2d."""
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}h"
-    return f"{int(seconds // 86400)}d"
-
-
-def _first_user_prompt(path: str) -> str:
-    """Peek at a transcript's first real user prompt for use as a picker label."""
-    try:
-        with open(path) as fh:
-            for _ in range(400):
-                line = fh.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                turn = _record_to_turn(o)
-                if turn and turn["role"] == "user":
-                    return " ".join(turn["text"].split())
-    except OSError:
-        pass
-    return "(no prompt found)"
-
-
-def _transcript_label(path: str) -> str:
-    """One-line picker label: id, size, age, first-prompt snippet."""
-    p = pathlib.Path(path)
-    size = p.stat().st_size
-    human = f"{size / 1024:.0f}K" if size < (1 << 20) else f"{size / (1 << 20):.1f}M"
-    age = _ago(time.time() - p.stat().st_mtime)
-    return f"{p.stem[:8]}  {human:>6}  {age:>4} ago  {_first_user_prompt(path)[:64]}"
-
-
-def _parse_selection(raw: str, n: int) -> list[int]:
-    """Parse '1 3 5', '1-3', '1,2', or 'all' into sorted 0-based indices within [1,n]."""
-    raw = raw.strip().lower()
-    if raw in {"all", "*", "a"}:
-        return list(range(n))
-    out: list[int] = []
-    for tok in raw.replace(",", " ").split():
-        a, sep, b = tok.partition("-")
-        if sep and a.isdigit() and b.isdigit():
-            out += range(int(a), int(b) + 1)
-        elif tok.isdigit():
-            out.append(int(tok))
-    return sorted({i - 1 for i in out if 1 <= i <= n})
-
-
-def _synth_pick_numbered(candidates: list[str]) -> list[str]:
-    """Fallback picker: numbered list, accepts numbers / ranges / 'all'."""
-    print()
-    print_system(
-        "Select transcripts to synthesize (numbers, ranges like 1-3, or 'all'):"
-    )
-    print()
-    for i, path in enumerate(candidates, 1):
-        print("  " + str(i) + ". " + _transcript_label(path))
-    while True:
-        raw = input(f"{BLUE}❯{RESET} selection [all]: ").strip() or "all"
-        idx = _parse_selection(raw, len(candidates))
-        if idx:
-            return [candidates[i] for i in idx]
-        print(f"{RED}Enter numbers 1-{len(candidates)}, a range, or 'all'.{RESET}")
-
-
-def _synth_pick_tty(candidates: list[str]) -> list[str]:
-    """Arrow-key checkbox picker: ↑/↓ move, space toggle, a all, enter confirm, esc cancel."""
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    labels = [_transcript_label(p) for p in candidates]
-    n = len(candidates)
-    selected = [True] * n  # default: everything on
-    cursor = 0
-    header = (
-        f"{BOLD}Select transcripts{RESET}  "
-        f"{DIM}↑/↓ move · space toggle · a all · enter confirm · esc cancel{RESET}"
-    )
-
-    def render(first: bool) -> None:
-        if not first:
-            sys.stdout.write(f"\033[{n + 2}A")  # back to the top of the block
-        sys.stdout.write("\r\033[J" + header + "\r\n\r\n")
-        for i, lab in enumerate(labels):
-            box = "◉" if selected[i] else "○"
-            row = f"{'›' if i == cursor else ' '} {box} {lab}"
-            sys.stdout.write((f"{BOLD}{row}{RESET}" if i == cursor else row) + "\r\n")
-        sys.stdout.flush()
-
-    try:
-        tty.setcbreak(fd)
-        render(True)
-        while True:
-            key = _read_tty_key(fd)
-            if key == "up":
-                cursor = (cursor - 1) % n
-            elif key == "down":
-                cursor = (cursor + 1) % n
-            elif key == " ":
-                selected[cursor] = not selected[cursor]
-            elif key in ("a", "A"):
-                turn_on = not all(selected)
-                selected = [turn_on] * n
-            elif key == "enter":
-                break
-            elif key in ("esc", "ctrl_c", "ctrl_d"):
-                selected = [False] * n
-                break
-            render(False)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    print()
-    chosen = [candidates[i] for i, on in enumerate(selected) if on]
-    if not chosen:
-        raise SystemExit("synthesize: no transcripts selected")
-    return chosen
-
-
-def _synth_pick(candidates: list[str]) -> list[str]:
-    """Pick transcripts interactively — arrow-key checkboxes on a tty, else numbered."""
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            return _synth_pick_tty(candidates)
-        except (ImportError, OSError):
-            pass
-    return _synth_pick_numbered(candidates)
-
-
-def run_synthesize(
-    paths: list[str],
-    out: Optional[str] = None,
-    *,
-    interactive: bool = True,
-    mode: str = "merge",
-) -> None:
-    """Fuse agent chat transcripts into one synthesis (normalize → extract → reconcile).
-
-    Inputs may be explicit files, directories to scan, or nothing (defaults to this
-    project's Claude Code history). When scanning, an interactive picker lets the
-    user choose which transcripts to fuse; --all (interactive=False) takes them all.
-    `mode` selects the output: 'merge' (full synthesis), 'diff' (divergences only),
-    or 'log' (chronological decision timeline).
-    """
-    global _MLX_STATE
-    file_args = [p for p in paths if pathlib.Path(p).is_file()]
-    dir_args = [p for p in paths if pathlib.Path(p).is_dir()]
-    for p in paths:
-        if p not in file_args and p not in dir_args:
-            print(f"{YELLOW}skip (not found): {p}{RESET}")
-
-    if file_args and not dir_args:
-        selected = file_args  # user named specific files — honor them as-is
-    else:
-        search = dir_args
-        if not search and not paths:  # only auto-discover when given nothing at all
-            default = _claude_project_dir()
-            if default:
-                search = [str(default)]
-                print_system(f"No paths given — listing transcripts in {default}")
-        candidates = list(dict.fromkeys(file_args + _discover_transcripts(search)))
-        if not candidates:
-            raise SystemExit(
-                "synthesize: no transcripts found — pass files or a directory, or "
-                "run from a project that has Claude Code chat history"
-            )
-        selected = (
-            _synth_pick(candidates)
-            if interactive and sys.stdin.isatty()
-            else candidates
-        )
-
-    if len(selected) == 1:
-        print(
-            f"{DIM}Only one transcript — degrades to a structured summary "
-            f"(fusion needs ≥2).{RESET}"
-        )
-    if mode == "log":  # a timeline reads oldest → newest
-        selected = sorted(selected, key=lambda f: pathlib.Path(f).stat().st_mtime)
-    if BACKEND in LOCAL_ML_BACKENDS and _MLX_STATE is None:
-        _MLX_STATE = load_model()
-    fact_sets = []
-    for p in selected:
-        chat = _synth_normalize(p)
-        print_system(
-            f"normalize {chat['id']} ({chat['source']}): {len(chat['turns'])} turns"
-        )
-        facts = _synth_extract(chat)
-        print_system(
-            f"extract   {chat['id']}: {len(facts.get('decisions', []))} decisions, "
-            f"{len(facts.get('problems_solved', []))} problems"
-        )
-        fact_sets.append(facts)
-    print_system(f"reconcile ({mode}): fusing…")
-    doc = _synth_reconcile(fact_sets, mode)
-    if out:
-        pathlib.Path(out).write_text(doc)
-        print_system(f"✓ wrote synthesis to {out}")
-    else:
-        print("\n" + doc)
+        for name, desc in ui.SLASH_COMMANDS.items():
+            ui.print_system(f"{name:<12} {desc}")
+        ui.print_system("Type / for suggestions: ↑↓ pick, Tab completes, Enter runs.")
+        return "handled", configure._MLX_UNCHANGED
+    return None, configure._MLX_UNCHANGED
 
 
 def _arg_value(args: list[str], *names: str) -> Optional[str]:
@@ -5283,30 +1682,35 @@ def run_headless(
     With verify (--verify), that command must pass once the agent says it's done;
     on failure its output goes back to the agent, up to VERIFY_ATTEMPTS times.
     """
-    global _HEADLESS, _MLX_STATE, _OUTPUT_SCHEMA
-    _HEADLESS = True
+    global _MLX_STATE, _OUTPUT_SCHEMA
+    ui.HEADLESS = True
     _OUTPUT_SCHEMA = schema
     _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     reason, error = "error", ""
     verified: Optional[bool] = None
     verify_output = ""
-    sdk: Optional[AgentSDKSession] = None
+    sdk: Optional[agent_sdk.AgentSDKSession] = None
     cost_usd = 0.0
     with contextlib.redirect_stdout(sys.stderr):
         try:
-            resolve_configuration()
-            _MLX_STATE = load_model()
+            configure.resolve_configuration()
+            _MLX_STATE = backends.load_model()
             system_prompt = build_system_prompt()
-            if BACKEND == AGENT_SDK_BACKEND:
+            if backends.BACKEND == backends.AGENT_SDK_BACKEND:
                 if schema is not None:
                     raise ValueError(
                         "--json-schema isn't supported on the claude-agent-sdk backend"
                     )
-                sdk = AgentSDKSession(persist=False, max_turns=max_turns)
+                sdk = agent_sdk.AgentSDKSession(
+                    cwd=workspace_root(),
+                    instructions=agents_md_context(),
+                    persist=False,
+                    max_turns=max_turns,
+                )
             for attempt in range(VERIFY_ATTEMPTS if verify else 1):
                 if sdk is not None:
-                    turn = sdk.run(flatten_content(messages[-1]["content"]))
+                    turn = sdk.run(backends.flatten_content(messages[-1]["content"]))
                     messages.append({"role": "assistant", "content": turn.text})
                     cost_usd += turn.cost_usd
                     reason = "error" if turn.is_error else "done"
@@ -5346,7 +1750,9 @@ def run_headless(
             if sdk is not None:
                 sdk.close()
     texts = [
-        flatten_content(m["content"]) for m in messages if m["role"] == "assistant"
+        backends.flatten_content(m["content"])
+        for m in messages
+        if m["role"] == "assistant"
     ]
     result = texts[-1].strip() if texts else ""
     is_error = reason != "done" or (schema is not None and not _STRUCTURED_RESULT)
@@ -5358,8 +1764,8 @@ def run_headless(
             "is_error": is_error,
             "stop_reason": reason,
             "num_turns": len(texts),
-            "backend": BACKEND,
-            "model": MODEL,
+            "backend": backends.BACKEND,
+            "model": backends.MODEL,
         }
         if sdk is not None:
             out["cost_usd"] = round(cost_usd, 6)
@@ -5428,14 +1834,16 @@ def main() -> None:
         print(f"wrencode {WRENCODE_VERSION}")
         return
     if "--uninstall" in args or (bool(args) and args[0] == "uninstall"):
-        uninstall()
+        configure.uninstall()
         return
     if "--yes" in args or "--auto-approve" in args:
         os.environ["WRENCODE_AUTO_APPROVE"] = "1"
     if args and args[0] == "synthesize":
         rest, out, paths, take_all = args[1:], None, [], False
         mode = "merge"
-        if rest and rest[0] in SYNTH_MODES:  # optional git-like submode keyword
+        if (
+            rest and rest[0] in synthesize.SYNTH_MODES
+        ):  # optional git-like submode keyword
             mode, rest = rest[0], rest[1:]
         i = 0
         while i < len(rest):
@@ -5448,8 +1856,8 @@ def main() -> None:
             else:
                 paths.append(rest[i])
                 i += 1
-        resolve_configuration()
-        run_synthesize(paths, out, interactive=not take_all, mode=mode)
+        configure.resolve_configuration()
+        synthesize.run_synthesize(paths, out, interactive=not take_all, mode=mode)
         return
 
     os.environ.setdefault("WRENCODE_WORKSPACE", str(pathlib.Path.cwd().resolve()))
@@ -5487,19 +1895,19 @@ def main() -> None:
         verify = _arg_value(args, "--verify") or ""
         raise SystemExit(run_headless(prompt, fmt, int(turns), schema, verify))
 
-    resolve_configuration()
+    configure.resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
-    print(render_banner(colors_enabled()))
-    print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{BACKEND}:{MODEL}{RESET}")
-    mlx_state = load_model()
+    print(ui.render_banner(ui.colors_enabled()))
+    print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{backends.BACKEND}:{backends.MODEL}{RESET}")
+    mlx_state = backends.load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()
     for path in find_agents_files():
         print(f"{DIM}Loaded {path}{RESET}")
     messages = load_history()
-    if BACKEND == AGENT_SDK_BACKEND:
-        if _load_agent_sdk_session_id():
+    if backends.BACKEND == backends.AGENT_SDK_BACKEND:
+        if agent_sdk._load_agent_sdk_session_id(workspace_root()):
             print(
                 f"{DIM}Resuming the Claude Agent SDK session (/clear starts fresh){RESET}"
             )
@@ -5509,18 +1917,18 @@ def main() -> None:
 
     while True:
         try:
-            user_input = read_user_input()
+            user_input = ui.read_user_input()
             if not user_input:
                 continue
             action, new_mlx = handle_slash_command(user_input, messages, mlx_state)
-            if new_mlx is not _MLX_UNCHANGED:
+            if new_mlx is not configure._MLX_UNCHANGED:
                 mlx_state = new_mlx
                 _MLX_STATE = mlx_state
             if action == "quit":
                 break
             if action == "handled":
                 continue
-            if BACKEND == AGENT_SDK_BACKEND:
+            if backends.BACKEND == backends.AGENT_SDK_BACKEND:
                 agent_sdk_session().run(user_input)
                 continue
             messages.append({"role": "user", "content": user_input})
@@ -5535,10 +1943,12 @@ def main() -> None:
         except Exception as err:
             msg = str(err)
             print(f"{RED}Error: {msg}{RESET}")
-            if BACKEND == "ollama" and ("not found" in msg.lower() or "404" in msg):
+            if backends.BACKEND == "ollama" and (
+                "not found" in msg.lower() or "404" in msg
+            ):
                 print(
-                    f"{YELLOW}Model '{MODEL}' isn't pulled. "
-                    f"Run: ollama pull {MODEL}  (or `ollama list`).{RESET}"
+                    f"{YELLOW}Model '{backends.MODEL}' isn't pulled. "
+                    f"Run: ollama pull {backends.MODEL}  (or `ollama list`).{RESET}"
                 )
             if os.environ.get("WRENCODE_DEBUG"):
                 traceback.print_exc()

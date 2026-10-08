@@ -1,6 +1,6 @@
 # 🐦 WrenCode
 
-A minimal agent harness for coding, in a single Python file.
+A minimal agent harness for coding. The agent loop is one readable Python file.
 
 Named after Harold Wren - the alias of a genius who built a superintelligent AI and operated quietly in the background.
 
@@ -11,6 +11,21 @@ Named after Harold Wren - the alias of a genius who built a superintelligent AI 
 WrenCode is a coding agent harness: everything around the model that turns it into an agent. It runs the tool-calling loop, executes tools, builds the system prompt, and manages context, locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
 
 Where Claude Code is the batteries-included harness, WrenCode is the **"understand and own your agent" harness**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
+
+## Code layout
+
+Read `wrencode.py` top to bottom to understand the agent; the files beside it are what it calls.
+
+|File                    |What's in it                                                      |
+|------------------------|------------------------------------------------------------------|
+|`wrencode.py`           |The harness: the seven tools, the system prompt, the turn loop, parallel subagents, context compaction, headless mode, `main()`|
+|`wrencode_backends.py`  |Talking to models: backend tables and state, HTTP with retries, request/response formats (Anthropic, OpenAI, Bedrock Converse, local), `get_response()`|
+|`wrencode_configure.py` |Picking a backend and model: the first-run chooser, `/configure` and `/model`, API-key prompts and verification, model lists, saved config|
+|`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
+|`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
+|`wrencode_synthesize.py`|The `synthesize` subcommand                                       |
+
+Each module imports only the ones below it in this table's dependency order (`wrencode.py` → backends/configure/sdk/synthesize → ui), so the loop can be read without the rest.
 
 ## Backends
 
@@ -247,7 +262,8 @@ sudo mv wrencode /usr/local/bin/wrencode
 
 ### Option 2: Run from source
 
-Single file, standard library only (except the backend you choose).
+Standard library only (except the backend you choose). `wrencode.py` runs with the
+`wrencode_*.py` modules next to it.
 
 ```bash
 git clone https://github.com/almostly/wrencode
