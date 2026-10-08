@@ -649,7 +649,9 @@ def render_banner(color: bool) -> str:
     lines = []
     for row, face in zip(_BANNER_ROWS, _BANNER_FACES):
         tint = f"\033[38;5;{face}m"
-        runs = re.sub(r"█+|[^█ ]+", lambda m: (tint if m[0][0] == "█" else shade) + m[0], row)
+        runs = re.sub(
+            r"█+|[^█ ]+", lambda m: (tint if m[0][0] == "█" else shade) + m[0], row
+        )
         lines.append(runs + RESET)
     return "\n".join(lines)
 
@@ -782,7 +784,9 @@ def edit(args: dict[str, Any]) -> str:
         count = text.count(old)
         if not args.get("all") and count > 1:
             return f"error: 'old' appears {count} times (add context to make it unique, or use all=true)"
-        updated = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+        updated = (
+            text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+        )
     elif (shifted := _reindented_edit(text, old, new)) is not None:
         updated, note = shifted
     else:
@@ -858,7 +862,10 @@ def _reindented_edit(text: str, old: str, new: str) -> Optional[tuple[str, str]]
             shifted.append(add + line)
     updated = "\n".join(lines[:i] + shifted + lines[i + n :])
     how = f"added {len(add)}" if add else f"removed {len(remove)}"
-    return updated, f"matched lines {i + 1}-{i + n} after adjusting indentation ({how} chars)"
+    return (
+        updated,
+        f"matched lines {i + 1}-{i + n} after adjusting indentation ({how} chars)",
+    )
 
 
 def _not_found_error(text: str, old: str) -> str:
@@ -1183,7 +1190,11 @@ def _respond_schema() -> Optional[dict[str, Any]]:
         return None
     if _OUTPUT_SCHEMA.get("type") == "object":
         return _OUTPUT_SCHEMA
-    return {"type": "object", "properties": {"value": _OUTPUT_SCHEMA}, "required": ["value"]}
+    return {
+        "type": "object",
+        "properties": {"value": _OUTPUT_SCHEMA},
+        "required": ["value"],
+    }
 
 
 def _known_tool(name: Any) -> bool:
@@ -1194,12 +1205,16 @@ def respond(args: dict[str, Any]) -> str:
     """Record the final structured answer if it matches the output schema."""
     schema = _respond_schema()
     if schema is None or _OUTPUT_SCHEMA is None:
-        return "error: respond is only available to the top-level agent with --json-schema"
+        return (
+            "error: respond is only available to the top-level agent with --json-schema"
+        )
     errors = validate_json(args, schema)
     if errors:
         listed = "\n".join(f"- {e}" for e in errors[:20])
         return f"error: the answer doesn't match the schema:\n{listed}\nFix these and call respond again."
-    _STRUCTURED_RESULT[:] = [args if _OUTPUT_SCHEMA.get("type") == "object" else args["value"]]
+    _STRUCTURED_RESULT[:] = [
+        args if _OUTPUT_SCHEMA.get("type") == "object" else args["value"]
+    ]
     return "ok: answer recorded"
 
 
@@ -1234,7 +1249,9 @@ def validate_json(value: Any, schema: Any, path: str = "$") -> list[str]:
     if "type" in schema:
         types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
         if not any(_json_type_ok(value, t) for t in types):
-            return [f"{path}: expected {' or '.join(types)}, got {type(value).__name__}"]
+            return [
+                f"{path}: expected {' or '.join(types)}, got {type(value).__name__}"
+            ]
     errs: list[str] = []
     if "enum" in schema and value not in schema["enum"]:
         errs.append(f"{path}: must be one of {json.dumps(schema['enum'])}")
@@ -1280,12 +1297,16 @@ def validate_json(value: Any, schema: Any, path: str = "$") -> list[str]:
     if "allOf" in schema:
         for sub in schema["allOf"]:
             errs += validate_json(value, sub, path)
-    if "anyOf" in schema and all(validate_json(value, sub, path) for sub in schema["anyOf"]):
+    if "anyOf" in schema and all(
+        validate_json(value, sub, path) for sub in schema["anyOf"]
+    ):
         errs.append(f"{path}: doesn't match any of the allowed shapes (anyOf)")
     if "oneOf" in schema:
         matches = sum(not validate_json(value, sub, path) for sub in schema["oneOf"])
         if matches != 1:
-            errs.append(f"{path}: must match exactly one shape in oneOf, matched {matches}")
+            errs.append(
+                f"{path}: must match exactly one shape in oneOf, matched {matches}"
+            )
     return errs
 
 
@@ -1673,7 +1694,9 @@ def _garbled_tool_call(text: str, native: bool) -> str:
         near = body[max(0, err.pos - 40) : err.pos + 20].replace("\n", "\\n")
         return f"invalid JSON at character {err.pos} ({err.msg}) near: {near}"
     if native:
-        return "it was written as text instead of through the function-calling interface"
+        return (
+            "it was written as text instead of through the function-calling interface"
+        )
     name = obj.get("tool", obj.get("name")) if isinstance(obj, dict) else None
     return "" if _call_payload(obj) else f"unknown tool or bad arguments for {name!r}"
 
@@ -1698,7 +1721,9 @@ def _build_tool_schemas(fmt: str) -> list[dict[str, Any]]:
     for name, (desc, params, _) in TOOLS.items():
         props = {k: {"type": _TYPE_MAP.get(v, "string")} for k, v in params.items()}
         req = [k for k, v in params.items() if not v.endswith("?")]
-        specs.append((name, desc, {"type": "object", "properties": props, "required": req}))
+        specs.append(
+            (name, desc, {"type": "object", "properties": props, "required": req})
+        )
     if (respond_schema := _respond_schema()) is not None:
         specs.append((RESPOND_TOOL, RESPOND_DESCRIPTION, respond_schema))
     for name, desc, schema in specs:
@@ -1757,7 +1782,9 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
     treating an empty operation as success.
     """
     u = data.get("usage", {})
-    out_tokens = u.get("outputTokens", u.get("output_tokens", u.get("completion_tokens")))
+    out_tokens = u.get(
+        "outputTokens", u.get("output_tokens", u.get("completion_tokens"))
+    )
     if _is_truncated(data):
         print(
             f"{YELLOW}Warning: response truncated at MAX_TOKENS={MAX_TOKENS} "
@@ -1952,7 +1979,10 @@ def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
             if e.code in {429, 500, 502, 503, 504} and attempt < HTTP_RETRIES:
-                print(f"{YELLOW}HTTP {e.code}, retrying in {wait}s{RESET}", file=sys.stderr)
+                print(
+                    f"{YELLOW}HTTP {e.code}, retrying in {wait}s{RESET}",
+                    file=sys.stderr,
+                )
                 time.sleep(wait)
                 continue
             raise Exception(f"HTTP {e.code}: {body}") from e
@@ -1962,7 +1992,10 @@ def _http_post_raw(url: str, data: bytes, headers: dict[str, str]) -> Any:
             if attempt == HTTP_RETRIES:
                 raise
             reason = getattr(e, "reason", None) or e
-            print(f"{YELLOW}Network error ({reason}), retrying in {wait}s{RESET}", file=sys.stderr)
+            print(
+                f"{YELLOW}Network error ({reason}), retrying in {wait}s{RESET}",
+                file=sys.stderr,
+            )
             time.sleep(wait)
     raise AssertionError("unreachable")
 
@@ -2135,7 +2168,9 @@ def _to_converse_message(m: dict[str, Any]) -> dict[str, Any]:
 
 
 def _defang_tool_tags(text: str) -> str:
-    return text.replace("<tool_call>", "<tool-call>").replace("</tool_call>", "</tool-call>")
+    return text.replace("<tool_call>", "<tool-call>").replace(
+        "</tool_call>", "</tool-call>"
+    )
 
 
 def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2185,7 +2220,8 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 results.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tr.get("tool_use_id") or tr.get("toolUseId", ""),
+                        "tool_call_id": tr.get("tool_use_id")
+                        or tr.get("toolUseId", ""),
                         "content": body,
                     }
                 )
@@ -2227,7 +2263,9 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if t["tool_call_id"] in kept:
                     fixed.append(t)
                 else:
-                    fixed.append({"role": "user", "content": f"Tool result: {t['content']}"})
+                    fixed.append(
+                        {"role": "user", "content": f"Tool result: {t['content']}"}
+                    )
             i = j
             continue
         fixed.append(m)
@@ -2416,7 +2454,9 @@ def save_history(messages: list[dict[str, Any]]) -> None:
             json.dump(messages, f)
 
 
-def _summarize(prompt: str, mlx_state: Optional[tuple[Any, Any]], max_tokens: int) -> str:
+def _summarize(
+    prompt: str, mlx_state: Optional[tuple[Any, Any]], max_tokens: int
+) -> str:
     """Send a one-off prompt to the current backend (no tools) and return its text."""
     system = "You are a helpful assistant."
     if BACKEND == "bedrock":
@@ -2464,7 +2504,10 @@ def _summarize(prompt: str, mlx_state: Optional[tuple[Any, Any]], max_tokens: in
     if BACKEND in LOCAL_ML_BACKENDS and mlx_state:
         model, tokenizer = mlx_state
         chat = tokenizer.apply_chat_template(
-            [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -2731,7 +2774,7 @@ GARBLED_NUDGE = (
     "Your last message contained a tool call that couldn't be run: {why}. Nothing "
     "was executed. Send the call again as a proper tool call, with arguments as "
     "valid JSON: each string is one JSON string literal with newlines escaped as "
-    "\\n and quotes as \\\"; no + concatenation or Python syntax."
+    '\\n and quotes as \\"; no + concatenation or Python syntax.'
 )
 
 
@@ -2821,8 +2864,13 @@ def run_agent_turn(
                 messages.append({"role": "user", "content": TRUNCATION_NUDGE})
                 continue
             truncations = 0
-            garbled = "" if tool_calls else _garbled_tool_call(
-                display_text if raw_data is not None else response_text, raw_data is not None
+            garbled = (
+                ""
+                if tool_calls
+                else _garbled_tool_call(
+                    display_text if raw_data is not None else response_text,
+                    raw_data is not None,
+                )
             )
             _append_assistant(messages, display_text, tool_calls, raw_data)
             if garbled:
@@ -2830,8 +2878,12 @@ def run_agent_turn(
                 garbled_nudges += 1
                 if garbled_nudges > MAX_TRUNCATION_RETRIES:
                     return "malformed_tool_call"
-                print(f"{YELLOW}Unparseable tool call ({garbled}); asking for a resend.{RESET}")
-                messages.append({"role": "user", "content": GARBLED_NUDGE.format(why=garbled)})
+                print(
+                    f"{YELLOW}Unparseable tool call ({garbled}); asking for a resend.{RESET}"
+                )
+                messages.append(
+                    {"role": "user", "content": GARBLED_NUDGE.format(why=garbled)}
+                )
                 continue
             if not tool_calls:
                 if _respond_schema() is None or _STRUCTURED_RESULT:
@@ -2853,7 +2905,9 @@ def run_agent_turn(
                 )
                 if result.startswith("error:"):
                     # Same failing call again, even with other calls in between?
-                    key = f"{tc.name}:{json.dumps(tc.input, sort_keys=True, default=str)}"
+                    key = (
+                        f"{tc.name}:{json.dumps(tc.input, sort_keys=True, default=str)}"
+                    )
                     failed_calls[key] = failed_calls.get(key, 0) + 1
                     if failed_calls[key] >= REPEATED_CALL_STOP:
                         print(
@@ -2868,7 +2922,10 @@ def run_agent_turn(
                 if stop:
                     break
             # Every tool call needs a result, or the next request is rejected.
-            results += [(tc, "skipped: stopped after repeated errors") for tc in tool_calls[len(results) :]]
+            results += [
+                (tc, "skipped: stopped after repeated errors")
+                for tc in tool_calls[len(results) :]
+            ]
             _append_tool_results(messages, results)
             if stop:
                 return "tool_errors"
@@ -2906,8 +2963,10 @@ def handle_slash_command(
         print_system("Cleared")
         return "handled", _MLX_UNCHANGED
     if cmd == "/compact":
-        if BACKEND in HOSTED_BACKENDS or BACKEND == "ollama" or (
-            BACKEND in LOCAL_ML_BACKENDS and mlx_state
+        if (
+            BACKEND in HOSTED_BACKENDS
+            or BACKEND == "ollama"
+            or (BACKEND in LOCAL_ML_BACKENDS and mlx_state)
         ):
             print_system("Compacting history...")
             model, tokenizer = mlx_state or (None, None)
@@ -3092,14 +3151,19 @@ def _list_openai_compatible_models() -> tuple[list[str], str]:
     key = os.environ.get("OPENAI_COMPATIBLE_API_KEY", "")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        req = urllib.request.Request(f"{_openai_compatible_base()}/models", headers=headers)
+        req = urllib.request.Request(
+            f"{_openai_compatible_base()}/models", headers=headers
+        )
         # Generous timeout: serverless hosts (Modal, etc.) may cold-start here.
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.load(resp)
         return sorted(m["id"] for m in data.get("data", []) if m.get("id")), ""
     except urllib.error.HTTPError as err:
         if err.code in {401, 403}:
-            return [], f"the server rejected the key (HTTP {err.code}); check OPENAI_COMPATIBLE_API_KEY"
+            return (
+                [],
+                f"the server rejected the key (HTTP {err.code}); check OPENAI_COMPATIBLE_API_KEY",
+            )
         return [], f"HTTP {err.code}"
     except Exception as err:
         return [], f"{err} — is the server running?"
@@ -3217,11 +3281,19 @@ def verify_api_key() -> tuple[str, str]:
     if not API_KEY:
         return ("invalid", "no key")
     probes = {
-        "anthropic": ("https://api.anthropic.com/v1/models", _anthropic_headers(), "GET"),
+        "anthropic": (
+            "https://api.anthropic.com/v1/models",
+            _anthropic_headers(),
+            "GET",
+        ),
         "openai": ("https://api.openai.com/v1/models", _openai_headers(), "GET"),
         "openrouter": ("https://openrouter.ai/api/v1/key", _openai_headers(), "GET"),
         # NanoGPT's /models is public, so check the key against the balance endpoint.
-        "nanogpt": ("https://nano-gpt.com/api/check-balance", _openai_headers(), "POST"),
+        "nanogpt": (
+            "https://nano-gpt.com/api/check-balance",
+            _openai_headers(),
+            "POST",
+        ),
     }
     if BACKEND not in probes:
         return ("unknown", "")
@@ -4150,7 +4222,12 @@ def run_verify(cmd: str) -> tuple[bool, str]:
     """Run the --verify command in the workspace; return (passed, output tail)."""
     try:
         r = subprocess.run(
-            cmd, shell=True, cwd=workspace_root(), capture_output=True, text=True, timeout=600
+            cmd,
+            shell=True,
+            cwd=workspace_root(),
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
     except subprocess.TimeoutExpired:
         return False, "timed out after 600s"
@@ -4188,11 +4265,15 @@ def run_headless(
             _MLX_STATE = load_model()
             system_prompt = build_system_prompt()
             for attempt in range(VERIFY_ATTEMPTS if verify else 1):
-                reason = run_agent_turn(messages, system_prompt, _MLX_STATE, max_iters=max_turns)
+                reason = run_agent_turn(
+                    messages, system_prompt, _MLX_STATE, max_iters=max_turns
+                )
                 if not verify or reason != "done":
                     break
                 verified, verify_output = run_verify(verify)
-                print(f"{DIM}verify `{verify}`: {'passed' if verified else 'failed'}{RESET}")
+                print(
+                    f"{DIM}verify `{verify}`: {'passed' if verified else 'failed'}{RESET}"
+                )
                 if verified or attempt == VERIFY_ATTEMPTS - 1:
                     break
                 _STRUCTURED_RESULT.clear()
@@ -4206,12 +4287,16 @@ def run_headless(
                 )
             if verified is False and reason == "done":
                 reason = "verify_failed"
-        except SystemExit:  # setup failed (no backend, key, or model); reason is on stderr
+        except (
+            SystemExit
+        ):  # setup failed (no backend, key, or model); reason is on stderr
             error = "configuration error (see stderr)"
         except Exception as err:  # noqa: BLE001 — reported in the result
             error = str(err)
             print(f"{RED}Error: {error}{RESET}")
-    texts = [flatten_content(m["content"]) for m in messages if m["role"] == "assistant"]
+    texts = [
+        flatten_content(m["content"]) for m in messages if m["role"] == "assistant"
+    ]
     result = texts[-1].strip() if texts else ""
     is_error = reason != "done" or (schema is not None and not _STRUCTURED_RESULT)
     if verify and verified is None and reason == "done":  # never reached the check
@@ -4226,7 +4311,9 @@ def run_headless(
             "model": MODEL,
         }
         if schema is not None:
-            out["structured_output"] = _STRUCTURED_RESULT[0] if _STRUCTURED_RESULT else None
+            out["structured_output"] = (
+                _STRUCTURED_RESULT[0] if _STRUCTURED_RESULT else None
+            )
         if verify:
             out["verified"] = verified
             if verified is False:
@@ -4251,8 +4338,12 @@ def print_help() -> None:
     print("                     (PROMPT '-' or omitted with piped stdin reads stdin)")
     print("--output-format F    with -p: text (default) or json")
     print("--max-turns N        with -p: cap tool-calling rounds")
-    print("--json-schema S      with -p: answer as JSON matching schema S (file or inline)")
-    print("--verify CMD         with -p: CMD must pass when the agent finishes, else it retries")
+    print(
+        "--json-schema S      with -p: answer as JSON matching schema S (file or inline)"
+    )
+    print(
+        "--verify CMD         with -p: CMD must pass when the agent finishes, else it retries"
+    )
     print("--yes         auto-approve all writes/commands (WRENCODE_AUTO_APPROVE)")
     print("--uninstall   remove saved config and show how to delete wrencode")
     print("--version, -V print version and exit")
@@ -4315,7 +4406,7 @@ def main() -> None:
         if prompt in {None, "-"}:
             prompt = sys.stdin.read() if piped else ""
         if not prompt.strip():
-            print(f"{RED}No prompt: pass -p \"...\" or pipe one on stdin.{RESET}")
+            print(f'{RED}No prompt: pass -p "..." or pipe one on stdin.{RESET}')
             raise SystemExit(2)
         fmt = _arg_value(args, "--output-format") or "text"
         if fmt not in {"text", "json"}:
@@ -4328,7 +4419,11 @@ def main() -> None:
         schema = None
         if (raw := _arg_value(args, "--json-schema")) is not None:
             try:
-                text = raw if raw.lstrip().startswith("{") else pathlib.Path(raw).read_text()
+                text = (
+                    raw
+                    if raw.lstrip().startswith("{")
+                    else pathlib.Path(raw).read_text()
+                )
                 schema = json.loads(text)
             except (OSError, ValueError) as err:
                 print(f"{RED}--json-schema: {err}{RESET}")
