@@ -462,8 +462,8 @@ uvx ruff check . && uvx ruff format .  # lint and format; the rule set is in pyp
 uvx ty check wrencode*.py              # type check
 ```
 
-A deliberate catch-all `except Exception` carries a `# noqa: BLE001` with its reason;
-everything else is kept clean under the pinned rules.
+There are no `# noqa` markers: a rule the design contradicts is turned off in
+`pyproject.toml` with its reason, and a test keeps it that way.
 
 ## Releasing
 

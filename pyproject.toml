@@ -74,10 +74,12 @@ ignored_tag_formats = ["$major.$minor.$patch.*"]
 target-version = "py39"
 
 [tool.ruff.lint]
-# ruff's defaults plus the families the code is kept clean under; a deliberate
-# catch-all `except Exception` carries a `# noqa: BLE001` with its reason.
+# ruff's defaults plus the families the code is kept clean under. No `# noqa`
+# anywhere: a rule the design contradicts is turned off here, with its reason.
 extend-select = ["I", "UP", "B", "SIM", "BLE", "TRY", "RUF", "PLW", "FA", "FLY", "S110"]
 ignore = [
+    "BLE001",  # the tool boundary, the interactive loop and the model-list fallbacks
+               # must survive any failure, so they catch Exception on purpose
     "PLW0603", # module-level state is set with `global` on purpose (see apply_backend)
     "TRY003",  # exception messages are written where they are raised
     "TRY300",  # `return` inside `try` reads fine here

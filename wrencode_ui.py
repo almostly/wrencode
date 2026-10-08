@@ -417,7 +417,8 @@ def _cancel_listener() -> None:
     """Watch stdin for Escape while a blocking agent operation runs."""
     if not sys.stdin.isatty():
         return
-    try:
+    # Without termios or a raw-capable stdin we only lose Escape-to-cancel.
+    with contextlib.suppress(Exception):
         import termios
         import tty
 
@@ -435,8 +436,6 @@ def _cancel_listener() -> None:
                     break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:  # noqa: BLE001, S110 — no raw stdin (or no termios): lose Escape, nothing else
-        pass
 
 
 @contextlib.contextmanager

@@ -504,7 +504,7 @@ def get_response_cancellable(
             result.append(
                 backends.get_response(messages, system_prompt, mlx_state, tool_specs())
             )
-        except BaseException as exc:  # noqa: BLE001 — propagate to caller
+        except BaseException as exc:  # propagate to caller
             error.append(exc)
 
     with ui.cancel_watch():
@@ -918,7 +918,7 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
                 + f"\n... [truncated {len(result) - MAX_OUT} chars; raise MAX_TOOL_OUTPUT_CHARS]"
             )
         return result
-    except Exception as e:  # noqa: BLE001 — any tool failure is reported to the model
+    except Exception as e:  # any tool failure is reported to the model
         return f"error: {e}"
 
 
@@ -1243,7 +1243,7 @@ def auto_compact(
         summary = backends.complete(
             "You are a helpful assistant.", prompt, max_tokens=1500, mlx_state=mlx_state
         )
-    except Exception as err:  # noqa: BLE001 — fall back to dropping history
+    except Exception as err:  # fall back to dropping history
         summary = f"(Earlier messages were dropped to fit the context window: {err})"
     note = f"{_COMPACTION_NOTE}\n{summary}"
     if task:
@@ -1604,7 +1604,7 @@ def _run_tasks_concurrently(calls: list[backends.ToolCall]) -> list[str]:
                 return
             try:
                 results[n] = run_tool(tc.name, tc.input)
-            except BaseException as err:  # noqa: BLE001 — reported as the result
+            except BaseException as err:  # reported as the result
                 results[n] = f"error: {err}"
 
     threads = [
@@ -1849,7 +1849,7 @@ def run_headless(
             SystemExit
         ):  # setup failed (no backend, key, or model); reason is on stderr
             error = "configuration error (see stderr)"
-        except Exception as err:  # noqa: BLE001 — reported in the result
+        except Exception as err:  # reported in the result
             error = str(err)
             print(f"{RED}Error: {ui.visible(error)}{RESET}")
         finally:
@@ -2056,7 +2056,7 @@ def main() -> None:
             continue
         except EOFError:
             break
-        except Exception as err:  # noqa: BLE001 — shown to the user; the session goes on
+        except Exception as err:  # shown to the user; the session goes on
             msg = str(err)
             print(f"{RED}Error: {ui.visible(msg)}{RESET}")
             if backends.BACKEND == "ollama" and (

@@ -122,7 +122,7 @@ def _fetch_hosted_models(
         if ids:
             _write_models_cache(cache, ids)
         return ids or fallback
-    except Exception as err:  # noqa: BLE001 — any failure falls back to the built-in list
+    except Exception as err:  # any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch {label} models: {err}{RESET}")
         return fallback
 
@@ -165,7 +165,7 @@ def fetch_anthropic_models() -> list[str]:
         if ids:
             _write_models_cache(backends.ANTHROPIC_MODELS_CACHE, ids)
         return ids or fallback
-    except Exception as err:  # noqa: BLE001 — any failure falls back to the built-in list
+    except Exception as err:  # any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch Anthropic models: {err}{RESET}")
         return fallback
 
@@ -213,7 +213,7 @@ def fetch_openai_models() -> list[str]:
         if ids:
             _write_models_cache(backends.OPENAI_MODELS_CACHE, ids)
         return ids or fallback
-    except Exception as err:  # noqa: BLE001 — any failure falls back to the built-in list
+    except Exception as err:  # any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch OpenAI models: {err}{RESET}")
         return fallback
 
@@ -248,7 +248,7 @@ def fetch_ollama_models() -> list[str]:
             m.get("name", "") for m in data.get("models", []) if m.get("name")
         )
         return names or [backends.BACKEND_SPECS["ollama"]["model"]]
-    except Exception as err:  # noqa: BLE001 — any failure falls back to the default model
+    except Exception as err:  # any failure falls back to the default model
         print(f"{YELLOW}Could not reach Ollama at {base}: {err}{RESET}")
         return [backends.BACKEND_SPECS["ollama"]["model"]]
 
@@ -415,7 +415,7 @@ def verify_api_key() -> tuple[str, str]:
             if err.code in (401, 403):
                 return ("invalid", f"HTTP {err.code}")
             return ("unknown", f"HTTP {err.code}")
-        except Exception as err:  # noqa: BLE001 — verification is advisory
+        except Exception as err:  # verification is advisory
             return ("unknown", str(err))
     if spec["kind"] not in backends.KEYED_KINDS:
         return ("ok", "")
@@ -467,7 +467,7 @@ def verify_api_key() -> tuple[str, str]:
                 ),
             )
         return ("unknown", f"HTTP {err.code}")
-    except Exception as err:  # noqa: BLE001 — verification is advisory
+    except Exception as err:  # verification is advisory
         return ("unknown", str(err))
 
 

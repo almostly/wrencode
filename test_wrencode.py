@@ -2551,6 +2551,19 @@ class TestHardening(unittest.TestCase):
         self.assertIn("core.fsmonitor=false", run.call_args.args[0])
 
 
+class TestRepoRules(unittest.TestCase):
+    def test_no_noqa_markers(self):
+        here = pathlib.Path(__file__).parent
+        files = [*sorted(here.glob("wrencode*.py")), here / "test_wrencode.py"]
+        offenders = [
+            f"{f.name}:{n}"
+            for f in files
+            for n, line in enumerate(f.read_text().splitlines(), 1)
+            if "noqa" in line and "test_no_noqa_markers" not in line
+        ]
+        self.assertEqual(offenders, [], "lint exceptions belong in pyproject.toml")
+
+
 class TestComplete(unittest.TestCase):
     """backends.complete(): one-shot completions shared by compaction and synthesize."""
 
