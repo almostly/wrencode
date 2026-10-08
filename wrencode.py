@@ -89,7 +89,7 @@ for _dir in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
 # -----------------------------------------------------------------------------------------------
 # Backend configuration
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.2.0"
+WRENCODE_VERSION = "0.3.0"
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key

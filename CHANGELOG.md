@@ -1,3 +1,23 @@
+## 0.3.0 (2026-10-08)
+
+### Feat
+
+- **claude-agent-sdk**: new backend running Claude Code's agent loop and tools, billed to ANTHROPIC_API_KEY, with approvals, Escape to interrupt, per-turn cost and per-project session resume
+- run task subagents from one reply in parallel (WRENCODE_MAX_PARALLEL_SUBAGENTS), with tagged output and approvals that take turns
+- show matching slash commands while typing /, with arrow keys, Tab completion and highlighting of real commands only; /clear, /quit and /exit aliases
+- **configure**: replace a key that comes from .env; the saved key keeps winning on later launches
+- WRENCODE_EFFORT sets Claude reasoning effort
+- **examples**: run several prompts in parallel on the claude-agent-sdk backend
+
+### Fix
+
+- fetch Anthropic and OpenAI model lists live, and send anthropic-workspace-id for multi-workspace Anthropic keys
+- prompt caching covers the growing conversation, not only the system prompt and tools
+- Claude backends default to claude-opus-5-5 with 16000 max tokens
+- ty passes without ignore comments
+- make wrencode.py executable to match its shebang
+- retry dropped connections and timeouts, not just 429/5xx
+
 ## 0.2.0 (2026-10-03)
 
 ### Feat

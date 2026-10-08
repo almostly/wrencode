@@ -57,7 +57,7 @@ include = ["wrencode.py", "README.md"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.2.0"
+version = "0.3.0"
 version_scheme = "pep440"
 tag_format = "$version"
 legacy_tag_formats = ["v$version"]
