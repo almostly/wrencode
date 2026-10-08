@@ -22,6 +22,7 @@ saved choice, e.g. for CI.
 |Backend       |Description                             |Availability          |
 |--------------|----------------------------------------|----------------------|
 |`anthropic`   |Claude via Anthropic API                |binary + source       |
+|`claude-agent-sdk`|Claude Code's agent loop and tools via the Claude Agent SDK|source install, Python 3.10+|
 |`openai`      |GPT models via OpenAI API               |binary + source       |
 |`openrouter`  |Any model via OpenRouter                |binary + source       |
 |`nanogpt`     |Any model via NanoGPT                   |binary + source       |
@@ -39,6 +40,29 @@ The default local models are
 (transformers) and
 [`deburky/gpt-oss-claude-mlx`](https://huggingface.co/deburky/gpt-oss-claude-mlx)
 (MLX) — override either with `MODEL=...`.
+
+### Claude Agent SDK
+
+The `claude-agent-sdk` backend hands each prompt to the
+[Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), which
+runs Claude Code's own agent loop, tools and subagents. WrenCode shows the
+stream, asks before edits and commands, and prints the cost of each turn.
+Install the extra, then pick the backend in `/configure`:
+
+```bash
+pip install 'wrencode[agent-sdk]'   # or: pip install claude-agent-sdk
+```
+
+It always authenticates with `ANTHROPIC_API_KEY`, so usage bills to your
+Console credits, including the monthly API credits that come with Max and Team
+plans. Subscription logins are never used. Multi-workspace keys need
+`ANTHROPIC_WORKSPACE_ID`. The conversation resumes per project across restarts;
+`/clear` starts a new one. Your `~/.claude` hooks, plugins and MCP servers are
+not loaded; project instructions come from `AGENTS.md` / `CLAUDE.md`.
+
+To run several prompts in parallel, each as its own agent with a fresh
+context, see `examples/agent_sdk_swarm.py`. It prints every answer and the
+total cost.
 
 ### OpenAI-compatible servers
 
@@ -82,7 +106,15 @@ All file operations are sandboxed to the workspace root by default.
 
 The `task` tool runs a nested agent loop on a fresh message history, so the
 parent's context only grows by the returned summary — useful for context-heavy
-subtasks. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
+subtasks.
+
+Task calls made in the same reply run in parallel, up to
+`WRENCODE_MAX_PARALLEL_SUBAGENTS` at a time (default 4), on every backend
+except the in-process `mlx` and `transformers` ones. Ask for it in the prompt,
+for example "analyze each file in docs/ with its own subagent, in parallel".
+Each subagent's output is tagged `[1]`, `[2]`, and so on; approval prompts
+take turns and pause the other agents' output until you answer. Escape stops
+the whole batch. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
 each subagent round is bounded. For autonomous subagent runs, enable
 `--yes` / `WRENCODE_AUTO_APPROVE` so sub-tool calls don't block on confirmation.
 
@@ -268,10 +300,12 @@ wrencode --configure
 # Or from source — also prompts on first run
 python3 wrencode.py
 
-# Anthropic Claude
+# Anthropic Claude (model list is fetched live from the API during /configure)
 BACKEND=anthropic python3 wrencode.py
+# Multi-workspace Anthropic keys also need a workspace id:
+# ANTHROPIC_WORKSPACE_ID=wrkspc_... BACKEND=anthropic python3 wrencode.py
 
-# OpenAI
+# OpenAI (model list fetched live from the API during /configure)
 BACKEND=openai MODEL=gpt-4o python3 wrencode.py
 
 # OpenRouter
@@ -316,9 +350,13 @@ This publishes release assets:
 |Command       |Description                                   |
 |--------------|----------------------------------------------|
 |`/help`       |Show available commands                       |
-|`/c`          |Clear conversation history                    |
+|`/model`      |Switch model, or `/model <id>` to set it directly|
+|`/backend`, `/configure`|Switch backend, model and API key   |
+|`/clear` or `/c`|Clear conversation history                  |
 |`/compact`    |Summarize history to reduce context          |
-|`/q` or `exit`|Quit                                          |
+|`/quit`, `/q` or `/exit`|Quit                                |
+
+Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 
 ## Environment Variables
 
@@ -332,7 +370,9 @@ This publishes release assets:
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
-|`MAX_TOKENS`                 |`8192`                 |Max tokens per response           |
+|`WRENCODE_MAX_PARALLEL_SUBAGENTS`|`4`                |Subagents run at once from one reply; `1` runs them in order|
+|`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
+|`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
 |`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction|
@@ -347,6 +387,7 @@ This publishes release assets:
 |`NANOGPT_API_KEY`            |-                      |NanoGPT API key                   |
 |`OPENAI_API_KEY`             |-                      |OpenAI API key                    |
 |`ANTHROPIC_API_KEY`          |-                      |Anthropic API key                 |
+|`ANTHROPIC_WORKSPACE_ID`     |-                      |Anthropic workspace id (`wrkspc_…`); required for multi-workspace keys|
 |`LOCAL_API_KEY`              |`local`                |Local proxy API key               |
 |`LOCAL_PORT`                 |`8082`                 |Local proxy port                  |
 |`OLLAMA_HOST`                |`http://localhost:11434`|Ollama server base URL           |

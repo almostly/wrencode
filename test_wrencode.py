@@ -12,6 +12,8 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from email.message import Message
+from typing import Any
 from unittest import mock
 
 import wrencode
@@ -180,6 +182,33 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertNotIn("\033[1m", chat)
         self.assertIn("hello", strip_ansi(chat))
 
+    def test_format_input_line_unknown_slash_is_plain(self):
+        with mock.patch.object(wrencode, "colors_enabled", return_value=True):
+            path = wrencode.format_input_line("/usr/bin is missing")
+            prefix = wrencode.format_input_line("/mo")
+            alias = wrencode.format_input_line("/q")
+        self.assertNotIn("\033[1m", path)
+        self.assertIn("\033[1m", prefix)
+        self.assertIn("\033[1m", alias)
+
+    def test_slash_matches_prefix(self):
+        self.assertEqual(wrencode.slash_matches("/mo"), ["/model"])
+        self.assertEqual(
+            wrencode.slash_matches("/c"), ["/configure", "/compact", "/clear"]
+        )
+        self.assertEqual(wrencode.slash_matches("/model gpt"), [])
+        self.assertEqual(wrencode.slash_matches("hello"), [])
+        self.assertIn("/help", wrencode.slash_matches("/"))
+
+    def test_slash_aliases_dispatch(self):
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "x"}]
+        with mock.patch.object(wrencode, "save_history"):
+            action, _ = wrencode.handle_slash_command("/c", msgs, None)
+            self.assertEqual((action, msgs), ("handled", []))
+            for cmd in ("/q", "/quit", "/exit"):
+                action, _ = wrencode.handle_slash_command(cmd, msgs, None)
+                self.assertEqual(action, "quit")
+
     def test_read_user_input_fallback(self):
         import io
 
@@ -291,11 +320,300 @@ class TestChooseBackendInteractive(unittest.TestCase):
                 return_value="claude-haiku-4-5-20251001",
             ),
             mock.patch("getpass.getpass", return_value=""),
+            mock.patch("builtins.input", return_value=""),
+            mock.patch.object(wrencode, "verify_api_key", return_value=("ok", "")),
         ):
             wrencode.choose_backend_interactive()
         saved = json.loads(wrencode.CONFIG_FILE.read_text())
         self.assertEqual(saved["api_key"], "sk-secret")
         self.assertEqual(wrencode.API_KEY, "sk-secret")
+
+    def test_reconfigure_saves_anthropic_workspace_id(self):
+        wrencode.save_config(
+            {
+                "backend": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "api_key": "sk-secret",
+            }
+        )
+        with (
+            mock.patch.object(wrencode, "pick_from_list", return_value=0),
+            mock.patch.object(
+                wrencode,
+                "pick_model_interactive",
+                return_value="claude-haiku-4-5-20251001",
+            ),
+            mock.patch("getpass.getpass", return_value=""),
+            mock.patch("builtins.input", return_value="wrkspc_test123"),
+            mock.patch.object(wrencode, "verify_api_key", return_value=("ok", "")),
+        ):
+            wrencode.choose_backend_interactive()
+        saved = json.loads(wrencode.CONFIG_FILE.read_text())
+        self.assertEqual(saved["anthropic_workspace_id"], "wrkspc_test123")
+        self.assertEqual(wrencode.ANTHROPIC_WORKSPACE_ID, "wrkspc_test123")
+
+    def _configure_anthropic(self, typed_key):
+        with (
+            mock.patch.object(wrencode, "pick_from_list", return_value=0),
+            mock.patch.object(
+                wrencode, "pick_model_interactive", return_value="claude-x"
+            ),
+            mock.patch("getpass.getpass", return_value=typed_key),
+            mock.patch("builtins.input", return_value=""),
+            mock.patch.object(wrencode, "verify_api_key", return_value=("ok", "")),
+        ):
+            wrencode.choose_backend_interactive()
+        return json.loads(wrencode.CONFIG_FILE.read_text())
+
+    def test_reconfigure_replaces_env_key(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-stale-from-dotenv"
+        saved = self._configure_anthropic("sk-fresh")
+        self.assertEqual(saved["api_key"], "sk-fresh")
+        self.assertEqual(saved["api_key_overrides_env"], "1")
+        self.assertEqual(wrencode.API_KEY, "sk-fresh")
+        # Next launch: .env sets the stale key again, the saved key still wins.
+        os.environ["ANTHROPIC_API_KEY"] = "sk-stale-from-dotenv"
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BACKEND", None)
+            wrencode.resolve_configuration()
+        self.assertEqual(wrencode.API_KEY, "sk-fresh")
+
+    def test_reconfigure_blank_keeps_env_key(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-from-env"
+        saved = self._configure_anthropic("")
+        self.assertFalse(saved.get("api_key_overrides_env"))
+        self.assertEqual(wrencode.API_KEY, "sk-from-env")
+
+
+class TestAnthropicPromptCaching(unittest.TestCase):
+    def test_request_caches_tools_system_and_history(self):
+        captured: dict[str, Any] = {}
+
+        def fake_post(url, body, headers):
+            captured["body"] = body
+            return {"content": [{"type": "text", "text": "ok"}], "usage": {}}
+
+        orig = (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY)
+        try:
+            wrencode.apply_backend("anthropic", model="claude-x", api_key="sk-t")
+            with mock.patch.object(wrencode, "_http_post", fake_post):
+                wrencode.get_response(
+                    [{"role": "user", "content": "hi"}], "sys-prompt", None
+                )
+        finally:
+            wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY = orig
+        body = captured["body"]
+        ephemeral = {"type": "ephemeral"}
+        self.assertEqual(body["cache_control"], ephemeral)  # growing history
+        self.assertEqual(body["system"][-1]["cache_control"], ephemeral)
+        self.assertEqual(body["tools"][-1]["cache_control"], ephemeral)
+        self.assertEqual(body["max_tokens"], wrencode.CLAUDE_MAX_TOKENS)
+
+    def test_effort_is_sent_only_when_set(self):
+        self.assertEqual(wrencode._claude_output_config(), {})
+        with mock.patch.object(wrencode, "CLAUDE_EFFORT", "high"):
+            self.assertEqual(
+                wrencode._claude_output_config(), {"output_config": {"effort": "high"}}
+            )
+
+
+try:
+    import claude_agent_sdk
+except ImportError:  # optional extra; message tests need its real types
+    claude_agent_sdk = None
+
+
+class TestAgentSDKBackend(unittest.TestCase):
+    def setUp(self):
+        self._tmp = pathlib.Path(tempfile.mkdtemp())
+        self._patches = [
+            mock.patch.object(wrencode, "CONFIG_DIR", self._tmp),
+            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp)}),
+        ]
+        for p in self._patches:
+            p.start()
+        self._saved = (
+            wrencode.BACKEND,
+            wrencode.MODEL,
+            wrencode.API_KEY,
+            wrencode.ANTHROPIC_WORKSPACE_ID,
+        )
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID", "MODEL"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        import shutil
+
+        (
+            wrencode.BACKEND,
+            wrencode.MODEL,
+            wrencode.API_KEY,
+            wrencode.ANTHROPIC_WORKSPACE_ID,
+        ) = self._saved
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_apply_backend_uses_anthropic_key_and_workspace(self):
+        wrencode.apply_backend(
+            "claude-agent-sdk", api_key="sk-t", anthropic_workspace_id="wrkspc_1"
+        )
+        self.assertEqual(wrencode.API_KEY, "sk-t")
+        self.assertEqual(wrencode.ANTHROPIC_WORKSPACE_ID, "wrkspc_1")
+        self.assertEqual(wrencode.MODEL, "claude-opus-5-5")
+
+    def test_env_forces_api_key_billing(self):
+        wrencode.apply_backend(
+            "claude-agent-sdk", api_key="sk-t", anthropic_workspace_id="wrkspc_1"
+        )
+        with mock.patch.dict(os.environ, {"ANTHROPIC_CUSTOM_HEADERS": "x-a: 1"}):
+            env = wrencode._agent_sdk_env()
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-t")
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"], "x-a: 1\nanthropic-workspace-id: wrkspc_1"
+        )
+
+    def test_env_omits_workspace_header_when_unset(self):
+        wrencode.apply_backend("claude-agent-sdk", api_key="sk-t")
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", wrencode._agent_sdk_env())
+
+    def test_tool_action_summaries(self):
+        fmt = wrencode.format_sdk_tool_action
+        self.assertEqual(fmt("Bash", {"command": "ls -la"}), "$ ls -la")
+        self.assertEqual(fmt("Read", {"file_path": "a.py"}), "Read a.py")
+        self.assertEqual(fmt("Grep", {"pattern": "TODO"}), "Grep TODO")
+        edit = fmt("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"})
+        self.assertEqual(edit, "Edit a.py\n- x\n+ y")
+        self.assertTrue(fmt("Odd", {"k": 1}).startswith("Odd("))
+
+    def test_hidden_from_frozen_binary(self):
+        with mock.patch.object(wrencode, "is_frozen", return_value=True):
+            self.assertNotIn("claude-agent-sdk", wrencode.available_backends())
+        with mock.patch.object(wrencode, "is_frozen", return_value=False):
+            self.assertIn("claude-agent-sdk", wrencode.available_backends())
+
+    def test_session_id_saved_per_workspace(self):
+        wrencode._save_agent_sdk_session_id("sess-1")
+        self.assertEqual(wrencode._load_agent_sdk_session_id(), "sess-1")
+        wrencode._save_agent_sdk_session_id("")
+        self.assertEqual(wrencode._load_agent_sdk_session_id(), "")
+
+    def test_clear_resets_sdk_session(self):
+        session = mock.MagicMock()
+        with (
+            mock.patch.object(wrencode, "BACKEND", "claude-agent-sdk"),
+            mock.patch.object(wrencode, "agent_sdk_session", return_value=session),
+            mock.patch.object(wrencode, "save_history"),
+        ):
+            action, _ = wrencode.handle_slash_command("/clear", [], None)
+            wrencode.handle_slash_command("/compact", [], None)
+        self.assertEqual(action, "handled")
+        session.reset.assert_called_once()
+        session.run.assert_called_once_with("/compact")
+
+    def test_headless_routes_to_sdk_and_reports_cost(self):
+        fake = mock.MagicMock()
+        fake.run.return_value = wrencode.AgentSDKTurn(text="Done.", cost_usd=0.0123)
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(wrencode, "resolve_configuration", lambda: None),
+            mock.patch.object(wrencode, "load_model", lambda: None),
+            mock.patch.object(wrencode, "BACKEND", "claude-agent-sdk"),
+            mock.patch.object(wrencode, "AgentSDKSession", return_value=fake),
+            mock.patch.object(wrencode, "_HEADLESS", False),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", err),
+        ):
+            code = wrencode.run_headless("do it", "json")
+        data = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(data["result"], "Done.")
+        self.assertEqual(data["cost_usd"], 0.0123)
+        fake.run.assert_called_once_with("do it")
+        fake.close.assert_called_once()
+
+    @staticmethod
+    def _sdk():
+        assert claude_agent_sdk is not None  # the tests below skip without it
+        return claude_agent_sdk
+
+    def _session(self):
+        with mock.patch("asyncio.new_event_loop"):
+            return wrencode.AgentSDKSession()
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_result_message_reports_turn_cost(self):
+        sdk = self._sdk()
+        session = self._session()
+        turn = wrencode.AgentSDKTurn()
+
+        def result(total, sid="s1"):
+            return sdk.ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                total_cost_usd=total,
+                result="ok",
+            )
+
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            self.assertTrue(session._handle_message(result(0.05), turn))
+            self.assertTrue(session._handle_message(result(0.08), turn))
+        self.assertAlmostEqual(turn.cost_usd, 0.03)
+        self.assertIn("$0.0300 this turn", out.getvalue())
+        self.assertEqual(wrencode._load_agent_sdk_session_id(), "s1")
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_workspace_error_gets_a_hint(self):
+        sdk = self._sdk()
+        session = self._session()
+        turn = wrencode.AgentSDKTurn()
+        msg = sdk.ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s1",
+            result="API Error: 400 must include the anthropic-workspace-id header",
+        )
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            session._handle_message(msg, turn)
+        self.assertTrue(turn.is_error)
+        self.assertIn("/configure", out.getvalue())
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_warns_when_not_billed_to_api_key(self):
+        sdk = self._sdk()
+        session = self._session()
+        msg = sdk.SystemMessage(
+            subtype="init", data={"apiKeySource": "claude.ai", "session_id": "s2"}
+        )
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            session._handle_message(msg, wrencode.AgentSDKTurn())
+        self.assertIn("may not bill", out.getvalue())
+
+    @unittest.skipIf(claude_agent_sdk is None, "claude-agent-sdk not installed")
+    def test_assistant_text_and_tool_calls_print(self):
+        sdk = self._sdk()
+        session = self._session()
+        turn = wrencode.AgentSDKTurn()
+        msg = sdk.AssistantMessage(
+            content=[
+                sdk.TextBlock(text="Looking."),
+                sdk.ToolUseBlock(id="t1", name="Bash", input={"command": "ls"}),
+            ],
+            model="claude-opus-5-5",
+        )
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            self.assertFalse(session._handle_message(msg, turn))
+        self.assertEqual(turn.text, "Looking.")
+        self.assertIn("$ ls", out.getvalue())
 
 
 class TestToolArgs(unittest.TestCase):
@@ -326,9 +644,98 @@ class TestToolArgs(unittest.TestCase):
 class TestModelPicker(unittest.TestCase):
     def test_list_models_includes_current_and_custom(self):
         wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
-        models = wrencode.list_models_for_backend("anthropic")
+        with mock.patch.object(
+            wrencode,
+            "fetch_anthropic_models",
+            return_value=["claude-haiku-4-5-20251001", "claude-sonnet-4-5"],
+        ):
+            models = wrencode.list_models_for_backend("anthropic")
         self.assertIn("claude-haiku-4-5-20251001", models)
+        self.assertIn("claude-sonnet-4-5", models)
         self.assertIn(wrencode.CUSTOM_MODEL_OPTION, models)
+
+    def test_list_models_fetches_from_anthropic(self):
+        wrencode.apply_backend("anthropic", model="claude-haiku-4-5-20251001")
+        with mock.patch.object(
+            wrencode,
+            "fetch_anthropic_models",
+            return_value=["claude-opus-4-6", "claude-haiku-4-5-20251001"],
+        ) as fetch:
+            models = wrencode.list_models_for_backend("anthropic")
+        fetch.assert_called_once()
+        self.assertEqual(models[0], "claude-opus-4-6")
+        self.assertIn(wrencode.CUSTOM_MODEL_OPTION, models)
+
+    def test_anthropic_headers_include_workspace_id(self):
+        orig_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        orig_ws = os.environ.pop("ANTHROPIC_WORKSPACE_ID", None)
+        try:
+            wrencode.apply_backend(
+                "anthropic",
+                model="claude-haiku-4-5-20251001",
+                api_key="sk-test",
+                anthropic_workspace_id="wrkspc_abc",
+            )
+            headers = wrencode._anthropic_headers()
+            self.assertEqual(headers["anthropic-workspace-id"], "wrkspc_abc")
+            self.assertEqual(headers["x-api-key"], "sk-test")
+        finally:
+            if orig_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = orig_key
+            if orig_ws is not None:
+                os.environ["ANTHROPIC_WORKSPACE_ID"] = orig_ws
+
+    def test_anthropic_headers_omit_workspace_when_unset(self):
+        orig_ws = os.environ.pop("ANTHROPIC_WORKSPACE_ID", None)
+        try:
+            wrencode.apply_backend(
+                "anthropic", model="claude-haiku-4-5-20251001", api_key="sk-test"
+            )
+            headers = wrencode._anthropic_headers()
+            self.assertNotIn("anthropic-workspace-id", headers)
+        finally:
+            if orig_ws is not None:
+                os.environ["ANTHROPIC_WORKSPACE_ID"] = orig_ws
+
+    def test_fetch_anthropic_models_parses_provider_response(self):
+        payload = {
+            "data": [
+                {"id": "claude-opus-4-6", "type": "model"},
+                {"id": "claude-haiku-4-5-20251001", "type": "model"},
+            ],
+            "has_more": False,
+            "last_id": "claude-haiku-4-5-20251001",
+        }
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = io.BytesIO(json.dumps(payload).encode())
+        cm.__exit__.return_value = False
+        self._tmp = tempfile.mkdtemp()
+        orig_cache = wrencode.ANTHROPIC_MODELS_CACHE
+        orig_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        orig_ws = os.environ.pop("ANTHROPIC_WORKSPACE_ID", None)
+        wrencode.ANTHROPIC_MODELS_CACHE = (
+            pathlib.Path(self._tmp) / "anthropic_models.json"
+        )
+        wrencode.apply_backend(
+            "anthropic", model="x", api_key="sk-test", anthropic_workspace_id="wrkspc_1"
+        )
+        try:
+            with mock.patch("urllib.request.urlopen", return_value=cm) as urlopen:
+                ids = wrencode.fetch_anthropic_models()
+            self.assertEqual(ids, ["claude-opus-4-6", "claude-haiku-4-5-20251001"])
+            req = urlopen.call_args[0][0]
+            hdrs = {k.lower(): v for k, v in req.headers.items()}
+            self.assertEqual(hdrs.get("x-api-key"), "sk-test")
+            self.assertEqual(hdrs.get("anthropic-workspace-id"), "wrkspc_1")
+        finally:
+            wrencode.ANTHROPIC_MODELS_CACHE = orig_cache
+            if orig_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = orig_key
+            if orig_ws is not None:
+                os.environ["ANTHROPIC_WORKSPACE_ID"] = orig_ws
+            import shutil
+
+            shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_pick_from_list_numbered(self):
         with mock.patch("builtins.input", return_value="2"):
@@ -692,17 +1099,19 @@ class TestResolveConfiguration(unittest.TestCase):
             json.dump({"backend": "anthropic", "model": "claude-x"}, f)
         wrencode.CONFIG_FILE = config_path
         saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: True
         called = []
-        orig_chooser = wrencode.choose_backend_interactive
-        wrencode.choose_backend_interactive = lambda: called.append(True)
         try:
-            wrencode.resolve_configuration()
+            with (
+                mock.patch.object(sys.stdin, "isatty", return_value=True),
+                mock.patch.object(
+                    wrencode,
+                    "choose_backend_interactive",
+                    side_effect=lambda: called.append(True),
+                ),
+            ):
+                wrencode.resolve_configuration()
             self.assertEqual(called, [True])
         finally:
-            sys.stdin.isatty = orig_isatty
-            wrencode.choose_backend_interactive = orig_chooser
             if saved_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = saved_key
 
@@ -714,32 +1123,32 @@ class TestResolveConfiguration(unittest.TestCase):
             json.dump({"backend": "anthropic", "model": "claude-x"}, f)
         wrencode.CONFIG_FILE = config_path
         saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: False
         called = []
-        orig_chooser = wrencode.choose_backend_interactive
-        wrencode.choose_backend_interactive = lambda: called.append(True)
         try:
-            wrencode.resolve_configuration()
+            with (
+                mock.patch.object(sys.stdin, "isatty", return_value=False),
+                mock.patch.object(
+                    wrencode,
+                    "choose_backend_interactive",
+                    side_effect=lambda: called.append(True),
+                ),
+            ):
+                wrencode.resolve_configuration()
             self.assertEqual(called, [])
             self.assertEqual(wrencode.BACKEND, "anthropic")
         finally:
-            sys.stdin.isatty = orig_isatty
-            wrencode.choose_backend_interactive = orig_chooser
             if saved_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = saved_key
 
     def test_non_interactive_no_config_raises_system_exit(self):
         # Point to an empty tmpdir (no config.json) and make stdin non-tty
         wrencode.CONFIG_FILE = pathlib.Path(self._tmp) / "config.json"
-        orig_isatty = sys.stdin.isatty
-        sys.stdin.isatty = lambda: False
-        try:
-            with self.assertRaises(SystemExit) as cm:
-                wrencode.resolve_configuration()
-            self.assertEqual(cm.exception.code, 1)
-        finally:
-            sys.stdin.isatty = orig_isatty
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=False),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            wrencode.resolve_configuration()
+        self.assertEqual(cm.exception.code, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1358,11 @@ class TestAgentLoopSmoke(unittest.TestCase):
         # Use ollama so the agent loop takes the XML tool-call path
         self._orig_backend = wrencode.BACKEND
         wrencode.apply_backend("ollama")
-        self._orig_get_response = wrencode.get_response
+
+    def _mock_get_response(self, fn):
+        patcher = mock.patch.object(wrencode, "get_response", fn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         import shutil
@@ -963,7 +1376,6 @@ class TestAgentLoopSmoke(unittest.TestCase):
             os.environ["WRENCODE_AUTO_APPROVE"] = self._orig_auto_approve
         elif "WRENCODE_AUTO_APPROVE" in os.environ:
             del os.environ["WRENCODE_AUTO_APPROVE"]
-        wrencode.get_response = self._orig_get_response
         wrencode.BACKEND = self._orig_backend
 
     def test_one_tool_call_then_final_answer(self):
@@ -980,9 +1392,11 @@ class TestAgentLoopSmoke(unittest.TestCase):
                 return '<tool_call>{"tool": "read", "args": {"path": "greeting.txt"}}</tool_call>'
             return "The file says: Hello from wrencode!"
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
-        messages = [{"role": "user", "content": "Read greeting.txt for me"}]
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": "Read greeting.txt for me"}
+        ]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=5)
 
         # Two get_response calls: one tool call + one final answer
@@ -1015,12 +1429,136 @@ class TestAgentLoopSmoke(unittest.TestCase):
             call_count[0] += 1
             return "Just a plain answer, no tools needed."
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
         messages = [{"role": "user", "content": "Say hello"}]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=5)
 
         self.assertEqual(call_count[0], 1)
+
+    def _task_reply(self, *prompts):
+        return "".join(
+            "<tool_call>"
+            + json.dumps({"tool": "task", "args": {"prompt": p}})
+            + "</tool_call>"
+            for p in prompts
+        )
+
+    def test_task_tool_runs_subagents(self):
+        """Two task calls in one reply each run a subagent; results reach the parent."""
+        answers = {"count a": "a is 1", "count b": "b is 2"}
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            first = wrencode.flatten_content(messages[0]["content"])
+            if first in answers:
+                return answers[first]
+            if len(messages) == 1:
+                return self._task_reply("count a", "count b")
+            return "Both counted."
+
+        self._mock_get_response(mock_get_response)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "count both"}]
+        with mock.patch("sys.stdout", io.StringIO()):
+            reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
+        self.assertEqual(reason, "done")
+        results = messages[2]["content"]
+        # Results keep the order of the calls, whichever subagent finished first.
+        self.assertIn("a is 1", results[0]["content"])
+        self.assertIn("b is 2", results[1]["content"])
+        self.assertEqual(
+            wrencode.flatten_content(messages[-1]["content"]), "Both counted."
+        )
+
+    def test_subagents_run_at_the_same_time(self):
+        """Three subagents must all be waiting at once to pass the barrier."""
+        import threading
+
+        barrier = threading.Barrier(3, timeout=5)
+
+        def mock_get_response(messages, system_prompt, mlx_state):
+            first = wrencode.flatten_content(messages[0]["content"])
+            if first.startswith("part"):
+                barrier.wait()  # raises BrokenBarrierError if they ran in turn
+                return f"{first} done"
+            if len(messages) == 1:
+                return self._task_reply("part 1", "part 2", "part 3")
+            return "All parts done."
+
+        self._mock_get_response(mock_get_response)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
+        self.assertEqual(reason, "done")
+        results = [b["content"] for b in messages[2]["content"]]
+        self.assertEqual(results, ["part 1 done", "part 2 done", "part 3 done"])
+        text = strip_ansi(out.getvalue())
+        self.assertIn("running 3 subagents in parallel", text)
+        for tag in ("[1]", "[2]", "[3]"):
+            self.assertIn(tag, text)
+
+    def test_local_weights_run_subagents_in_order(self):
+        calls = [wrencode.ToolCall(str(i), "task", {"prompt": "x"}) for i in range(2)]
+        with mock.patch.object(wrencode, "BACKEND", "mlx"):
+            self.assertEqual(wrencode._run_parallel_tasks(calls), {})
+        with mock.patch.object(wrencode, "MAX_PARALLEL_SUBAGENTS", 1):
+            self.assertEqual(wrencode._run_parallel_tasks(calls), {})
+
+    def test_cancel_stops_the_batch(self):
+        def mock_get_response(messages, system_prompt, mlx_state):
+            first = wrencode.flatten_content(messages[0]["content"])
+            if first.startswith("slow"):
+                wrencode._CANCEL_REQUESTED.set()  # as if Escape was pressed
+                return "partial"
+            return self._task_reply("slow 1", "slow 2")
+
+        self._mock_get_response(mock_get_response)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
+        with mock.patch("sys.stdout", io.StringIO()):
+            reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
+        self.assertEqual(reason, "cancelled")
+        self.assertFalse(wrencode._CANCEL_REQUESTED.is_set())
+
+    def test_subagent_depth_is_per_thread(self):
+        import threading
+
+        seen: list[int] = []
+
+        def probe():
+            seen.append(wrencode._subagent_depth())
+
+        wrencode._AGENT_LOCAL.depth = 1
+        try:
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+        finally:
+            wrencode._AGENT_LOCAL.depth = 0
+        self.assertEqual(seen, [0])
+
+    def test_approval_holds_other_agents_output(self):
+        import threading
+
+        real = io.StringIO()
+        out = wrencode._AgentStdout(real)
+        wrencode._AGENT_LOCAL.tag = "1"
+        try:
+            out.hold()  # agent 1 is at an approval prompt
+            other = threading.Thread(
+                target=lambda: (
+                    setattr(wrencode._AGENT_LOCAL, "tag", "2"),
+                    out.write("from two\n"),
+                )
+            )
+            other.start()
+            other.join()
+            out.write("Approve? ")
+            self.assertEqual(real.getvalue(), "Approve? ")  # agent 2 is held
+            out.release()
+        finally:
+            del wrencode._AGENT_LOCAL.tag
+        self.assertIn("from two", strip_ansi(real.getvalue()))
+        self.assertIn("[2] from two", strip_ansi(real.getvalue()))
 
     def test_tool_call_dispatches_real_tool(self):
         """Verify that run_tool dispatches to the real read implementation."""
@@ -1038,7 +1576,7 @@ class TestAgentLoopSmoke(unittest.TestCase):
             call_count[0] += 1
             return '<tool_call>{"tool": "glob", "args": {"pat": "*.txt"}}</tool_call>'
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
         messages = [{"role": "user", "content": "loop forever"}]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=3)
@@ -1052,7 +1590,7 @@ class TestAgentLoopSmoke(unittest.TestCase):
             call_count[0] += 1
             return '<tool_call>{"tool": "read", "args": {"path": "missing.txt"}}</tool_call>'
 
-        wrencode.get_response = mock_get_response
+        self._mock_get_response(mock_get_response)
 
         messages = [{"role": "user", "content": "keep retrying"}]
         wrencode.run_agent_turn(messages, "You are helpful.", None, max_iters=20)
@@ -1188,7 +1726,7 @@ class TestCertifiTrustStore(unittest.TestCase):
             import certifi
         except ImportError:
             self.skipTest("certifi not installed in this environment")
-        cert_file = os.environ.get("SSL_CERT_FILE")
+        cert_file = os.environ.get("SSL_CERT_FILE", "")
         self.assertEqual(cert_file, certifi.where())
         self.assertTrue(os.path.exists(cert_file))
 
@@ -1361,8 +1899,12 @@ class TestBedrockBackend(unittest.TestCase):
             captured["url"] = url
             captured["body"] = json.loads(data)
             captured["headers"] = headers
-            return {"output": {"message": {"role": "assistant",
-                    "content": [{"text": "ok"}]}}, "stopReason": "end_turn"}
+            return {
+                "output": {
+                    "message": {"role": "assistant", "content": [{"text": "ok"}]}
+                },
+                "stopReason": "end_turn",
+            }
 
         with mock.patch.dict(
             os.environ,
@@ -1385,24 +1927,47 @@ class TestBedrockBackend(unittest.TestCase):
         self.assertNotIn("anthropic_version", body)
         self.assertEqual(body["system"], [{"text": "sys-prompt"}])
         self.assertEqual(body["inferenceConfig"]["maxTokens"], wrencode.MAX_TOKENS)
-        self.assertEqual(body["messages"][0]["content"], [{"text": "hi"}])  # str -> [{text}]
+        self.assertEqual(
+            body["messages"][0]["content"], [{"text": "hi"}]
+        )  # str -> [{text}]
         self.assertIn("toolSpec", body["toolConfig"]["tools"][0])
         self.assertIn("Authorization", captured["headers"])
         # The host is bedrock-runtime.*, but the SigV4 credential scope must name
         # the signing service "bedrock" — AWS 403s on "bedrock-runtime" here.
-        self.assertIn("/us-east-1/bedrock/aws4_request", captured["headers"]["Authorization"])
-        self.assertNotIn("/bedrock-runtime/aws4_request", captured["headers"]["Authorization"])
+        self.assertIn(
+            "/us-east-1/bedrock/aws4_request", captured["headers"]["Authorization"]
+        )
+        self.assertNotIn(
+            "/bedrock-runtime/aws4_request", captured["headers"]["Authorization"]
+        )
         # The returned raw JSON parses back to text via the native path.
-        self.assertEqual(json.loads(raw)["output"]["message"]["content"][0]["text"], "ok")
+        self.assertEqual(
+            json.loads(raw)["output"]["message"]["content"][0]["text"], "ok"
+        )
 
     def test_bedrock_response_parse_and_append_roundtrip(self):
         # Converse response -> parsed text + ToolCall, and the history append uses
         # Converse blocks (assistant content + toolResult) so the next turn is valid.
         with mock.patch.object(wrencode, "BACKEND", "bedrock"):
-            data = {"output": {"message": {"role": "assistant", "content": [
-                {"text": "let me read"},
-                {"toolUse": {"toolUseId": "tu1", "name": "read", "input": {"path": "x"}}},
-            ]}}, "stopReason": "tool_use", "usage": {"inputTokens": 5, "outputTokens": 7}}
+            data = {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"text": "let me read"},
+                            {
+                                "toolUse": {
+                                    "toolUseId": "tu1",
+                                    "name": "read",
+                                    "input": {"path": "x"},
+                                }
+                            },
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 5, "outputTokens": 7},
+            }
             text, calls = wrencode._parse_native_response(data)
             self.assertEqual(text, "let me read")
             self.assertEqual(calls[0].id, "tu1")
@@ -1430,21 +1995,37 @@ class TestSynthesize(unittest.TestCase):
         raw = self._jsonl(
             {"type": "mode", "mode": "default"},  # non-message line ignored
             {"type": "user", "message": {"role": "user", "content": "fix the bug"}},
-            {"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "thinking", "text": "hmm"},          # dropped
-                {"type": "text", "text": "Found it in foo.py"},
-                {"type": "tool_use", "name": "read", "input": {}},  # dropped
-            ]}},
-            {"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "content": "bytes"}]}},  # dropped (list)
-            {"type": "user", "message": {"role": "user",
-                                         "content": "<system-reminder>x"}},  # skipped
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "text": "hmm"},  # dropped
+                        {"type": "text", "text": "Found it in foo.py"},
+                        {"type": "tool_use", "name": "read", "input": {}},  # dropped
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "content": "bytes"}],
+                },
+            },  # dropped (list)
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "<system-reminder>x"},
+            },  # skipped
         )
         turns = wrencode._parse_claude_code_jsonl(raw)
-        self.assertEqual(turns, [
-            {"role": "user", "text": "fix the bug"},
-            {"role": "assistant", "text": "Found it in foo.py"},
-        ])
+        self.assertEqual(
+            turns,
+            [
+                {"role": "user", "text": "fix the bug"},
+                {"role": "assistant", "text": "Found it in foo.py"},
+            ],
+        )
 
     def test_normalize_rejects_non_jsonl(self):
         self.assertIsNone(wrencode._parse_claude_code_jsonl("# just markdown\nhello"))
@@ -1454,37 +2035,51 @@ class TestSynthesize(unittest.TestCase):
         raw = self._jsonl(
             {"role": "user", "content": "build X"},
             {"sender": "ai", "text": "done, edited y.py"},
-            {"role": "system", "content": "ignored"},   # non-user/assistant dropped
+            {"role": "system", "content": "ignored"},  # non-user/assistant dropped
         )
-        self.assertEqual(wrencode._adapt_generic_jsonl(raw), [
-            {"role": "user", "text": "build X"},
-            {"role": "assistant", "text": "done, edited y.py"},
-        ])
+        self.assertEqual(
+            wrencode._adapt_generic_jsonl(raw),
+            [
+                {"role": "user", "text": "build X"},
+                {"role": "assistant", "text": "done, edited y.py"},
+            ],
+        )
 
     def test_messages_json_adapter_handles_array_and_wrapper(self):
-        arr = json.dumps([{"role": "user", "content": "hi"},
-                          {"role": "assistant", "content": [{"text": "yo"}]}])
-        self.assertEqual(wrencode._adapt_messages_json(arr), [
-            {"role": "user", "text": "hi"},
-            {"role": "assistant", "text": "yo"},
-        ])
+        arr = json.dumps(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"text": "yo"}]},
+            ]
+        )
+        self.assertEqual(
+            wrencode._adapt_messages_json(arr),
+            [
+                {"role": "user", "text": "hi"},
+                {"role": "assistant", "text": "yo"},
+            ],
+        )
         wrapped = json.dumps({"messages": [{"role": "user", "content": "hey"}]})
-        self.assertEqual(wrencode._adapt_messages_json(wrapped),
-                         [{"role": "user", "text": "hey"}])
+        self.assertEqual(
+            wrencode._adapt_messages_json(wrapped), [{"role": "user", "text": "hey"}]
+        )
         self.assertIsNone(wrencode._adapt_messages_json('{"no": "messages"}'))
 
     def test_coerce_text_flattens_blocks(self):
-        self.assertEqual(wrencode._coerce_text([{"text": "a"}, {"content": "b"}]), "a\nb")
+        self.assertEqual(
+            wrencode._coerce_text([{"text": "a"}, {"content": "b"}]), "a\nb"
+        )
         self.assertEqual(wrencode._coerce_text("plain"), "plain")
         self.assertEqual(wrencode._coerce_text({"text": "nested"}), "nested")
 
     def test_normalize_reports_adapter_source(self):
-        cc = self._jsonl({"type": "user",
-                          "message": {"role": "user", "content": "hi"}})
+        cc = self._jsonl({"type": "user", "message": {"role": "user", "content": "hi"}})
         generic = self._jsonl({"role": "user", "content": "hi"})
         with tempfile.TemporaryDirectory() as d:
-            for name, raw, want in [("a.jsonl", cc, "claude-code"),
-                                    ("b.jsonl", generic, "jsonl")]:
+            for name, raw, want in [
+                ("a.jsonl", cc, "claude-code"),
+                ("b.jsonl", generic, "jsonl"),
+            ]:
                 p = pathlib.Path(d) / name
                 p.write_text(raw)
                 self.assertEqual(wrencode._synth_normalize(str(p))["source"], want)
@@ -1525,10 +2120,13 @@ class TestSynthesize(unittest.TestCase):
 
     def test_extract_forces_json_and_tags_provenance(self):
         chat = {"id": "abcd1234", "turns": [{"role": "user", "text": "hi"}]}
-        payload = '"decisions": ["use Converse"], "problems_solved": [], ' \
-                  '"files_touched": ["wrencode.py"], "open_questions": []}'
-        with mock.patch.object(wrencode, "_synth_complete",
-                               return_value="{" + payload) as m:
+        payload = (
+            '"decisions": ["use Converse"], "problems_solved": [], '
+            '"files_touched": ["wrencode.py"], "open_questions": []}'
+        )
+        with mock.patch.object(
+            wrencode, "_synth_complete", return_value="{" + payload
+        ) as m:
             facts = wrencode._synth_extract(chat)
         # extraction is forced via assistant prefill "{"
         self.assertEqual(m.call_args.kwargs.get("prefill"), "{")
@@ -1537,8 +2135,11 @@ class TestSynthesize(unittest.TestCase):
 
     def test_extract_survives_unparseable_output(self):
         chat = {"id": "ffff", "turns": [{"role": "user", "text": "hi"}]}
-        with mock.patch.object(wrencode, "_synth_complete",
-                               return_value="Let me continue the chat instead..."):
+        with mock.patch.object(
+            wrencode,
+            "_synth_complete",
+            return_value="Let me continue the chat instead...",
+        ):
             facts = wrencode._synth_extract(chat)
         self.assertEqual(facts["chat"], "ffff")
         self.assertEqual(facts["decisions"], [])
@@ -1548,24 +2149,33 @@ class TestSynthesize(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             a = pathlib.Path(d) / "a.jsonl"
             b = pathlib.Path(d) / "b.jsonl"
-            a.write_text(json.dumps(
-                {"type": "user", "message": {"role": "user", "content": "task A"}}))
-            b.write_text(json.dumps(
-                {"type": "user", "message": {"role": "user", "content": "task B"}}))
+            a.write_text(
+                json.dumps(
+                    {"type": "user", "message": {"role": "user", "content": "task A"}}
+                )
+            )
+            b.write_text(
+                json.dumps(
+                    {"type": "user", "message": {"role": "user", "content": "task B"}}
+                )
+            )
             out = pathlib.Path(d) / "synthesis.md"
-            extract_json = ('{"decisions": ["d"], "problems_solved": [], '
-                            '"files_touched": [], "open_questions": []}')
+            extract_json = (
+                '{"decisions": ["d"], "problems_solved": [], '
+                '"files_touched": [], "open_questions": []}'
+            )
             # one extract call per file, then one reconcile call
-            with mock.patch.object(wrencode, "_synth_complete",
-                                   side_effect=[extract_json, extract_json,
-                                                "# SYNTHESIS\nmerged"]):
+            with mock.patch.object(
+                wrencode,
+                "_synth_complete",
+                side_effect=[extract_json, extract_json, "# SYNTHESIS\nmerged"],
+            ):
                 wrencode.run_synthesize([str(a), str(b)], out=str(out))
             self.assertEqual(out.read_text(), "# SYNTHESIS\nmerged")
 
     def test_run_synthesize_errors_when_no_transcripts(self):
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(SystemExit):
-                wrencode.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit):
+            wrencode.run_synthesize([str(pathlib.Path(d) / "missing.jsonl")])
 
 
 class TestNanoGPTBackend(unittest.TestCase):
@@ -1598,13 +2208,25 @@ class TestNanoGPTBackend(unittest.TestCase):
                 "role": "assistant",
                 "content": [
                     {"type": "text", "text": "Checking."},
-                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "wc -l f"}},
-                    {"type": "tool_use", "id": "t2", "name": "bash", "input": {"cmd": "ls"}},
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "bash",
+                        "input": {"cmd": "wc -l f"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "bash",
+                        "input": {"cmd": "ls"},
+                    },
                 ],
             },
             {
                 "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "3 f"}],
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "3 f"}
+                ],
             },
         ]
         out = wrencode._to_openai_messages(history)
@@ -1613,13 +2235,18 @@ class TestNanoGPTBackend(unittest.TestCase):
         # unanswered t2 is dropped so every tool_call id has a result
         self.assertEqual([c["id"] for c in out[1]["tool_calls"]], ["t1"])
         self.assertEqual(
-            json.loads(out[1]["tool_calls"][0]["function"]["arguments"]), {"cmd": "wc -l f"}
+            json.loads(out[1]["tool_calls"][0]["function"]["arguments"]),
+            {"cmd": "wc -l f"},
         )
-        self.assertEqual(out[2], {"role": "tool", "tool_call_id": "t1", "content": "3 f"})
+        self.assertEqual(
+            out[2], {"role": "tool", "tool_call_id": "t1", "content": "3 f"}
+        )
         self.assertEqual(len(out), 3)
 
     def test_xml_tool_tags_in_history_are_defanged(self):
-        history = [{"role": "assistant", "content": '<tool_call>{"tool": "ls"}</tool_call>'}]
+        history = [
+            {"role": "assistant", "content": '<tool_call>{"tool": "ls"}</tool_call>'}
+        ]
         out = wrencode._to_openai_messages(history)
         self.assertNotIn("<tool_call>", out[0]["content"])
         self.assertNotIn("</tool_call>", out[0]["content"])
@@ -1628,7 +2255,9 @@ class TestNanoGPTBackend(unittest.TestCase):
         history = [
             {
                 "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}],
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "x", "content": "ok"}
+                ],
             }
         ]
         self.assertEqual(
@@ -1639,9 +2268,17 @@ class TestNanoGPTBackend(unittest.TestCase):
     def test_native_openai_messages_pass_through(self):
         history = [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
-            ]},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "ls", "arguments": "{}"},
+                    }
+                ],
+            },
             {"role": "tool", "tool_call_id": "c1", "content": "a.py"},
         ]
         self.assertEqual(wrencode._to_openai_messages(history), history)
@@ -1689,7 +2326,9 @@ class TestAgentsMd(unittest.TestCase):
         (self._tmp / "config").mkdir()
         (self._tmp / "config" / "AGENTS.md").write_text("mine")
         (self.ws / "AGENTS.md").write_text("project")
-        self.assertEqual(wrencode.find_agents_files()[0], self._tmp / "config" / "AGENTS.md")
+        self.assertEqual(
+            wrencode.find_agents_files()[0], self._tmp / "config" / "AGENTS.md"
+        )
 
     def test_outside_git_only_workspace(self):
         import shutil
@@ -1746,7 +2385,10 @@ class TestHeadless(unittest.TestCase):
     def test_stdout_is_only_the_answer(self):
         (self._tmp / "a.txt").write_text("hi")
         code, out, err = self.run_headless(
-            ['<tool_call>{"tool": "read", "args": {"path": "a.txt"}}</tool_call>', "Done."]
+            [
+                '<tool_call>{"tool": "read", "args": {"path": "a.txt"}}</tool_call>',
+                "Done.",
+            ]
         )
         self.assertEqual((code, out), (0, "Done.\n"))
         self.assertIn("read a.txt", err)
@@ -1800,7 +2442,9 @@ class TestHeadless(unittest.TestCase):
         ):
             code = wrencode.run_headless("x", "json")
         data = json.loads(out.getvalue())
-        self.assertEqual((code, data["error"], data["stop_reason"]), (1, "HTTP 401", "error"))
+        self.assertEqual(
+            (code, data["error"], data["stop_reason"]), (1, "HTTP 401", "error")
+        )
 
     def test_setup_failure_still_reports_json(self):
         def no_backend():
@@ -1825,7 +2469,16 @@ class TestHeadless(unittest.TestCase):
         self.assertIsNone(wrencode._arg_value(["-p"], "-p"))
 
     def test_main_dispatch(self):
-        argv = ["wrencode", "--yes", "-p", "fix it", "--output-format", "json", "--max-turns", "3"]
+        argv = [
+            "wrencode",
+            "--yes",
+            "-p",
+            "fix it",
+            "--output-format",
+            "json",
+            "--max-turns",
+            "3",
+        ]
         with (
             mock.patch.object(sys, "argv", argv),
             mock.patch.object(wrencode, "run_headless", return_value=0) as run,
@@ -1860,7 +2513,7 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         test = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *a):
+            def log_message(self, format: str, *args: Any) -> None:
                 pass
 
             def _send(self, payload):
@@ -1885,7 +2538,10 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
                             {
                                 "id": "c1",
                                 "type": "function",
-                                "function": {"name": "glob", "arguments": '{"pat": "*.txt"}'},
+                                "function": {
+                                    "name": "glob",
+                                    "arguments": '{"pat": "*.txt"}',
+                                },
                             }
                         ],
                     }
@@ -1901,7 +2557,10 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         self._patches = [
             mock.patch.dict(
                 os.environ,
-                {"OPENAI_COMPATIBLE_BASE_URL": base, "WRENCODE_WORKSPACE": str(self._tmp)},
+                {
+                    "OPENAI_COMPATIBLE_BASE_URL": base,
+                    "WRENCODE_WORKSPACE": str(self._tmp),
+                },
             ),
             mock.patch.object(wrencode, "_HEADLESS", False),
             mock.patch.object(wrencode, "CONFIG_DIR", self._tmp / "config"),
@@ -1910,7 +2569,12 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
             p.start()
         for var in ("MODEL", "OPENAI_COMPATIBLE_API_KEY"):
             os.environ.pop(var, None)
-        self._saved = (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY, wrencode.API_BASE)
+        self._saved = (
+            wrencode.BACKEND,
+            wrencode.MODEL,
+            wrencode.API_KEY,
+            wrencode.API_BASE,
+        )
 
     def tearDown(self):
         import shutil
@@ -1919,7 +2583,9 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         self.server.server_close()
         for p in self._patches:
             p.stop()
-        (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY, wrencode.API_BASE) = self._saved
+        (wrencode.BACKEND, wrencode.MODEL, wrencode.API_KEY, wrencode.API_BASE) = (
+            self._saved
+        )
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def headless(self):
@@ -1934,7 +2600,8 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
 
     def test_base_url_normalized(self):
         with mock.patch.dict(
-            os.environ, {"OPENAI_COMPATIBLE_BASE_URL": "http://h:8080/v1/chat/completions/"}
+            os.environ,
+            {"OPENAI_COMPATIBLE_BASE_URL": "http://h:8080/v1/chat/completions/"},
         ):
             wrencode.apply_backend("openai-compatible")
         self.assertEqual(wrencode.API_BASE, "http://h:8080/v1/chat/completions")
@@ -1975,7 +2642,7 @@ class TestOpenAICompatibleBackend(unittest.TestCase):
         def deny(*a, **k):
             import urllib.error
 
-            raise urllib.error.HTTPError("u", 401, "x", {}, io.BytesIO(b""))
+            raise urllib.error.HTTPError("u", 401, "x", Message(), io.BytesIO(b""))
 
         err = io.StringIO()
         with (
@@ -2017,12 +2684,17 @@ class TestAutoCompact(unittest.TestCase):
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
-                        {"id": f"c{i}", "type": "function",
-                         "function": {"name": "read", "arguments": "{}"}}
+                        {
+                            "id": f"c{i}",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                        }
                     ],
                 }
             )
-            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 1500})
+            msgs.append(
+                {"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 1500}
+            )
         return msgs
 
     def test_keeps_tail_paired_and_task_verbatim(self):
@@ -2040,12 +2712,28 @@ class TestAutoCompact(unittest.TestCase):
         self.assertEqual(wrencode._to_openai_messages(msgs), msgs)  # nothing orphaned
 
     def test_anthropic_blocks_stay_paired(self):
-        msgs = [{"role": "user", "content": "go"}]
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
         for i in range(12):
-            msgs.append({"role": "assistant", "content": [
-                {"type": "tool_use", "id": f"t{i}", "name": "read", "input": {}}]})
-            msgs.append({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": f"t{i}", "content": "y" * 2000}]})
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": f"t{i}", "name": "read", "input": {}}
+                    ],
+                }
+            )
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"t{i}",
+                            "content": "y" * 2000,
+                        }
+                    ],
+                }
+            )
         wrencode.auto_compact(msgs, None)
         roles = [m["role"] for m in msgs]
         self.assertEqual(roles[:2], ["user", "assistant"])
@@ -2072,13 +2760,17 @@ class TestAutoCompact(unittest.TestCase):
 
     def test_summary_failure_drops_history_with_note(self):
         msgs = self.openai_history(20)
-        with mock.patch.object(wrencode, "_summarize", side_effect=RuntimeError("nope")):
+        with mock.patch.object(
+            wrencode, "_summarize", side_effect=RuntimeError("nope")
+        ):
             wrencode.auto_compact(msgs, None)
         self.assertIn("dropped to fit the context window", msgs[0]["content"])
         self.assertIn("build the thing", msgs[0]["content"])
 
     def test_transcript_defangs_and_cuts_middle(self):
-        msgs = [{"role": "assistant", "content": '<tool_call>{"tool": "x"}</tool_call>'}]
+        msgs = [
+            {"role": "assistant", "content": '<tool_call>{"tool": "x"}</tool_call>'}
+        ]
         msgs += [{"role": "user", "content": f"m{i} " + "z" * 1000} for i in range(50)]
         out = wrencode._transcript(msgs, 5000)
         self.assertNotIn("<tool_call>", out)
@@ -2115,7 +2807,9 @@ class TestAutoCompactInLoop(unittest.TestCase):
         msgs = [{"role": "user", "content": "read it a lot"}]
         with (
             mock.patch.object(wrencode, "get_response", lambda *a: next(replies)),
-            mock.patch.object(wrencode, "auto_compact", wraps=wrencode.auto_compact) as ac,
+            mock.patch.object(
+                wrencode, "auto_compact", wraps=wrencode.auto_compact
+            ) as ac,
             mock.patch.object(wrencode, "_summarize", return_value="S"),
         ):
             reason = wrencode.run_agent_turn(msgs, "sys", None)
@@ -2129,7 +2823,9 @@ class TestAutoCompactInLoop(unittest.TestCase):
         def get_response(*a):
             calls.append(1)
             if len(calls) == 1:
-                raise Exception("HTTP 400: prompt is too long: 210000 tokens > 200000 maximum")
+                raise Exception(
+                    "HTTP 400: prompt is too long: 210000 tokens > 200000 maximum"
+                )
             return "ok"
 
         msgs = [{"role": "user", "content": "hi"}]
@@ -2142,7 +2838,9 @@ class TestAutoCompactInLoop(unittest.TestCase):
 
     def test_repeated_context_error_raises(self):
         def get_response(*a):
-            raise Exception("HTTP 400: This model's maximum context length is 8192 tokens")
+            raise Exception(
+                "HTTP 400: This model's maximum context length is 8192 tokens"
+            )
 
         with (
             mock.patch.object(wrencode, "get_response", get_response),
@@ -2181,13 +2879,15 @@ class TestHttpRetry(unittest.TestCase):
     def http_error(self, code):
         import urllib.error
 
-        return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b"busy"))
+        return urllib.error.HTTPError("u", code, "x", Message(), io.BytesIO(b"busy"))
 
     def test_retries_server_errors_then_succeeds(self):
         ok = mock.MagicMock()
         ok.__enter__.return_value = io.BytesIO(b'{"ok": 1}')
         with (
-            mock.patch("urllib.request.urlopen", side_effect=[self.http_error(503), ok]) as op,
+            mock.patch(
+                "urllib.request.urlopen", side_effect=[self.http_error(503), ok]
+            ) as op,
             mock.patch("time.sleep") as sleep,
             mock.patch("sys.stderr", io.StringIO()),
         ):
@@ -2198,7 +2898,10 @@ class TestHttpRetry(unittest.TestCase):
 
     def test_gives_up_after_retries(self):
         with (
-            mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: (_ for _ in ()).throw(self.http_error(429))) as op,
+            mock.patch(
+                "urllib.request.urlopen",
+                side_effect=lambda *a, **k: (_ for _ in ()).throw(self.http_error(429)),
+            ) as op,
             mock.patch("time.sleep"),
             mock.patch("sys.stderr", io.StringIO()),
             self.assertRaisesRegex(Exception, "HTTP 429: busy"),
@@ -2216,35 +2919,47 @@ class TestHttpRetry(unittest.TestCase):
         import urllib.error
 
         for err in (
-            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            http.client.RemoteDisconnected(
+                "Remote end closed connection without response"
+            ),
             TimeoutError("The read operation timed out"),
             urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")),
             ConnectionResetError(54, "Connection reset by peer"),
         ):
             with (
-                mock.patch("urllib.request.urlopen", side_effect=[err, self.ok_response()]) as op,
+                mock.patch(
+                    "urllib.request.urlopen", side_effect=[err, self.ok_response()]
+                ) as op,
                 mock.patch("time.sleep") as sleep,
                 mock.patch("sys.stderr", io.StringIO()) as stderr,
             ):
-                self.assertEqual(wrencode._http_post_raw("http://x", b"{}", {}), {"ok": 1})
+                self.assertEqual(
+                    wrencode._http_post_raw("http://x", b"{}", {}), {"ok": 1}
+                )
             self.assertEqual(op.call_count, 2, err)
             sleep.assert_called_once_with(2)
             self.assertIn("Network error", stderr.getvalue())
 
     def test_network_error_raised_after_retries(self):
         with (
-            mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")) as op,
+            mock.patch(
+                "urllib.request.urlopen", side_effect=TimeoutError("timed out")
+            ) as op,
             mock.patch("time.sleep") as sleep,
             mock.patch("sys.stderr", io.StringIO()),
             self.assertRaisesRegex(TimeoutError, "timed out"),
         ):
             wrencode._http_post_raw("http://x", b"{}", {})
         self.assertEqual(op.call_count, wrencode.HTTP_RETRIES + 1)
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2, 4][: wrencode.HTTP_RETRIES])
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list], [2, 4][: wrencode.HTTP_RETRIES]
+        )
 
     def test_client_errors_not_retried(self):
         with (
-            mock.patch("urllib.request.urlopen", side_effect=self.http_error(400)) as op,
+            mock.patch(
+                "urllib.request.urlopen", side_effect=self.http_error(400)
+            ) as op,
             self.assertRaisesRegex(Exception, "HTTP 400"),
         ):
             wrencode._http_post_raw("http://x", b"{}", {})
@@ -2267,15 +2982,25 @@ class TestTruncationRecovery(unittest.TestCase):
 
     @staticmethod
     def reply(content, finish):
-        return json.dumps({"choices": [{"message": {"role": "assistant", "content": content},
-                                        "finish_reason": finish}]})
+        return json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": finish,
+                    }
+                ]
+            }
+        )
 
     def test_nudges_after_empty_truncation(self):
         replies = iter([self.reply("", "length"), self.reply("All done.", "stop")])
         msgs = [{"role": "user", "content": "build it"}]
         with mock.patch.object(wrencode, "get_response", lambda *a: next(replies)):
             self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "done")
-        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "user", "assistant"])
+        self.assertEqual(
+            [m["role"] for m in msgs], ["user", "assistant", "user", "assistant"]
+        )
         self.assertEqual(msgs[2]["content"], wrencode.TRUNCATION_NUDGE)
         self.assertEqual(msgs[-1]["content"], "All done.")
         self.assertEqual(wrencode._to_openai_messages(msgs), msgs)
@@ -2287,11 +3012,15 @@ class TestTruncationRecovery(unittest.TestCase):
             msgs = [{"role": "user", "content": "x"}]
             reason = wrencode.run_agent_turn(msgs, "sys", None)
         self.assertEqual(reason, "max_tokens")
-        self.assertEqual(msgs.count({"role": "user", "content": wrencode.TRUNCATION_NUDGE}),
-                         wrencode.MAX_TRUNCATION_RETRIES)
+        self.assertEqual(
+            msgs.count({"role": "user", "content": wrencode.TRUNCATION_NUDGE}),
+            wrencode.MAX_TRUNCATION_RETRIES,
+        )
 
     def test_normal_stop_unaffected(self):
-        with mock.patch.object(wrencode, "get_response", lambda *a: self.reply("hi", "stop")):
+        with mock.patch.object(
+            wrencode, "get_response", lambda *a: self.reply("hi", "stop")
+        ):
             msgs = [{"role": "user", "content": "x"}]
             self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "done")
         self.assertEqual(len(msgs), 2)
@@ -2303,7 +3032,10 @@ class TestValidateJson(unittest.TestCase):
         "properties": {
             "verdict": {"enum": ["pass", "fail"]},
             "score": {"type": "integer", "minimum": 0, "maximum": 10},
-            "files": {"type": "array", "items": {"type": "string", "pattern": r"\.py$"}},
+            "files": {
+                "type": "array",
+                "items": {"type": "string", "pattern": r"\.py$"},
+            },
             "note": {"type": ["string", "null"], "maxLength": 5},
         },
         "required": ["verdict", "score"],
@@ -2315,19 +3047,31 @@ class TestValidateJson(unittest.TestCase):
         self.assertEqual(wrencode.validate_json(ok, self.SCHEMA), [])
 
     def test_errors_have_paths(self):
-        bad = {"verdict": "maybe", "score": 11.5, "files": ["a.txt"], "note": "toolong", "x": 1}
+        bad = {
+            "verdict": "maybe",
+            "score": 11.5,
+            "files": ["a.txt"],
+            "note": "toolong",
+            "x": 1,
+        }
         errs = wrencode.validate_json(bad, self.SCHEMA)
         joined = "\n".join(errs)
-        for frag in ("$.verdict: must be one of", "$.score: expected integer",
-                     "$.files[0]: doesn't match pattern", "$.note: longer than 5",
-                     "unexpected property 'x'"):
+        for frag in (
+            "$.verdict: must be one of",
+            "$.score: expected integer",
+            "$.files[0]: doesn't match pattern",
+            "$.note: longer than 5",
+            "unexpected property 'x'",
+        ):
             self.assertIn(frag, joined)
 
     def test_missing_required_and_bool_is_not_int(self):
         errs = wrencode.validate_json({"verdict": "pass", "score": True}, self.SCHEMA)
         self.assertTrue(any("$.score: expected integer" in e for e in errs))
-        self.assertIn("$: missing required property 'score'",
-                      wrencode.validate_json({"verdict": "fail"}, self.SCHEMA))
+        self.assertIn(
+            "$: missing required property 'score'",
+            wrencode.validate_json({"verdict": "fail"}, self.SCHEMA),
+        )
 
     def test_combinators(self):
         s = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
@@ -2340,7 +3084,10 @@ class TestValidateJson(unittest.TestCase):
 class TestStructuredOutput(unittest.TestCase):
     SCHEMA = {
         "type": "object",
-        "properties": {"bugs": {"type": "integer"}, "files": {"type": "array", "items": {"type": "string"}}},
+        "properties": {
+            "bugs": {"type": "integer"},
+            "files": {"type": "array", "items": {"type": "string"}},
+        },
         "required": ["bugs", "files"],
     }
 
@@ -2385,11 +3132,14 @@ class TestStructuredOutput(unittest.TestCase):
 
     @staticmethod
     def call(args):
-        return '<tool_call>{"tool": "respond", "args": %s}</tool_call>' % json.dumps(args)
+        return '<tool_call>{"tool": "respond", "args": %s}</tool_call>' % json.dumps(
+            args
+        )
 
     def test_valid_answer_ends_run(self):
         code, out, prompts = self.run_headless(
-            [self.call({"bugs": 2, "files": ["a.py"]}), "should not be asked"], self.SCHEMA
+            [self.call({"bugs": 2, "files": ["a.py"]}), "should not be asked"],
+            self.SCHEMA,
         )
         data = json.loads(out)
         self.assertEqual(code, 0)
@@ -2399,42 +3149,61 @@ class TestStructuredOutput(unittest.TestCase):
 
     def test_invalid_answer_gets_errors_then_retries(self):
         code, out, _ = self.run_headless(
-            [self.call({"bugs": "two"}), self.call({"bugs": 2, "files": []})], self.SCHEMA
+            [self.call({"bugs": "two"}), self.call({"bugs": 2, "files": []})],
+            self.SCHEMA,
         )
-        self.assertEqual((code, json.loads(out)["structured_output"]), (0, {"bugs": 2, "files": []}))
+        self.assertEqual(
+            (code, json.loads(out)["structured_output"]), (0, {"bugs": 2, "files": []})
+        )
 
     def test_text_mode_prints_the_json(self):
-        code, out, _ = self.run_headless([self.call({"bugs": 0, "files": []})], self.SCHEMA, "text")
+        code, out, _ = self.run_headless(
+            [self.call({"bugs": 0, "files": []})], self.SCHEMA, "text"
+        )
         self.assertEqual((code, json.loads(out)), (0, {"bugs": 0, "files": []}))
 
     def test_plain_reply_is_nudged_then_fails(self):
-        code, out, _ = self.run_headless(["two bugs", "still text", "and again"], self.SCHEMA)
+        code, out, _ = self.run_headless(
+            ["two bugs", "still text", "and again"], self.SCHEMA
+        )
         data = json.loads(out)
         self.assertEqual((code, data["stop_reason"]), (1, "no_structured_output"))
         self.assertIsNone(data["structured_output"])
 
     def test_non_object_schema_is_wrapped(self):
         code, out, _ = self.run_headless(
-            [self.call({"value": ["x", "y"]})], {"type": "array", "items": {"type": "string"}}
+            [self.call({"value": ["x", "y"]})],
+            {"type": "array", "items": {"type": "string"}},
         )
         self.assertEqual(json.loads(out)["structured_output"], ["x", "y"])
 
     def test_native_tool_schema_and_subagents(self):
         with mock.patch.object(wrencode, "_OUTPUT_SCHEMA", self.SCHEMA):
-            names = [t["function"]["name"] for t in wrencode._build_tool_schemas("openai")]
+            names = [
+                t["function"]["name"] for t in wrencode._build_tool_schemas("openai")
+            ]
             self.assertIn("respond", names)
-            with mock.patch.object(wrencode, "_SUBAGENT_DEPTH", 1):
-                names = [t["function"]["name"] for t in wrencode._build_tool_schemas("openai")]
+            with mock.patch.object(wrencode, "_subagent_depth", return_value=1):
+                names = [
+                    t["function"]["name"]
+                    for t in wrencode._build_tool_schemas("openai")
+                ]
                 self.assertNotIn("respond", names)
-                self.assertIn("only available", wrencode.respond({"bugs": 1, "files": []}))
-        self.assertNotIn("respond", [t["name"] for t in wrencode._build_tool_schemas("anthropic")])
+                self.assertIn(
+                    "only available", wrencode.respond({"bugs": 1, "files": []})
+                )
+        self.assertNotIn(
+            "respond", [t["name"] for t in wrencode._build_tool_schemas("anthropic")]
+        )
 
     def test_cli_schema_from_file_and_inline(self):
         path = self._tmp / "s.json"
         path.write_text(json.dumps(self.SCHEMA))
         for value in (str(path), json.dumps(self.SCHEMA)):
             with (
-                mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--json-schema", value]),
+                mock.patch.object(
+                    sys, "argv", ["wrencode", "-p", "x", "--json-schema", value]
+                ),
                 mock.patch.object(wrencode, "run_headless", return_value=0) as run,
                 self.assertRaises(SystemExit),
             ):
@@ -2443,7 +3212,9 @@ class TestStructuredOutput(unittest.TestCase):
 
     def test_cli_bad_schema(self):
         with (
-            mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--json-schema", "{nope"]),
+            mock.patch.object(
+                sys, "argv", ["wrencode", "-p", "x", "--json-schema", "{nope"]
+            ),
             mock.patch("sys.stdout", io.StringIO()),
             self.assertRaises(SystemExit) as cm,
         ):
@@ -2464,7 +3235,8 @@ class TestForgivingEdit(unittest.TestCase):
     def setUp(self):
         self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         self._env = mock.patch.dict(
-            os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}
+            os.environ,
+            {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"},
         )
         self._env.start()
         self._out = mock.patch("sys.stdout", io.StringIO())
@@ -2490,7 +3262,9 @@ class TestForgivingEdit(unittest.TestCase):
         self.assertTrue(result.startswith("ok (matched lines 2-3"), result)
         self.assertIn("added 4 chars", result)
         text = (self._tmp / "cart.py").read_text()
-        self.assertIn("    def remove(self, sku: str):\n        self.items.pop(sku, None)\n", text)
+        self.assertIn(
+            "    def remove(self, sku: str):\n        self.items.pop(sku, None)\n", text
+        )
         self.assertIn("    def subtotal", text)
 
     def test_over_indented_quote_is_dedented(self):
@@ -2500,12 +3274,16 @@ class TestForgivingEdit(unittest.TestCase):
 
     def test_inconsistent_shift_is_rejected(self):
         # def is 2 spaces short of the file, body 4 short: no single shift fits.
-        result = self.edit("  def remove(self, sku: str):\n    del self.items[sku]", "x")
+        result = self.edit(
+            "  def remove(self, sku: str):\n    del self.items[sku]", "x"
+        )
         self.assertTrue(result.startswith("error:"), result)
         self.assertEqual((self._tmp / "cart.py").read_text(), self.CART)
 
     def test_ambiguous_reindent_is_rejected(self):
-        (self._tmp / "cart.py").write_text("def a():\n    x = 1\n\ndef b():\n    x = 1\n")
+        (self._tmp / "cart.py").write_text(
+            "def a():\n    x = 1\n\ndef b():\n    x = 1\n"
+        )
         result = self.edit("x = 1", "x = 2")
         self.assertIn("appears 2 times", result)
 
@@ -2523,12 +3301,18 @@ class TestForgivingEdit(unittest.TestCase):
     def test_wrong_file_points_to_the_right_one(self):
         # Qwen3-8B's next failure: editing to_cents in cart.py; it lives in money.py.
         (self._tmp / "shop").mkdir()
-        (self._tmp / "shop" / "money.py").write_text("import os\n\ndef to_cents(s: str) -> int:\n    return 0\n")
-        result = self.edit("def to_cents(s: str) -> int:\n    return int(float(s) * 100)", "x")
+        (self._tmp / "shop" / "money.py").write_text(
+            "import os\n\ndef to_cents(s: str) -> int:\n    return 0\n"
+        )
+        result = self.edit(
+            "def to_cents(s: str) -> int:\n    return int(float(s) * 100)", "x"
+        )
         self.assertIn("isn't in cart.py but appears in shop/money.py:3", result)
 
     def test_no_hint_when_nowhere_else(self):
-        self.assertNotIn("did you mean", self.edit("def missing_function():\n    pass", "x"))
+        self.assertNotIn(
+            "did you mean", self.edit("def missing_function():\n    pass", "x")
+        )
 
     def test_reindented_result_still_syntax_checked(self):
         result = self.edit("return 0", "return (")
@@ -2540,7 +3324,10 @@ class TestRepeatedFailingCalls(unittest.TestCase):
         self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         (self._tmp / "f.py").write_text("x = 1\n")
         self._patches = [
-            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.dict(
+                os.environ,
+                {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"},
+            ),
             mock.patch.object(wrencode, "BACKEND", "ollama"),
             mock.patch("sys.stdout", io.StringIO()),
         ]
@@ -2563,8 +3350,11 @@ class TestRepeatedFailingCalls(unittest.TestCase):
             reason = wrencode.run_agent_turn(msgs, "sys", None)
         self.assertEqual(reason, "tool_errors")
         results = [
-            b["content"] for m in msgs if isinstance(m["content"], list)
-            for b in m["content"] if b.get("type") == "tool_result"
+            b["content"]
+            for m in msgs
+            if isinstance(m["content"], list)
+            for b in m["content"]
+            if b.get("type") == "tool_result"
         ]
         edits = [r for r in results if r.startswith("error:")]
         self.assertEqual(len(edits), wrencode.REPEATED_CALL_STOP)
@@ -2573,15 +3363,19 @@ class TestRepeatedFailingCalls(unittest.TestCase):
 
     def test_skipped_calls_still_get_results(self):
         bad = '{"tool": "edit", "args": {"path": "f.py", "old": "nope", "new": "z"}}'
-        batch = f"<tool_call>{bad}</tool_call><tool_call>{bad}</tool_call><tool_call>" + \
-            '{"tool": "glob", "args": {"pat": "*"}}</tool_call>'
-        msgs = [{"role": "user", "content": "go"}]
+        batch = (
+            f"<tool_call>{bad}</tool_call><tool_call>{bad}</tool_call><tool_call>"
+            + '{"tool": "glob", "args": {"pat": "*"}}</tool_call>'
+        )
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
         with (
             mock.patch.object(wrencode, "TOOL_ERROR_REPEAT_LIMIT", 2),
             mock.patch.object(wrencode, "get_response", lambda *a: batch),
         ):
             self.assertEqual(wrencode.run_agent_turn(msgs, "sys", None), "tool_errors")
-        ids_called = [b["id"] for b in msgs[1]["content"] if b.get("type") == "tool_use"]
+        ids_called = [
+            b["id"] for b in msgs[1]["content"] if b.get("type") == "tool_use"
+        ]
         ids_answered = [b["tool_use_id"] for b in msgs[2]["content"]]
         self.assertEqual(ids_called, ids_answered)
         self.assertTrue(msgs[2]["content"][-1]["content"].startswith("skipped"))
@@ -2591,7 +3385,10 @@ class TestVerify(unittest.TestCase):
     def setUp(self):
         self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         self._patches = [
-            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.dict(
+                os.environ,
+                {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"},
+            ),
             mock.patch.object(wrencode, "resolve_configuration", lambda: None),
             mock.patch.object(wrencode, "load_model", lambda: None),
             mock.patch.object(wrencode, "_HEADLESS", False),
@@ -2627,13 +3424,19 @@ class TestVerify(unittest.TestCase):
 
     def test_false_done_is_sent_back_then_fixed(self):
         write = '<tool_call>{"tool": "write", "args": {"path": "ok.txt", "content": "y"}}</tool_call>'
-        code, data, prompts = self.headless(["All done!", write, "Now really done."], "test -f ok.txt")
-        self.assertEqual((code, data["verified"], data["stop_reason"]), (0, True, "done"))
+        code, data, prompts = self.headless(
+            ["All done!", write, "Now really done."], "test -f ok.txt"
+        )
+        self.assertEqual(
+            (code, data["verified"], data["stop_reason"]), (0, True, "done")
+        )
         self.assertIn("the check `test -f ok.txt` failed (exit code 1)", prompts[1])
 
     def test_gives_up_after_attempts(self):
         code, data, _ = self.headless(["done"] * 3, "echo nope; exit 3")
-        self.assertEqual((code, data["verified"], data["stop_reason"]), (1, False, "verify_failed"))
+        self.assertEqual(
+            (code, data["verified"], data["stop_reason"]), (1, False, "verify_failed")
+        )
         self.assertIn("exit code 3", data["verify_output"])
         self.assertIn("nope", data["verify_output"])
 
@@ -2647,7 +3450,9 @@ class TestVerify(unittest.TestCase):
 
     def test_cli_flag(self):
         with (
-            mock.patch.object(sys, "argv", ["wrencode", "-p", "x", "--verify", "make test"]),
+            mock.patch.object(
+                sys, "argv", ["wrencode", "-p", "x", "--verify", "make test"]
+            ),
             mock.patch.object(wrencode, "run_headless", return_value=0) as run,
             self.assertRaises(SystemExit),
         ):
@@ -2656,7 +3461,7 @@ class TestVerify(unittest.TestCase):
 
 
 # Trimmed from a real Qwen3-8B reply on vLLM: a "+" join inside the JSON arguments.
-QWEN3_GARBLED_CALL = "<tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\": \"shop/money.py\", \"old\": \"def to_cents(amount: str) -> int:\\n        \\\"\\\"\\\"Parse '12.34' or '12' into cents.\\\"\\\"\\\"\\n        if '.' in amount:\\n            whole, frac = amount.split('.')\" + \"\\n            return int(whole) * 100 + int(frac.ljust(</tool_call>"
+QWEN3_GARBLED_CALL = '<tool_call>\n{"name": "edit", "arguments": {"path": "shop/money.py", "old": "def to_cents(amount: str) -> int:\\n        \\"\\"\\"Parse \'12.34\' or \'12\' into cents.\\"\\"\\"\\n        if \'.\' in amount:\\n            whole, frac = amount.split(\'.\')" + "\\n            return int(whole) * 100 + int(frac.ljust(</tool_call>'
 
 
 class TestGarbledToolCalls(unittest.TestCase):
@@ -2664,7 +3469,10 @@ class TestGarbledToolCalls(unittest.TestCase):
         self._tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         (self._tmp / "a.txt").write_text("hello")
         self._patches = [
-            mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"}),
+            mock.patch.dict(
+                os.environ,
+                {"WRENCODE_WORKSPACE": str(self._tmp), "WRENCODE_AUTO_APPROVE": "1"},
+            ),
             mock.patch("sys.stdout", io.StringIO()),
         ]
         for p in self._patches:
@@ -2698,17 +3506,33 @@ class TestGarbledToolCalls(unittest.TestCase):
         why = wrencode._garbled_tool_call(QWEN3_GARBLED_CALL, native=True)
         self.assertIn("invalid JSON at character", why)
         self.assertIn("Expecting ',' delimiter", why)
-        self.assertIn('split(\'.\')" + "', why)
+        self.assertIn("split('.')\" + \"", why)
 
     def test_native_garbled_call_is_resent_not_final(self):
-        good = self.openai(None, [{"id": "c1", "type": "function",
-                                   "function": {"name": "read", "arguments": '{"path": "a.txt"}'}}])
-        reason, msgs = self.loop("openai", [self.openai(QWEN3_GARBLED_CALL), good, self.openai("Read it.")])
+        good = self.openai(
+            None,
+            [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path": "a.txt"}'},
+                }
+            ],
+        )
+        reason, msgs = self.loop(
+            "openai", [self.openai(QWEN3_GARBLED_CALL), good, self.openai("Read it.")]
+        )
         self.assertEqual(reason, "done")
         nudge = msgs[2]["content"]
-        self.assertTrue(nudge.startswith("Your last message contained a tool call that couldn't be run"))
+        self.assertTrue(
+            nudge.startswith(
+                "Your last message contained a tool call that couldn't be run"
+            )
+        )
         self.assertEqual(msgs[-1]["content"], "Read it.")
-        out = wrencode._to_openai_messages(msgs)  # history stays valid; the tag is defanged
+        out = wrencode._to_openai_messages(
+            msgs
+        )  # history stays valid; the tag is defanged
         self.assertEqual([m["role"] for m in out], [m["role"] for m in msgs])
         self.assertNotIn("<tool_call>", json.dumps(out))
 
@@ -2717,8 +3541,13 @@ class TestGarbledToolCalls(unittest.TestCase):
         good = '<tool_call>{"tool": "read", "args": {"path": "a.txt"}}</tool_call>'
         reason, msgs = self.loop("ollama", [bad, good, "It says hello."])
         self.assertEqual(reason, "done")
-        results = [b["content"] for m in msgs if isinstance(m["content"], list)
-                   for b in m["content"] if b.get("type") == "tool_result"]
+        results = [
+            b["content"]
+            for m in msgs
+            if isinstance(m["content"], list)
+            for b in m["content"]
+            if b.get("type") == "tool_result"
+        ]
         self.assertTrue(any("hello" in r for r in results))
 
     def test_gives_up_after_repeated_garbling(self):
@@ -2727,22 +3556,30 @@ class TestGarbledToolCalls(unittest.TestCase):
 
     def test_native_call_written_as_text(self):
         text = '<tool_call>{"name": "read", "arguments": {"path": "a.txt"}}</tool_call>'
-        self.assertIn("function-calling interface", wrencode._garbled_tool_call(text, native=True))
+        self.assertIn(
+            "function-calling interface", wrencode._garbled_tool_call(text, native=True)
+        )
 
     def test_xml_unknown_tool(self):
-        why = wrencode._garbled_tool_call('<tool_call>{"tool": "fly", "args": {}}</tool_call>', native=False)
+        why = wrencode._garbled_tool_call(
+            '<tool_call>{"tool": "fly", "args": {}}</tool_call>', native=False
+        )
         self.assertIn("unknown tool", why)
 
     def test_plain_final_answer_unaffected(self):
-        self.assertEqual(wrencode._garbled_tool_call("All done, tests pass.", native=True), "")
+        self.assertEqual(
+            wrencode._garbled_tool_call("All done, tests pass.", native=True), ""
+        )
 
     def test_hermes_shape_parsed_on_xml_path(self):
         calls = wrencode.parse_tool_calls(
             '<tool_call>{"name": "read", "arguments": {"path": "a.txt"}}</tool_call>'
             '<tool_call>{"name": "glob", "arguments": "{\\"pat\\": \\"*.txt\\"}"}</tool_call>'
         )
-        self.assertEqual([(c["name"], c["input"]) for c in calls],
-                         [("read", {"path": "a.txt"}), ("glob", {"pat": "*.txt"})])
+        self.assertEqual(
+            [(c["name"], c["input"]) for c in calls],
+            [("read", {"path": "a.txt"}), ("glob", {"pat": "*.txt"})],
+        )
 
 
 if __name__ == "__main__":
