@@ -1941,6 +1941,8 @@ def run_headless(
         }
         if backends.USAGE.session_calls:
             out["usage"] = backends.USAGE.as_dict()
+            if "cost_usd" in out["usage"]:
+                out["cost_usd"] = out["usage"]["cost_usd"]
         if sdk is not None:
             out["cost_usd"] = round(cost_usd, 6)
         if schema is not None:
@@ -2148,7 +2150,11 @@ def main() -> None:
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(ui.render_banner(ui.colors_enabled()))
-    print(f"{BOLD}wrencode{RESET} 🐦 | {DIM}{backends.BACKEND}:{backends.MODEL}{RESET}")
+    price = backends.price_for()
+    priced = f" · {price.label()}" if price is not None else ""
+    print(
+        f"{BOLD}wrencode{RESET} 🐦 | {DIM}{backends.BACKEND}:{backends.MODEL}{priced}{RESET}"
+    )
     mlx_state = backends.load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()
@@ -2181,9 +2187,18 @@ def main() -> None:
             f"{DIM}History mirrored to {_STORE.mirror.label} (/sync copies everything now){RESET}"
         )
 
+    def typing_hint(text: str) -> str:
+        """The estimated input cost of sending what's typed, under the prompt."""
+        if not SHOW_USAGE or backends.BACKEND == backends.AGENT_SDK_BACKEND:
+            return ""
+        context = (
+            0 if backends.USAGE.prompt else estimate_tokens(messages, system_prompt)
+        )
+        return backends.send_estimate(len(text), context)
+
     while True:
         try:
-            user_input = ui.read_user_input()
+            user_input = ui.read_user_input(typing_hint)
             if not user_input:
                 continue
             action, new_mlx = handle_slash_command(user_input, messages, mlx_state)

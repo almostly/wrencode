@@ -80,6 +80,56 @@ def _write_models_cache(cache: pathlib.Path, ids: list[str]) -> None:
     os.chmod(cache, 0o600)
 
 
+def _catalog_price(entry: dict[str, Any]) -> list[float] | None:
+    """[input, output, cache_read, cache_write] per million tokens from a catalog entry.
+
+    OpenRouter (and catalogs in its format) list `pricing` in USD per token as
+    strings: prompt, completion, and optionally input_cache_read and
+    input_cache_write. Missing cache rates count as the input rate.
+    """
+    pricing = entry.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+    try:
+        inp = float(pricing.get("prompt")) * 1e6
+        out = float(pricing.get("completion")) * 1e6
+        read = pricing.get("input_cache_read")
+        write = pricing.get("input_cache_write")
+        rates = [
+            inp,
+            out,
+            float(read) * 1e6 if read is not None else inp,
+            float(write) * 1e6 if write is not None else inp,
+        ]
+    except (TypeError, ValueError):
+        return None
+    if any(r < 0 for r in rates):
+        return None
+    return [round(r, 6) for r in rates]
+
+
+def _save_catalog_prices(backend: str, entries: list[Any]) -> int:
+    """Merge the prices a /models catalog lists into prices.json; returns how many."""
+    found = {
+        f"{backend}/{m['id']}": rates
+        for m in entries
+        if isinstance(m, dict) and m.get("id") and (rates := _catalog_price(m))
+    }
+    if not found:
+        return 0
+    path = backends.PRICES_FILE
+    saved: dict[str, Any] = {}
+    with contextlib.suppress(OSError, ValueError):
+        loaded = json.loads(path.read_text())
+        if isinstance(loaded, dict):
+            saved = loaded
+    saved.update(found)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True))
+    os.chmod(path, 0o600)
+    return len(found)
+
+
 def _api_key_for_backend(backend: str) -> str:
     """Resolve an API key for model fetches without requiring BACKEND == backend."""
     if env_key := backends._env_api_key(backend):
@@ -118,9 +168,11 @@ def _fetch_hosted_models(
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
-        ids = sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
+        entries = data.get("data", [])
+        ids = sorted(m.get("id", "") for m in entries if m.get("id"))
         if ids:
             _write_models_cache(cache, ids)
+            _save_catalog_prices(backend, entries)
         return ids or fallback
     except Exception as err:  # any failure falls back to the built-in list
         print(f"{YELLOW}Could not fetch {label} models: {err}{RESET}")
@@ -474,7 +526,7 @@ def verify_api_key() -> tuple[str, str]:
 def pick_model_interactive(backend: str) -> str | None:
     """Arrow-key model picker for a backend; returns model id or None."""
     models = list_models_for_backend(backend)
-    labels = models[:]
+    labels = _model_labels(backend, models)
     initial = models.index(backends.MODEL) if backends.MODEL in models else 0
     idx = ui.pick_from_list(
         f"Choose model ({backend})",
@@ -490,6 +542,19 @@ def pick_model_interactive(backend: str) -> str | None:
         custom = input(f"{BLUE}❯{RESET} model id [{default}]: ").strip()
         return custom or default
     return choice
+
+
+def _model_labels(backend: str, models: list[str]) -> list[str]:
+    """Model ids with their price alongside, when one is known."""
+    width = max((len(m) for m in models), default=0)
+    labels = []
+    for model in models:
+        price = backends.price_for(model, backend)
+        if price is None or model == CUSTOM_MODEL_OPTION:
+            labels.append(model)
+        else:
+            labels.append(f"{model:<{width}}  {DIM}{price.label()}{RESET}")
+    return labels
 
 
 def try_reload_model() -> Any:

@@ -13,6 +13,7 @@ import re
 import select
 import sys
 import threading
+from collections.abc import Callable
 from typing import Any
 
 _AGENT_LOCAL = threading.local()
@@ -120,7 +121,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/resume": "continue one: /resume <id>",
     "/search": "search past conversations: /search <text>",
     "/sync": "copy this project's history to the mirror now",
-    "/usage": "token usage: this turn and the session",
+    "/usage": "token usage and spend: this turn and the session",
     "/help": "list commands",
     "/quit": "save history and exit",
 }
@@ -175,11 +176,16 @@ def _read_input_char(fd: int) -> str:
 
 
 def _redraw_input_line(
-    text: str, matches: list[str] | None = None, sel: int = 0
+    text: str, matches: list[str] | None = None, sel: int = 0, hint: str = ""
 ) -> None:
-    """Redraw the prompt line plus a completion menu below it, cursor kept on the line."""
+    """Redraw the prompt line plus a completion menu or a hint below it, cursor kept on the line.
+
+    `hint` is one dim line of context for what's typed (the estimated cost of
+    sending it); it is shown when there is no menu.
+    """
     line = format_input_line(text)
     out = "\r\033[J" + line
+    below = len(matches or [])
     for i, cmd in enumerate(matches or []):
         desc = SLASH_COMMANDS.get(cmd, "")
         if not colors_enabled():
@@ -188,9 +194,12 @@ def _redraw_input_line(
             out += f"\n  {BOLD}{BRIGHT_CYAN}{cmd:<12}{RESET} {desc}"
         else:
             out += f"\n  {DIM}{cmd:<12} {desc}{RESET}"
-    if matches:
+    if hint and not matches:
+        out += f"\n  {DIM}{hint}{RESET}" if colors_enabled() else f"\n  {hint}"
+        below = 1
+    if below:
         col = 2 + len(text)  # "❯ " is two cells
-        out += f"\033[{len(matches)}A\r" + (f"\033[{col}C" if col else "")
+        out += f"\033[{below}A\r" + (f"\033[{col}C" if col else "")
     sys.stdout.write(out)
     sys.stdout.flush()
 
@@ -235,11 +244,14 @@ def _read_tty_line(
     history: bool = False,
     redraw: Any | None = None,
     complete: bool = False,
+    hint: Callable[[str], str] | None = None,
 ) -> str:
     """Read one line in cbreak mode; swallows arrow keys unless history=True.
 
     With complete=True, typing a /prefix shows matching slash commands below
     the line: ↑↓ pick, Tab or → fills in, Enter runs the highlighted one.
+    `hint(text)` returns a dim line to show under what's typed (empty for none);
+    it is asked again on every keystroke, so it should be cheap.
     """
     import termios
     import tty
@@ -253,9 +265,15 @@ def _read_tty_line(
     def _matches() -> list[str]:
         return slash_matches("".join(buf)) if complete else []
 
+    def _hint() -> str:
+        text = "".join(buf)
+        if hint is None or not text or text.startswith("/"):
+            return ""
+        return hint(text)
+
     def _redraw() -> None:
         if complete:
-            _redraw_input_line("".join(buf), _matches(), sel)
+            _redraw_input_line("".join(buf), _matches(), sel, _hint())
         elif redraw is not None:
             redraw("".join(buf))
         else:
@@ -340,9 +358,9 @@ def _remember_input(text: str) -> None:
         _INPUT_HISTORY.append(text)
 
 
-def _read_user_input_interactive() -> str:
+def _read_user_input_interactive(hint: Callable[[str], str] | None = None) -> str:
     """TTY line editor with live slash-command coloring and history."""
-    text = _read_tty_line("", history=True, complete=True)
+    text = _read_tty_line("", history=True, complete=True, hint=hint)
     _remember_input(text)
     return text
 
@@ -357,10 +375,14 @@ def read_feedback_line() -> str:
     return input(prompt).strip()
 
 
-def read_user_input() -> str:
-    """Read one line from the ❯ prompt with live slash-command coloring."""
+def read_user_input(hint: Callable[[str], str] | None = None) -> str:
+    """Read one line from the ❯ prompt with live slash-command coloring.
+
+    On a terminal, `hint(text)` supplies a dim line shown under the input as it
+    is typed (see _read_tty_line); it is ignored when stdin is a pipe.
+    """
     if sys.stdin.isatty() and sys.stdout.isatty():
-        return _read_user_input_interactive()
+        return _read_user_input_interactive(hint)
 
     if colors_enabled():
         sys.stdout.write(f"{BRIGHT_CYAN}❯{RESET} ")

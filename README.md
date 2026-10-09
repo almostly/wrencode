@@ -261,30 +261,59 @@ latest decisions override earlier ones. A chat whose extraction doesn't come bac
 as JSON is reported and contributes nothing. With a single transcript the result
 degrades to a structured summary.
 
-## Token usage
+## Token usage and spend
 
 After each turn wrencode prints one dim line with what the backend reported:
 
 ```
-↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  ▰▱▱▱▱▱▱▱▱▱ 1%
+↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · Σ $0.21
 ```
 
 Up is the turn's input tokens, down its output, `×2` the number of model calls,
 `⚡` the share of input served from the prompt cache at the reduced rate, and the
 meter the context fill: the size of the latest request against the model's window,
 which is what the next turn starts from and what auto-compaction watches. The
-meter turns yellow at the compaction threshold. The terminal tab title shows the
-context fill and the session totals. `/usage` prints the full numbers:
+meter turns yellow at the compaction threshold. Then the turn's cost and, after
+the first turn, the session total. The terminal tab title shows the context fill,
+the session totals and the spend. `/usage` prints the full numbers:
 
 ```
-             input  cached written  output calls
-this turn     1.6k    1.6k      54     108     1
-session       4.7k    3.9k    1.6k     236     3
+             input  cached written  output calls      cost
+this turn     1.6k    1.6k      54     108     1   $0.0042
+session       4.7k    3.9k    1.6k     236     3    $0.213
 context: 1.6k of 128k (1%); input = uncached + cached (read) + written
+price: $2/$10 per MTok (cache read $0.20, write $2.50; built-in)
 ```
+
+While you type, a dim line under the prompt estimates what sending the message
+will cost in input tokens: the context the model already holds (at the cache-read
+rate for the part it served from the cache last time), its last reply, and your
+text at about four characters per token. Output can't be known ahead, so it isn't
+counted.
+
+```
+❯ fix the bug in the parser
+  ≈ $0.0031 input
+```
+
+**Where the prices come from.** Each call is priced at the four rates in effect
+for the model: input, output, cache read and cache write, in USD per million
+tokens. Anthropic's Models API lists models but not prices, so Claude models (and
+the OpenAI, Amazon Nova and Bedrock ids wrencode knows) come from a built-in
+table, checked October 2026; `/usage` says `built-in` and the startup line shows
+the rate. OpenRouter and NanoGPT list prices in their model catalogs, and
+`/configure` saves those to `~/.wrencode/prices.json` when it fetches the model
+list, keyed `backend/model id`; you can add your own entries there as
+`[input, output, cache_read, cache_write]`. `WRENCODE_PRICE=input,output[,cache_read[,cache_write]]`
+overrides everything for the current model (`WRENCODE_PRICE=0,0` marks a local
+model free). Without a known price nothing is shown, `/usage` prints `$?` and how
+to set one, and no estimate appears while typing. Claude Haiku 5.5's higher rate
+card above 100K-token prompts is applied per call. The model picker in
+`/configure` and `/model` shows the price beside each model it knows.
 
 Headless runs print the line to stderr and add a `usage` object to the
-`--output-format json` result. Set `WRENCODE_SHOW_USAGE=0` to turn the line off.
+`--output-format json` result, with `cost_usd` when every call had a known
+price. Set `WRENCODE_SHOW_USAGE=0` to turn the line and the typing estimate off.
 Backends that report no usage (local models, the local proxy) print nothing.
 
 ## Context management
@@ -527,7 +556,7 @@ This publishes release assets:
 |`/resume <id>`|Continue an earlier conversation             |
 |`/search <text>`|Search past conversations                  |
 |`/sync`       |Copy this project's history to the mirror now (Postgres history)|
-|`/usage`      |Token usage for this turn and the session    |
+|`/usage`      |Token usage and spend for this turn and the session, and the price in effect|
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 
@@ -553,7 +582,8 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`WRENCODE_SANDBOX_MEMORY_MB` |`256`                  |Memory a `python` tool snippet may use|
 |`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
-|`WRENCODE_SHOW_USAGE`        |`1`                    |Print the token usage line after each turn|
+|`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
+|`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
 |`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction and `synthesize`|

@@ -2921,14 +2921,17 @@ class TestUsage(unittest.TestCase):
             backends._record_usage({"usage": {"input_tokens": 100, "output_tokens": 1}})
             report = backends.usage_report()
             title = backends.usage_title()
+        # no MODEL here, so no price: the line and title carry no dollar amount
         self.assertEqual(line, "↑ 1.9k  ↓ 386  ⚡ 76% cached  ▱▱▱▱▱▱▱▱▱▱ 2%")
         self.assertEqual(
-            report[0].split(), ["input", "cached", "written", "output", "calls"]
+            report[0].split(), ["input", "cached", "written", "output", "calls", "cost"]
         )
         self.assertEqual(
-            report[1].split(), ["this", "turn", "2.0k", "1.5k", "264", "387", "2"]
+            report[1].split(), ["this", "turn", "2.0k", "1.5k", "264", "387", "2", "$?"]
         )
         self.assertTrue(report[3].startswith("context: 100 of 128k (0%)"))
+        self.assertTrue(report[4].startswith("price: unknown"))
+        self.assertIn("WRENCODE_PRICE", report[4])
         self.assertEqual(title, "wrencode · ctx 0% · ↑2.0k ↓387")
 
     def test_usage_meter_fills_and_warns_at_the_compaction_threshold(self):
@@ -2978,6 +2981,311 @@ class TestUsage(unittest.TestCase):
         self.assertEqual(
             (backends.USAGE.turn_uncached, backends.USAGE.turn_out), (30, 3)
         )
+
+
+class TestPricing(unittest.TestCase):
+    """Prices per token: the table, the overrides, the cost math, and what's shown."""
+
+    def setUp(self):
+        self._orig = backends.USAGE
+        backends.USAGE = backends.Usage()
+        self.addCleanup(setattr, backends, "USAGE", self._orig)
+        self._tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        patch = mock.patch.object(backends, "PRICES_FILE", self._tmp / "prices.json")
+        patch.start()
+        self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ, {"WRENCODE_PRICE": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("WRENCODE_PRICE", None)
+
+    def test_built_in_table_matches_every_provider_spelling(self):
+        cases = {
+            ("anthropic", "claude-sonnet-4-5-20250929"): "$3/$15 per MTok",
+            ("anthropic", "claude-opus-5-5"): "$4/$20 per MTok",
+            ("anthropic", "claude-opus-5"): "$5/$25 per MTok",
+            ("anthropic", "claude-haiku-5-5"): "$0.10/$0.50 per MTok",
+            ("openrouter", "anthropic/claude-3.5-sonnet"): "$3/$15 per MTok",
+            (
+                "bedrock",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ): "$1/$5 per MTok",
+            ("bedrock", "us.amazon.nova-pro-v1:0"): "$0.80/$3.20 per MTok",
+            ("openai", "gpt-4o-mini"): "$0.15/$0.60 per MTok",
+        }
+        for (backend, model), label in cases.items():
+            price = backends.price_for(model, backend)
+            self.assertIsNotNone(price, model)
+            self.assertEqual(price.label(), label, model)
+        self.assertEqual(backends.price_for("claude-opus-5-5").source, "built-in")
+        self.assertIsNone(backends.price_for("gpt-oss-20b", "local"))
+        self.assertIsNone(backends.price_for("claude-opus-5-5", "mlx"))
+        self.assertIsNone(backends.price_for("llama-3", "ollama"))
+
+    def test_claude_cache_rates_follow_the_price_list(self):
+        opus = backends.price_for("claude-opus-5-5", "anthropic")
+        sonnet = backends.price_for("claude-sonnet-5-5", "anthropic")
+        fable = backends.price_for("claude-fable-5-1", "anthropic")
+        self.assertEqual((opus.cache_read, opus.cache_write), (0.2, 5.0))
+        self.assertEqual((sonnet.cache_read, sonnet.cache_write), (0.2, 2.5))
+        self.assertEqual((fable.cache_read, fable.cache_write), (0.25, 12.5))
+
+    def test_env_override_then_saved_catalog_then_table(self):
+        backends.PRICES_FILE.write_text(
+            json.dumps({"openrouter/anthropic/claude-3.5-sonnet": [1, 2, 0.1, 1.25]})
+        )
+        catalog = backends.price_for("anthropic/claude-3.5-sonnet", "openrouter")
+        self.assertEqual((catalog.input, catalog.output), (1.0, 2.0))
+        self.assertEqual(catalog.source, "openrouter catalog")
+        # the file is re-read when it changes
+        backends.PRICES_FILE.write_text(
+            json.dumps({"openrouter/anthropic/claude-3.5-sonnet": [7, 8]})
+        )
+        os.utime(backends.PRICES_FILE, (1, 1))
+        again = backends.price_for("anthropic/claude-3.5-sonnet", "openrouter")
+        self.assertEqual((again.input, again.output, again.cache_read), (7.0, 8.0, 7.0))
+        with mock.patch.dict(os.environ, {"WRENCODE_PRICE": "0.5,1.5"}):
+            env = backends.price_for("gpt-oss-20b", "local")
+            self.assertEqual(env.label(), "$0.50/$1.50 per MTok")
+            self.assertEqual(env.source, "WRENCODE_PRICE")
+        with mock.patch.dict(os.environ, {"WRENCODE_PRICE": "junk"}):
+            self.assertIsNone(backends.price_for("claude-opus-5-5", "anthropic"))
+        with mock.patch.dict(os.environ, {"WRENCODE_PRICE": "1,2,3,4,5"}):
+            self.assertIsNone(backends.price_for("claude-opus-5-5", "anthropic"))
+
+    def test_call_cost_uses_each_rate_and_the_long_prompt_card(self):
+        sonnet = backends.price_for("claude-sonnet-5-5", "anthropic")
+        cost = backends.call_cost(sonnet, 200, 1472, 264, 386)
+        expected = (200 * 2 + 1472 * 0.2 + 264 * 2.5 + 386 * 10) / 1e6
+        self.assertAlmostEqual(cost, expected)
+        haiku = backends.price_for("claude-haiku-5-5", "anthropic")
+        short = backends.call_cost(haiku, 1000, 0, 0, 100)
+        long = backends.call_cost(haiku, 150_000, 0, 0, 100)
+        self.assertAlmostEqual(short, (1000 * 0.10 + 100 * 0.50) / 1e6)
+        self.assertAlmostEqual(long, (150_000 * 0.50 + 100 * 2.50) / 1e6)
+        self.assertIsNone(backends.call_cost(None, 1, 1, 1, 1))
+
+    def test_money_keeps_small_amounts_visible(self):
+        self.assertEqual(backends._money(0), "$0")
+        self.assertEqual(backends._money(0.00004), "<$0.0001")
+        self.assertEqual(backends._money(0.0052144), "$0.0052")
+        self.assertEqual(backends._money(0.2134), "$0.213")
+        self.assertEqual(backends._money(12.345), "$12.35")
+        self.assertEqual(backends._money(1234.5), "$1,234")
+
+    def test_spend_is_on_the_line_the_report_and_the_title(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "MODEL", "claude-sonnet-5-5"),
+            mock.patch.object(backends, "CONTEXT_TOKENS", 128000),
+        ):
+            backends._record_usage(
+                {
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 386,
+                        "cache_creation_input_tokens": 264,
+                        "cache_read_input_tokens": 1472,
+                    }
+                }
+            )
+            first = backends.usage_line()
+            backends.USAGE.begin_turn()
+            backends._record_usage(
+                {"usage": {"input_tokens": 1000, "output_tokens": 100}}
+            )
+            second = backends.usage_line()
+            report = backends.usage_report()
+            title = backends.usage_title()
+            as_dict = backends.USAGE.as_dict()
+        self.assertTrue(first.endswith("▱▱▱▱▱▱▱▱▱▱ 2%  $0.0052"), first)
+        self.assertTrue(second.endswith("1%  $0.0030 · Σ $0.0082"), second)
+        self.assertEqual(report[1].split()[-1], "$0.0030")
+        self.assertEqual(report[2].split()[-1], "$0.0082")
+        self.assertEqual(
+            report[4],
+            "price: $2/$10 per MTok (cache read $0.20, write $2.50; built-in)",
+        )
+        self.assertEqual(title, "wrencode · ctx 1% · ↑2.9k ↓486 · $0.0082")
+        self.assertAlmostEqual(as_dict["cost_usd"], 0.008214, places=6)
+
+    def test_a_call_without_a_price_withholds_the_total(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "MODEL", "claude-sonnet-5-5"),
+        ):
+            backends._record_usage({"usage": {"input_tokens": 10, "output_tokens": 1}})
+        with (
+            mock.patch.object(backends, "BACKEND", "openai-compatible"),
+            mock.patch.object(backends, "MODEL", "some-local-thing"),
+        ):
+            backends._record_usage(
+                {"usage": {"prompt_tokens": 10, "completion_tokens": 1}}
+            )
+            line = backends.usage_line()
+            report = backends.usage_report()
+            title = backends.usage_title()
+        self.assertNotIn("$", line)
+        self.assertNotIn("$", title)
+        self.assertEqual(report[2].split()[-1], "$?")
+        self.assertNotIn("cost_usd", backends.USAGE.as_dict())
+
+    def test_send_estimate_prices_the_next_request(self):
+        with (
+            mock.patch.object(backends, "MODEL", "x"),
+            mock.patch.object(backends, "BACKEND", "local"),
+        ):
+            self.assertEqual(backends.send_estimate(100), "")
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "MODEL", "claude-sonnet-5-5"),
+        ):
+            # before the first call: the estimated context at the input rate
+            first = backends.send_estimate(400, context_tokens=2000)
+            self.assertEqual(
+                first, f"≈ {backends._money((2000 + 101) * 2 / 1e6)} input"
+            )
+            backends._record_usage(
+                {
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 300,
+                        "cache_creation_input_tokens": 500,
+                        "cache_read_input_tokens": 1500,
+                    }
+                }
+            )
+            # then: last prompt read from the cache, the reply and the text written to it
+            hint = backends.send_estimate(40)
+        cached = 2000 * 0.2
+        fresh = (300 + 11) * 2.5
+        self.assertEqual(hint, f"≈ {backends._money((cached + fresh) / 1e6)} input")
+
+    def test_catalog_prices_are_saved_from_a_models_fetch(self):
+        entries = [
+            {
+                "id": "anthropic/claude-sonnet-4.5",
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015",
+                    "input_cache_read": "0.0000003",
+                    "input_cache_write": "0.00000375",
+                },
+            },
+            {"id": "free/model", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "odd/model", "pricing": {"prompt": "n/a", "completion": "1"}},
+            {"id": "bare/model"},
+        ]
+        self.assertEqual(configure._save_catalog_prices("openrouter", entries), 2)
+        saved = json.loads(backends.PRICES_FILE.read_text())
+        self.assertEqual(
+            saved["openrouter/anthropic/claude-sonnet-4.5"], [3, 15, 0.3, 3.75]
+        )
+        self.assertEqual(saved["openrouter/free/model"], [0, 0, 0, 0])
+        self.assertEqual(stat.S_IMODE(backends.PRICES_FILE.stat().st_mode), 0o600)
+        # a later fetch merges, keeping what it did not list
+        configure._save_catalog_prices(
+            "nanogpt",
+            [{"id": "m", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}],
+        )
+        saved = json.loads(backends.PRICES_FILE.read_text())
+        self.assertIn("openrouter/free/model", saved)
+        self.assertEqual(saved["nanogpt/m"], [1, 2, 1, 1])
+        price = backends.price_for("anthropic/claude-sonnet-4.5", "openrouter")
+        self.assertEqual(price.source, "openrouter catalog")
+        self.assertEqual(
+            backends.price_for("free/model", "openrouter").label(), "$0/$0 per MTok"
+        )
+
+    def test_hosted_models_fetch_saves_the_catalog_prices(self):
+        payload = {
+            "data": [
+                {
+                    "id": "b/two",
+                    "pricing": {"prompt": "0.000002", "completion": "0.000004"},
+                },
+                {"id": "a/one"},
+            ]
+        }
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = io.BytesIO(json.dumps(payload).encode())
+        cm.__exit__.return_value = False
+        cache = self._tmp / "models.json"
+        with (
+            mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test"}),
+            mock.patch("urllib.request.urlopen", return_value=cm),
+        ):
+            ids = configure._fetch_hosted_models(
+                "openrouter", "https://x/models", cache, "X"
+            )
+        self.assertEqual(ids, ["a/one", "b/two"])
+        saved = json.loads(backends.PRICES_FILE.read_text())
+        self.assertEqual(list(saved), ["openrouter/b/two"])
+
+    def test_model_chooser_shows_prices_beside_known_models(self):
+        with mock.patch.object(ui, "colors_enabled", return_value=False):
+            labels = configure._model_labels(
+                "anthropic",
+                ["claude-opus-5-5", "mystery-model", configure.CUSTOM_MODEL_OPTION],
+            )
+        self.assertEqual(
+            strip_ansi(labels[0]).split(), ["claude-opus-5-5", "$4/$20", "per", "MTok"]
+        )
+        self.assertEqual(labels[1], "mystery-model")
+        self.assertEqual(labels[2], configure.CUSTOM_MODEL_OPTION)
+
+    def test_hint_is_drawn_under_the_prompt_and_cleared_by_the_menu(self):
+        with mock.patch.object(ui, "colors_enabled", return_value=False):
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line("fix the bug", hint="≈ $0.0031 input")
+                hinted = sys.stdout.getvalue()
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line("/mo", ["/model"], 0, hint="≈ $0.0031 input")
+                menu = sys.stdout.getvalue()
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line("fix the bug")
+                bare = sys.stdout.getvalue()
+        self.assertIn("\n  ≈ $0.0031 input", hinted)
+        self.assertTrue(
+            hinted.endswith("\033[1A\r\033[13C"), repr(hinted)
+        )  # back up to the text
+        self.assertNotIn("≈", menu)
+        self.assertIn("/model", menu)
+        self.assertNotIn("\n", bare)
+
+    def test_read_user_input_ignores_the_hint_without_a_terminal(self):
+        calls = []
+        with (
+            mock.patch("sys.stdin", io.StringIO("hello\n")),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            text = ui.read_user_input(lambda t: calls.append(t) or "x")
+        self.assertEqual(text, "hello")
+        self.assertEqual(calls, [])
+
+    def test_typing_hint_is_wired_into_the_prompt(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "MODEL", "claude-sonnet-5-5"),
+            mock.patch.object(ui, "read_user_input", side_effect=EOFError),
+            mock.patch.object(wrencode, "SHOW_USAGE", True),
+            mock.patch.object(wrencode, "load_history", return_value=[]),
+            mock.patch.object(wrencode, "build_system_prompt", return_value="s" * 400),
+            mock.patch.object(wrencode, "find_agents_files", return_value=[]),
+            mock.patch.object(history, "open_store", return_value=None),
+            mock.patch.object(configure, "resolve_configuration"),
+            mock.patch.object(backends, "load_model", return_value=None),
+            mock.patch("sys.stdout", io.StringIO()),
+            mock.patch.object(sys, "argv", ["wrencode"]),
+        ):
+            wrencode.main()
+            banner = sys.stdout.getvalue()
+            hint = ui.read_user_input.call_args[0][0]
+            shown = hint("fix the bug")
+        self.assertIn("$2/$10 per MTok", strip_ansi(banner))
+        self.assertTrue(shown.startswith("≈ $"), shown)
+        self.assertTrue(shown.endswith(" input"))
 
 
 class TestComplete(unittest.TestCase):

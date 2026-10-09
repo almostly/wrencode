@@ -499,6 +499,163 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
         )
 
 
+@dataclass(frozen=True)
+class Price:
+    """USD per million tokens: input, output, prompt-cache read, prompt-cache write.
+
+    `long` is the rate card used once the prompt passes 100K tokens, for models
+    that charge more there (Claude Haiku 5.5); `source` says where the figures
+    came from, for /usage.
+    """
+
+    input: float
+    output: float
+    cache_read: float
+    cache_write: float
+    source: str = "built-in"
+    long: tuple[float, float] | None = None
+
+    def at(self, prompt: int) -> tuple[float, float, float, float]:
+        """The four rates that apply to a request with `prompt` input tokens."""
+        if self.long and prompt > 100_000:
+            inp, out = self.long
+            scale = inp / self.input if self.input else 1.0
+            return inp, out, self.cache_read * scale, self.cache_write * scale
+        return self.input, self.output, self.cache_read, self.cache_write
+
+    def label(self) -> str:
+        """'$2/$10 per MTok', the way price lists put it."""
+        return f"${_rate(self.input)}/${_rate(self.output)} per MTok"
+
+
+def _rate(usd: float) -> str:
+    """A per-million rate: 2, 0.10, 0.075."""
+    if usd == int(usd):
+        return str(int(usd))
+    text = f"{usd:.4f}".rstrip("0")
+    return text if len(text.split(".")[1]) >= 2 else text + "0"
+
+
+def _p(
+    inp: float,
+    out: float,
+    read: float | None = None,
+    long: tuple[float, float] | None = None,
+) -> Price:
+    """A Claude-style price: cache reads 0.1x input unless given, writes 1.25x."""
+    return Price(inp, out, inp * 0.1 if read is None else read, inp * 1.25, long=long)
+
+
+# Prices the model APIs don't report (Anthropic's /v1/models has none), USD per
+# million tokens, checked October 2026. Matched as substrings of the lowercased
+# model id with '.' read as '-', so the same row covers claude-sonnet-4-5-20250929
+# (Anthropic), anthropic/claude-sonnet-4.5 (OpenRouter) and
+# us.anthropic.claude-sonnet-4-5-20250929-v1:0 (Bedrock). Order matters: a more
+# specific id goes before the prefix it extends. WRENCODE_PRICE overrides.
+PRICE_TABLE: tuple[tuple[str, Price], ...] = (
+    ("claude-fable-5-1", _p(10, 50, 0.25)),
+    ("claude-mythos-5-1", _p(10, 50, 0.25)),
+    ("claude-fable-5", _p(10, 50, 1.0)),
+    ("claude-mythos-5", _p(10, 50, 1.0)),
+    ("claude-opus-5-5", _p(4, 20, 0.20)),
+    ("claude-opus-5", _p(5, 25)),
+    ("claude-sonnet-5-5", _p(2, 10)),
+    ("claude-sonnet-5", _p(2, 10)),
+    ("claude-haiku-5-5", _p(0.10, 0.50, long=(0.50, 2.50))),
+    ("claude-opus-4-1", _p(15, 75)),
+    ("claude-opus-4-5", _p(5, 25)),
+    ("claude-opus-4-6", _p(5, 25)),
+    ("claude-opus-4-7", _p(5, 25)),
+    ("claude-opus-4-8", _p(5, 25)),
+    ("claude-opus-4", _p(15, 75)),
+    ("claude-sonnet-4", _p(3, 15)),
+    ("claude-haiku-4-5", _p(1, 5)),
+    ("claude-3-7-sonnet", _p(3, 15)),
+    ("claude-3-5-sonnet", _p(3, 15)),
+    ("claude-3-5-haiku", _p(0.80, 4)),
+    ("claude-3-opus", _p(15, 75)),
+    ("claude-3-haiku", _p(0.25, 1.25)),
+    ("gpt-4o-mini", Price(0.15, 0.60, 0.075, 0)),
+    ("gpt-4o", Price(2.50, 10, 1.25, 0)),
+    ("gpt-4-1-nano", Price(0.10, 0.40, 0.025, 0)),
+    ("gpt-4-1-mini", Price(0.40, 1.60, 0.10, 0)),
+    ("gpt-4-1", Price(2, 8, 0.50, 0)),
+    ("gpt-5-nano", Price(0.05, 0.40, 0.005, 0)),
+    ("gpt-5-mini", Price(0.25, 2, 0.025, 0)),
+    ("gpt-5", Price(1.25, 10, 0.125, 0)),
+    ("nova-micro", Price(0.035, 0.14, 0.00875, 0)),
+    ("nova-lite", Price(0.06, 0.24, 0.015, 0)),
+    ("nova-pro", Price(0.80, 3.20, 0.20, 0)),
+)
+# Prices /configure saved from a provider catalog that lists them (OpenRouter,
+# NanoGPT): {"<backend>/<model id>": [input, output, cache_read, cache_write]}.
+PRICES_FILE = CONFIG_DIR / "prices.json"
+_PRICES_FILE_CACHE: tuple[float, dict[str, Any]] = (-1.0, {})
+
+
+def _catalog_prices() -> dict[str, Any]:
+    """The saved catalog prices, re-read when the file changes."""
+    global _PRICES_FILE_CACHE
+    try:
+        mtime = PRICES_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if mtime != _PRICES_FILE_CACHE[0]:
+        try:
+            data = json.loads(PRICES_FILE.read_text())
+        except (OSError, ValueError):
+            data = {}
+        _PRICES_FILE_CACHE = (mtime, data if isinstance(data, dict) else {})
+    return _PRICES_FILE_CACHE[1]
+
+
+def _price_from_rates(rates: Any, source: str) -> Price | None:
+    """Price from an [input, output, cache_read, cache_write] list (the last two optional)."""
+    try:
+        nums = [float(x) for x in rates]
+    except (TypeError, ValueError):
+        return None
+    if len(nums) < 2 or len(nums) > 4 or any(n < 0 for n in nums):
+        return None
+    inp, out = nums[0], nums[1]
+    read = nums[2] if len(nums) > 2 else inp
+    write = nums[3] if len(nums) > 3 else inp
+    return Price(inp, out, read, write, source=source)
+
+
+def price_for(model: str = "", backend: str = "") -> Price | None:
+    """The price of `model` (default: the active one), or None when it isn't known.
+
+    WRENCODE_PRICE="input,output[,cache_read[,cache_write]]" (USD per million
+    tokens) wins, then the catalog prices /configure saved, then the built-in
+    table. Local models and proxies have no price unless WRENCODE_PRICE says so.
+    """
+    model = model or MODEL
+    backend = backend or BACKEND
+    if env := os.environ.get("WRENCODE_PRICE", "").strip():
+        return _price_from_rates(env.split(","), "WRENCODE_PRICE")
+    saved = _catalog_prices().get(f"{backend}/{model}")
+    if saved and (price := _price_from_rates(saved, f"{backend} catalog")):
+        return price
+    if backend in LOCAL_ML_BACKENDS or backend == "local":
+        return None
+    needle = model.lower().replace(".", "-")
+    for key, price in PRICE_TABLE:
+        if key in needle:
+            return price
+    return None
+
+
+def call_cost(
+    price: Price | None, uncached: int, cache_read: int, cache_write: int, out: int
+) -> float | None:
+    """What one model call cost in USD, or None without a price."""
+    if price is None:
+        return None
+    inp, outp, read, write = price.at(uncached + cache_read + cache_write)
+    return (uncached * inp + cache_read * read + cache_write * write + out * outp) / 1e6
+
+
 @dataclass
 class Usage:
     """Token counts the backend reported: the current turn and the whole session.
@@ -506,6 +663,8 @@ class Usage:
     `uncached` are input tokens charged in full, `cache_read` the ones served from
     the prompt cache, `cache_write` the ones written to it. `prompt` is the size
     of the latest request's prompt: what the context window currently holds.
+    Costs are USD from price_for(); `unpriced_calls` counts the calls made
+    without a known price, so a total is only shown when it is complete.
     """
 
     turn_uncached: int = 0
@@ -513,18 +672,32 @@ class Usage:
     turn_cache_write: int = 0
     turn_out: int = 0
     turn_calls: int = 0
+    turn_cost: float = 0.0
+    turn_unpriced: int = 0
     session_uncached: int = 0
     session_cache_read: int = 0
     session_cache_write: int = 0
     session_out: int = 0
     session_calls: int = 0
+    session_cost: float = 0.0
+    unpriced_calls: int = 0
     prompt: int = 0
+    last_cached: int = 0  # the latest request's cache reads + writes
+    last_out: int = 0
 
     def begin_turn(self) -> None:
         self.turn_uncached = self.turn_cache_read = self.turn_cache_write = 0
-        self.turn_out = self.turn_calls = 0
+        self.turn_out = self.turn_calls = self.turn_unpriced = 0
+        self.turn_cost = 0.0
 
-    def add(self, uncached: int, cache_read: int, cache_write: int, out: int) -> None:
+    def add(
+        self,
+        uncached: int,
+        cache_read: int,
+        cache_write: int,
+        out: int,
+        cost: float | None = None,
+    ) -> None:
         self.turn_uncached += uncached
         self.turn_cache_read += cache_read
         self.turn_cache_write += cache_write
@@ -535,11 +708,19 @@ class Usage:
         self.session_cache_write += cache_write
         self.session_out += out
         self.session_calls += 1
+        if cost is None:
+            self.turn_unpriced += 1
+            self.unpriced_calls += 1
+        else:
+            self.turn_cost += cost
+            self.session_cost += cost
         self.prompt = uncached + cache_read + cache_write
+        self.last_cached = cache_read + cache_write
+        self.last_out = out
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, Any]:
         """Session totals, for the headless JSON result."""
-        return {
+        d: dict[str, Any] = {
             "input_tokens": self.session_uncached
             + self.session_cache_read
             + self.session_cache_write,
@@ -549,6 +730,9 @@ class Usage:
             "model_calls": self.session_calls,
             "context_tokens": self.prompt,
         }
+        if self.session_calls and not self.unpriced_calls:
+            d["cost_usd"] = round(self.session_cost, 6)
+        return d
 
 
 USAGE = Usage()
@@ -577,7 +761,8 @@ def _record_usage(data: dict[str, Any]) -> None:
         uncached = max(int(u.get("prompt_tokens") or 0) - cache_read, 0)
         cache_write = 0
         out = int(u.get("completion_tokens") or 0)
-    USAGE.add(uncached, cache_read, cache_write, out)
+    cost = call_cost(price_for(), uncached, cache_read, cache_write, out)
+    USAGE.add(uncached, cache_read, cache_write, out, cost)
 
 
 def _count(n: int) -> str:
@@ -586,13 +771,38 @@ def _count(n: int) -> str:
     return f"{n // 1000}k" if n % 1000 == 0 else f"{n / 1000:.1f}k"
 
 
+def _money(usd: float) -> str:
+    """Dollars at a precision that keeps small amounts visible: $0.0042, $0.21, $12."""
+    if usd == 0:
+        return "$0"
+    if usd < 0.0001:
+        return "<$0.0001"
+    if usd < 0.01:
+        return f"${usd:.4f}"
+    if usd < 1:
+        return f"${usd:.3f}"
+    if usd < 100:
+        return f"${usd:.2f}"
+    return f"${usd:,.0f}"
+
+
 def context_fill() -> float:
     """How full the context window is after the latest request, 0.0 to 1.0."""
     return min(USAGE.prompt / CONTEXT_TOKENS, 1.0) if CONTEXT_TOKENS else 0.0
 
 
+def _spend() -> str:
+    """The turn's cost with the session total, or '' once a call had no price."""
+    u = USAGE
+    if u.unpriced_calls:
+        return ""
+    if u.session_calls == u.turn_calls:
+        return f"  {_money(u.session_cost)}"
+    return f"  {_money(u.turn_cost)} · Σ {_money(u.session_cost)}"
+
+
 def usage_line(warn_at: float = 0.0) -> str:
-    """The compact line after a turn: tokens up and down, cache hit rate, context meter.
+    """The compact line after a turn: tokens up and down, cache hit rate, context meter, cost.
 
     `warn_at` colors the meter once the context fill reaches it (the auto-compaction
     threshold), when colors are on.
@@ -606,11 +816,34 @@ def usage_line(warn_at: float = 0.0) -> str:
     bar = "▰" * cells + "▱" * (10 - cells)
     if warn_at and fill >= warn_at and ui.colors_enabled():
         bar = f"{YELLOW}{bar}{RESET}{DIM}"
-    return f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{calls}{hit}  {bar} {100 * fill:.0f}%"
+    return (
+        f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{calls}{hit}  "
+        f"{bar} {100 * fill:.0f}%{_spend()}"
+    )
+
+
+def price_note() -> str:
+    """Where the active model's price comes from, or how to set one."""
+    price = price_for()
+    if price is None:
+        return (
+            f"price: unknown for {MODEL}; set WRENCODE_PRICE=input,output[,cache_read"
+            f"[,cache_write]] in USD per million tokens"
+        )
+    note = (
+        f"price: {price.label()} (cache read ${_rate(price.cache_read)}, "
+        f"write ${_rate(price.cache_write)}; {price.source})"
+    )
+    if price.long:
+        note += (
+            f"; ${_rate(price.long[0])}/${_rate(price.long[1])} "
+            "once the prompt passes 100k"
+        )
+    return note
 
 
 def usage_report() -> list[str]:
-    """The full numbers for /usage: this turn and the session, then the context."""
+    """The full numbers for /usage: this turn and the session, then the context and price."""
     u = USAGE
     rows = [
         (
@@ -620,6 +853,7 @@ def usage_report() -> list[str]:
             u.turn_cache_write,
             u.turn_out,
             u.turn_calls,
+            "$?" if u.turn_unpriced else _money(u.turn_cost),
         ),
         (
             "session",
@@ -628,27 +862,55 @@ def usage_report() -> list[str]:
             u.session_cache_write,
             u.session_out,
             u.session_calls,
+            "$?" if u.unpriced_calls else _money(u.session_cost),
         ),
     ]
-    head = f"{'':<10}{'input':>8}{'cached':>8}{'written':>8}{'output':>8}{'calls':>6}"
+    head = f"{'':<10}{'input':>8}{'cached':>8}{'written':>8}{'output':>8}{'calls':>6}{'cost':>10}"
     lines = [head]
-    for name, unc, read, write, out, calls in rows:
+    for name, unc, read, write, out, calls, cost in rows:
         lines.append(
             f"{name:<10}{_count(unc + read + write):>8}{_count(read):>8}"
-            f"{_count(write):>8}{_count(out):>8}{calls:>6}"
+            f"{_count(write):>8}{_count(out):>8}{calls:>6}{cost:>10}"
         )
     lines.append(
         f"context: {_count(u.prompt)} of {_count(CONTEXT_TOKENS)} ({100 * context_fill():.0f}%); "
         f"input = uncached + cached (read) + written"
     )
+    lines.append(price_note())
     return lines
 
 
 def usage_title() -> str:
-    """The terminal title: the context fill and the session's tokens at a glance."""
+    """The terminal title: the context fill, the session's tokens and spend at a glance."""
     u = USAGE
     session_in = u.session_uncached + u.session_cache_read + u.session_cache_write
-    return f"wrencode · ctx {100 * context_fill():.0f}% · ↑{_count(session_in)} ↓{_count(u.session_out)}"
+    title = f"wrencode · ctx {100 * context_fill():.0f}% · ↑{_count(session_in)} ↓{_count(u.session_out)}"
+    if not u.unpriced_calls:
+        title += f" · {_money(u.session_cost)}"
+    return title
+
+
+def send_estimate(typed_chars: int, context_tokens: int = 0) -> str:
+    """'≈ $0.0031 input' for sending what's typed so far, or '' without a price.
+
+    The next request carries the previous prompt again (the part the backend
+    cached last time is assumed to hit the cache at the read rate; the rest and
+    anything new at the write rate once caching is in use, the plain input
+    rate otherwise), plus the model's last reply and the typed text at about
+    four characters per token. Output can't be known ahead, so it is not counted.
+    `context_tokens` is the estimated prompt size before the first call.
+    """
+    price = price_for()
+    if price is None:
+        return ""
+    u = USAGE
+    reused = u.prompt or max(context_tokens, 0)
+    cached = min(u.last_cached, reused) if u.prompt else 0
+    typed = typed_chars // 4 + 1
+    inp, _, read, write = price.at(reused + u.last_out + typed)
+    fresh_rate = (write or inp) if cached else inp
+    cost = (cached * read + (reused - cached + u.last_out + typed) * fresh_rate) / 1e6
+    return f"≈ {_money(cost)} input"
 
 
 def _log_usage_debug(data: dict[str, Any]) -> None:
