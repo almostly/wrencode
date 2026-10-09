@@ -962,7 +962,10 @@ def print_tool_result(result: str, name: str = "") -> None:
         for line in lines[1:4]:
             print(f"{DIM}    {line[:200]}{RESET}")
         return
-    if ui._agent_tag() or name in {"read", "bash"}:  # one line: the size
+    if name == "bash":  # its output already streamed above: just the size
+        print(f"{gutter} {DIM}{len(lines)} line{'s' if len(lines) != 1 else ''}{RESET}")
+        return
+    if ui._agent_tag() or name == "read":  # one line: the size
         if len(lines) == 1 and len(text) <= 120:
             print(f"{gutter} {DIM}{text}{RESET}")
         else:

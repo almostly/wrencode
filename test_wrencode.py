@@ -3423,6 +3423,7 @@ class TestApprovalAndResults(unittest.TestCase):
         self.assertEqual(self._result("  "), "  ⎿ (empty)\n")
         self.assertEqual(self._result("1: a\n2: b\n3: c", "read"), "  ⎿ 3 lines read\n")
         self.assertEqual(self._result("line\nline", "bash"), "  ⎿ 2 lines\n")
+        self.assertEqual(self._result("ok", "bash"), "  ⎿ 1 line\n")  # streamed already
         self.assertEqual(
             self._result("error: nope\ndetail"), "  ⎿ error: nope\n    detail\n"
         )
