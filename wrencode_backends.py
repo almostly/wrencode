@@ -586,24 +586,69 @@ def _count(n: int) -> str:
     return f"{n // 1000}k" if n % 1000 == 0 else f"{n / 1000:.1f}k"
 
 
-def usage_line() -> str:
-    """One line for the person: this turn's tokens, the context fill, the session totals."""
+def context_fill() -> float:
+    """How full the context window is after the latest request, 0.0 to 1.0."""
+    return min(USAGE.prompt / CONTEXT_TOKENS, 1.0) if CONTEXT_TOKENS else 0.0
+
+
+def usage_line(warn_at: float = 0.0) -> str:
+    """The compact line after a turn: tokens up and down, cache hit rate, context meter.
+
+    `warn_at` colors the meter once the context fill reaches it (the auto-compaction
+    threshold), when colors are on.
+    """
     u = USAGE
     turn_in = u.turn_uncached + u.turn_cache_read + u.turn_cache_write
-    cached = f", {_count(u.turn_cache_read)} from cache" if u.turn_cache_read else ""
-    written = (
-        f", {_count(u.turn_cache_write)} cached for next time"
-        if u.turn_cache_write
-        else ""
+    calls = f" ×{u.turn_calls}" if u.turn_calls > 1 else ""
+    hit = f"  ⚡ {100 * u.turn_cache_read // turn_in}% cached" if turn_in else ""
+    fill = context_fill()
+    cells = min(10, round(fill * 10))
+    bar = "▰" * cells + "▱" * (10 - cells)
+    if warn_at and fill >= warn_at and ui.colors_enabled():
+        bar = f"{YELLOW}{bar}{RESET}{DIM}"
+    return f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{calls}{hit}  {bar} {100 * fill:.0f}%"
+
+
+def usage_report() -> list[str]:
+    """The full numbers for /usage: this turn and the session, then the context."""
+    u = USAGE
+    rows = [
+        (
+            "this turn",
+            u.turn_uncached,
+            u.turn_cache_read,
+            u.turn_cache_write,
+            u.turn_out,
+            u.turn_calls,
+        ),
+        (
+            "session",
+            u.session_uncached,
+            u.session_cache_read,
+            u.session_cache_write,
+            u.session_out,
+            u.session_calls,
+        ),
+    ]
+    head = f"{'':<10}{'input':>8}{'cached':>8}{'written':>8}{'output':>8}{'calls':>6}"
+    lines = [head]
+    for name, unc, read, write, out, calls in rows:
+        lines.append(
+            f"{name:<10}{_count(unc + read + write):>8}{_count(read):>8}"
+            f"{_count(write):>8}{_count(out):>8}{calls:>6}"
+        )
+    lines.append(
+        f"context: {_count(u.prompt)} of {_count(CONTEXT_TOKENS)} ({100 * context_fill():.0f}%); "
+        f"input = uncached + cached (read) + written"
     )
-    calls = f" over {u.turn_calls} calls" if u.turn_calls > 1 else ""
-    pct = f" ({100 * u.prompt // CONTEXT_TOKENS}%)" if CONTEXT_TOKENS else ""
+    return lines
+
+
+def usage_title() -> str:
+    """The terminal title: the context fill and the session's tokens at a glance."""
+    u = USAGE
     session_in = u.session_uncached + u.session_cache_read + u.session_cache_write
-    return (
-        f"tokens: {_count(turn_in)} in{cached}{written} · {_count(u.turn_out)} out{calls}"
-        f" · context {_count(u.prompt)} of {_count(CONTEXT_TOKENS)}{pct}"
-        f" · session {_count(session_in)} in, {_count(u.session_out)} out"
-    )
+    return f"wrencode · ctx {100 * context_fill():.0f}% · ↑{_count(session_in)} ↓{_count(u.session_out)}"
 
 
 def _log_usage_debug(data: dict[str, Any]) -> None:

@@ -266,16 +266,26 @@ degrades to a structured summary.
 After each turn wrencode prints one dim line with what the backend reported:
 
 ```
-tokens: 1.7k in, 1.5k from cache, 264 cached for next time · 386 out over 2 calls · context 1.7k of 128k (1%) · session 3.4k in, 555 out
+↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  ▰▱▱▱▱▱▱▱▱▱ 1%
 ```
 
-"in" counts every input token of the turn's requests, "from cache" the part served
-by the prompt cache at the reduced rate, "cached for next time" the part written
-to it. "context" is the size of the latest request, which is what the next
-turn starts from and what auto-compaction watches. Headless runs print the line
-to stderr and add a `usage` object to the `--output-format json` result. Set
-`WRENCODE_SHOW_USAGE=0` to turn the line off. Backends that report no usage
-(local models, the local proxy) print nothing.
+Up is the turn's input tokens, down its output, `×2` the number of model calls,
+`⚡` the share of input served from the prompt cache at the reduced rate, and the
+meter the context fill: the size of the latest request against the model's window,
+which is what the next turn starts from and what auto-compaction watches. The
+meter turns yellow at the compaction threshold. The terminal tab title shows the
+context fill and the session totals. `/usage` prints the full numbers:
+
+```
+             input  cached written  output calls
+this turn     1.6k    1.6k      54     108     1
+session       4.7k    3.9k    1.6k     236     3
+context: 1.6k of 128k (1%); input = uncached + cached (read) + written
+```
+
+Headless runs print the line to stderr and add a `usage` object to the
+`--output-format json` result. Set `WRENCODE_SHOW_USAGE=0` to turn the line off.
+Backends that report no usage (local models, the local proxy) print nothing.
 
 ## Context management
 
@@ -517,6 +527,7 @@ This publishes release assets:
 |`/resume <id>`|Continue an earlier conversation             |
 |`/search <text>`|Search past conversations                  |
 |`/sync`       |Copy this project's history to the mirror now (Postgres history)|
+|`/usage`      |Token usage for this turn and the session    |
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 

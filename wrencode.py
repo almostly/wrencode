@@ -1763,6 +1763,10 @@ def handle_slash_command(
             save_history(messages)
             ui.print_system("Cleared")
         return "handled", configure._MLX_UNCHANGED
+    if cmd == "/usage":
+        for line in backends.usage_report():
+            ui.print_system(line)
+        return "handled", configure._MLX_UNCHANGED
     if cmd in {"/sessions", "/resume", "/search", "/sync"} or cmd.startswith(
         ("/resume ", "/search ")
     ):
@@ -1906,7 +1910,7 @@ def run_headless(
             if verified is False and reason == "done":
                 reason = "verify_failed"
             if SHOW_USAGE and backends.USAGE.session_calls:
-                print(f"{DIM}{backends.usage_line()}{RESET}")
+                print(f"{DIM}{backends.usage_line(COMPACT_AT)}{RESET}")
         except (
             SystemExit
         ):  # setup failed (no backend, key, or model); reason is on stderr
@@ -2198,7 +2202,10 @@ def main() -> None:
             run_agent_turn(messages, system_prompt, mlx_state)
             save_history(messages)
             if SHOW_USAGE and backends.USAGE.turn_calls:
-                print(f"{DIM}{backends.usage_line()}{RESET}")
+                print(f"{DIM}{backends.usage_line(COMPACT_AT)}{RESET}")
+                if sys.stdout.isatty():  # the tab title carries the session totals
+                    sys.stdout.write(f"\033]0;{backends.usage_title()}\007")
+                    sys.stdout.flush()
         except KeyboardInterrupt:
             save_history(messages)
             print(f"\n{DIM}(use /q to quit){RESET}")

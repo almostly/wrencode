@@ -2918,11 +2918,39 @@ class TestUsage(unittest.TestCase):
                 }
             )
             line = backends.usage_line()
+            backends._record_usage({"usage": {"input_tokens": 100, "output_tokens": 1}})
+            report = backends.usage_report()
+            title = backends.usage_title()
+        self.assertEqual(line, "↑ 1.9k  ↓ 386  ⚡ 76% cached  ▱▱▱▱▱▱▱▱▱▱ 2%")
         self.assertEqual(
-            line,
-            "tokens: 1.9k in, 1.5k from cache, 264 cached for next time · 386 out"
-            " · context 1.9k of 128k (1%) · session 1.9k in, 386 out",
+            report[0].split(), ["input", "cached", "written", "output", "calls"]
         )
+        self.assertEqual(
+            report[1].split(), ["this", "turn", "2.0k", "1.5k", "264", "387", "2"]
+        )
+        self.assertTrue(report[3].startswith("context: 100 of 128k (0%)"))
+        self.assertEqual(title, "wrencode · ctx 0% · ↑2.0k ↓387")
+
+    def test_usage_meter_fills_and_warns_at_the_compaction_threshold(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "CONTEXT_TOKENS", 1000),
+            mock.patch.object(ui, "colors_enabled", return_value=True),
+        ):
+            backends._record_usage({"usage": {"input_tokens": 800, "output_tokens": 1}})
+            warned = backends.usage_line(0.75)
+            calm = backends.usage_line(0.9)
+        self.assertIn("▰▰▰▰▰▰▰▰▱▱ 80%", strip_ansi(warned))
+        self.assertIn(ui.YELLOW, warned)
+        self.assertNotIn(ui.YELLOW, calm)
+
+    def test_usage_command_prints_the_report(self):
+        with mock.patch("sys.stdout", io.StringIO()):
+            action, _ = wrencode.handle_slash_command("/usage", [], None)
+            out = sys.stdout.getvalue()
+        self.assertEqual(action, "handled")
+        self.assertIn("this turn", out)
+        self.assertIn("context:", out)
 
     def test_turn_resets_but_session_accumulates(self):
         with mock.patch.object(backends, "BACKEND", "anthropic"):
