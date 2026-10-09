@@ -575,6 +575,73 @@ class TestIntuitiveUI(unittest.TestCase):
         with self.assertRaises(ValueError):
             ui.truecolor("#12345")
 
+    def test_first_run_asks_when_the_terminal_does_not_say_and_theme_switches(self):
+        import types
+
+        fake = types.ModuleType("wrencode.fake_colors")
+        fake.AGENT_TEXT = ui.AGENT_TEXT
+        fake.YELLOW = ui.YELLOW
+        sys.modules["wrencode.fake_colors"] = fake
+        self.addCleanup(sys.modules.pop, "wrencode.fake_colors", None)
+        before = (ui.THEME, ui.THEME_SOURCE)
+        self.addCleanup(ui.apply_theme, before[0] or "dark", before[1])
+        saved: list[dict[str, str]] = []
+        tty_out = io.StringIO()
+        tty_out.isatty = lambda: True  # type: ignore[method-assign]
+        with (
+            mock.patch.object(ui, "THEME_SOURCE", ""),
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch.object(ui, "ask_line", return_value="l"),
+            mock.patch.object(backends, "load_config", return_value={"backend": "x"}),
+            mock.patch.object(backends, "save_config", saved.append),
+            mock.patch("sys.stdout", tty_out),
+        ):
+            app._setup_theme()
+            self.assertEqual((ui.THEME, ui.THEME_SOURCE), ("light", "saved"))
+        self.assertEqual(saved, [{"backend": "x", "theme": "light"}])
+        light_text = ui.baseline_palette("light").text
+        self.assertEqual(fake.AGENT_TEXT, light_text)  # rebound where it was imported
+        self.assertEqual(ui.AGENT_MARK, f"{ui.PALETTE.accent}●{ui.RESET}")
+        with (  # the terminal said: no question
+            mock.patch.object(ui, "THEME_SOURCE", "terminal"),
+            mock.patch.object(ui, "ask_line") as ask,
+        ):
+            app._setup_theme()
+        ask.assert_not_called()
+        with (
+            mock.patch.object(backends, "load_config", return_value={"theme": "light"}),
+            mock.patch.object(backends, "save_config", saved.append),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            app.handle_slash_command("/theme dark", [], None)
+            app.handle_slash_command("/theme", [], None)
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertEqual(saved[-1], {"theme": "dark"})
+        self.assertEqual(ui.THEME, "dark")
+        self.assertIn("Baseline dark (saved by /theme)", out)
+        with (
+            mock.patch.object(backends, "load_config", return_value={"theme": "dark"}),
+            mock.patch.object(backends, "save_config", saved.append),
+            mock.patch.object(ui, "detect_theme", return_value=("light", "terminal")),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            app.handle_slash_command("/theme auto", [], None)
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertEqual(saved[-1], {})  # auto: nothing kept
+        self.assertIn("Baseline light (read from the terminal)", out)
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "config.json").write_text(json.dumps({"theme": "light"}))
+        with mock.patch.dict(
+            os.environ,
+            {"WRENCODE_CONFIG_DIR": str(tmp), "WRENCODE_THEME": "", "COLORFGBG": ""},
+        ):
+            self.assertEqual(ui.detect_theme(), ("light", "saved"))
+        with mock.patch.dict(
+            os.environ, {"WRENCODE_CONFIG_DIR": str(tmp), "WRENCODE_THEME": "dark"}
+        ):
+            self.assertEqual(ui.detect_theme(), ("dark", "env"))  # the variable wins
+
     def test_theme_detection_and_text_colors(self):
         with mock.patch.dict(
             os.environ, {"WRENCODE_THEME": "light", "COLORFGBG": "15;0"}
@@ -585,7 +652,7 @@ class TestIntuitiveUI(unittest.TestCase):
         with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": "0;15"}):
             self.assertEqual(ui.terminal_theme(), "light")
         with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": ""}):
-            self.assertEqual(ui.terminal_theme(), "")  # unknown: no guess
+            self.assertEqual(ui.terminal_theme(), "")  # unknown: no guess (no tty here)
         # Known backgrounds get tints; an unknown one keeps the terminal's own
         # text color, which reads on both (a light grey on white did not).
         self.assertEqual(ui.text_colors("light"), ("\033[38;5;236m", "\033[38;5;94m"))

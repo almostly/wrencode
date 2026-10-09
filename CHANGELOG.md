@@ -2,7 +2,7 @@
 
 ### Feat
 
-- **colors**: wrencode draws in Baseline (github.com/xRiskLab/vscode-themes), dark or light to match the terminal's background, which is read from `COLORFGBG` or asked of the terminal itself: prose in the editor text color, code the way the editor colors it (identifiers blue, keywords red, strings, calls and attributes orange, constants magenta, comments muted), the accent blue on the assistant's dot, the prompt and the banner. `WRENCODE_THEME=light|dark` forces a variant, `ansi` keeps the terminal's own colors, and a Zed theme file (`path.json#Name`) replaces the palette
+- **colors**: wrencode draws in Baseline (github.com/xRiskLab/vscode-themes), dark or light to match the terminal's background, which is read from `COLORFGBG` or asked of the terminal itself (when neither says, the first run asks once; `/theme light|dark|auto` changes the saved answer): prose in the editor text color, code the way the editor colors it (identifiers blue, keywords red, strings, calls and attributes orange, constants magenta, comments muted), the accent blue on the assistant's dot, the prompt and the banner. `WRENCODE_THEME=light|dark` forces a variant, `ansi` keeps the terminal's own colors, and a Zed theme file (`path.json#Name`) replaces the palette
 
 ### Fix
 

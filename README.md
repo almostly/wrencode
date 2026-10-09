@@ -728,8 +728,9 @@ What a session looks like, and the keys that drive it.
   color, code the way the editor colors it (identifiers blue, keywords red,
   strings, calls and attributes orange, constants magenta, comments muted), the
   accent blue on the assistant's dot, the prompt and the banner. The background
-  is read from `COLORFGBG` or asked of the terminal itself (most answer);
-  `WRENCODE_THEME=light` or `dark` forces one, `ansi` draws with the terminal's
+  is read from `COLORFGBG` or asked of the terminal itself (most answer); when
+  neither says, the first run asks you once and `/theme light|dark|auto`
+  changes the saved answer. `WRENCODE_THEME=light` or `dark` forces one, `ansi` draws with the terminal's
   own colors instead, and a [Zed](https://zed.dev) theme file
   (`~/.config/zed/themes/mine.json#Mine Light`) replaces the palette with its
   own.

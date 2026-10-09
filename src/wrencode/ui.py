@@ -14,6 +14,7 @@ import re
 import select
 import sys
 import threading
+import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from typing import Any
@@ -43,23 +44,85 @@ _ANSI_GREEN, _ANSI_YELLOW, _ANSI_RED = "\033[32m", "\033[33m", "\033[31m"
 _ANSI_BRIGHT_CYAN = "\033[96m"
 
 
-def terminal_theme() -> str:
-    """ "light" or "dark" when the terminal's background is known (WRENCODE_THEME
-    wins, then the COLORFGBG hint some terminals export, "15;0" being white on
-    black), else "" for unknown."""
+def query_background(timeout: float = 0.25) -> str:
+    """Ask the terminal for its background color (OSC 11) and answer "light",
+    "dark" or "" when it does not say within `timeout`. Most terminals
+    (iTerm2, Terminal.app, Ghostty, kitty, Alacritty, WezTerm, Warp, VS Code
+    and Zed's) answer at once; one that doesn't sends nothing back."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return ""
+    try:
+        import select
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except Exception:
+        return ""
+    reply = b""
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033]11;?\033\\")
+        sys.stdout.flush()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            left = deadline - time.monotonic()
+            if not select.select([fd], [], [], max(left, 0))[0]:
+                break
+            reply += os.read(fd, 64)
+            if reply.endswith((b"\x07", b"\x1b\\")):
+                break
+    except Exception:
+        return ""
+    finally:
+        with contextlib.suppress(Exception):
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    m = re.search(rb"11;rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", reply)
+    if not m:
+        return ""
+    r, g, b = (int(x[:2], 16) for x in m.groups())
+    return "light" if 0.299 * r + 0.587 * g + 0.114 * b > 128 else "dark"
+
+
+def saved_theme() -> str:
+    """The theme kept in the config file ("light", "dark"), or "" for none or auto."""
+    import json
+
+    config_dir = pathlib.Path(
+        os.environ.get("WRENCODE_CONFIG_DIR", "~/.wrencode")
+    ).expanduser()
+    try:
+        theme = json.loads((config_dir / "config.json").read_text()).get("theme", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return theme if theme in ("light", "dark") else ""
+
+
+def detect_theme() -> tuple[str, str]:
+    """("light" or "dark", where it came from): WRENCODE_THEME=light|dark
+    ("env"), the config file's theme ("saved"), the COLORFGBG hint some
+    terminals export, "15;0" being white on black, or the terminal's answer
+    to a background query ("terminal"); ("", "") when none of them says."""
     theme = os.environ.get("WRENCODE_THEME", "").lower()
     if theme in ("light", "dark"):
-        return theme
-    if theme.endswith("-light"):
-        return "light"
-    if theme.endswith("-dark"):
-        return "dark"
+        return theme, "env"
+    if saved := saved_theme():
+        return saved, "saved"
     fgbg = os.environ.get("COLORFGBG", "")
     if ";" in fgbg:
         bg = fgbg.rsplit(";", 1)[-1]
         if bg.isdigit():
-            return "light" if int(bg) in (7, 15) or int(bg) >= 231 else "dark"
-    return ""
+            light = int(bg) in (7, 15) or int(bg) >= 231
+            return ("light" if light else "dark"), "terminal"
+    if asked := query_background():
+        return asked, "terminal"
+    return "", ""
+
+
+def terminal_theme() -> str:
+    """ "light", "dark", or "" when nothing says (see detect_theme)."""
+    return detect_theme()[0]
 
 
 def text_colors(theme: str) -> tuple[str, str]:
@@ -273,7 +336,7 @@ def resolve_palette(spec: str, background: str) -> tuple[Palette, str]:
     )
 
 
-THEME = terminal_theme()
+THEME, THEME_SOURCE = detect_theme()
 LIGHT = THEME == "light"
 PALETTE, THEME_ERROR = resolve_palette(os.environ.get("WRENCODE_THEME", ""), THEME)
 DIM = PALETTE.muted
@@ -286,6 +349,53 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 )
 BRIGHT_CYAN = PALETTE.accent
 AGENT_TEXT, CODE_TEXT = PALETTE.text, PALETTE.code
+
+# The names the other modules import by value; apply_theme rebinds them there too.
+_COLOR_NAMES = (
+    "DIM",
+    "BLUE",
+    "CYAN",
+    "GREEN",
+    "YELLOW",
+    "RED",
+    "BRIGHT_CYAN",
+    "AGENT_TEXT",
+    "CODE_TEXT",
+    "AGENT_MARK",
+    "TOOL_MARK",
+)
+
+
+def apply_theme(theme: str, source: str = "saved") -> None:
+    """Switch to the Baseline variant for `theme` ("light", "dark", or "" to
+    detect again) in this module and in every wrencode module that imported
+    the color names, so the change shows at once."""
+    global THEME, THEME_SOURCE, LIGHT, PALETTE, THEME_ERROR
+    if theme not in ("light", "dark"):
+        theme, source = detect_theme()
+    THEME, THEME_SOURCE, LIGHT = theme, source, theme == "light"
+    PALETTE, THEME_ERROR = resolve_palette(os.environ.get("WRENCODE_THEME", ""), theme)
+    values = {
+        "DIM": PALETTE.muted,
+        "BLUE": PALETTE.blue,
+        "CYAN": PALETTE.cyan,
+        "GREEN": PALETTE.green,
+        "YELLOW": PALETTE.yellow,
+        "RED": PALETTE.red,
+        "BRIGHT_CYAN": PALETTE.accent,
+        "AGENT_TEXT": PALETTE.text,
+        "CODE_TEXT": PALETTE.code,
+        "AGENT_MARK": f"{PALETTE.accent}●{RESET}",
+        "TOOL_MARK": f"{PALETTE.green}●{RESET}",
+    }
+    this = sys.modules[__name__]
+    for module in [this, *sys.modules.values()]:
+        if module is this or (module.__name__ or "").startswith("wrencode."):
+            for name in _COLOR_NAMES:
+                if hasattr(module, name):
+                    setattr(module, name, values[name])
+
+
 AGENT_MARK = f"{PALETTE.accent}●{RESET}"  # opens every assistant reply
 TOOL_MARK = f"{PALETTE.green}●{RESET}"  # opens every tool call: same dot, its own color
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -450,6 +560,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/sync": "copy this project's history to the mirror now",
     "/usage": "token usage and spend: this turn and the session",
     "/permissions": "rules that allow or deny actions without asking",
+    "/theme": "dark or light colors (or /theme auto)",
     "/mcp": "MCP servers and their tools (/mcp reload reconnects)",
     "/help": "list commands",
     "/quit": "save history and exit",
