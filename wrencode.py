@@ -796,7 +796,9 @@ if sandbox.available():
             "Run a Python snippet in a sandbox: no network, shell or environment, "
             "a standard-library subset, the workspace read-only at /workspace (the "
             "working directory), and read(path), glob(pat), grep(pat) available as "
-            "functions. Printed output and the trailing expression's value come back"
+            "functions returning the same text as the tools (glob: one path per "
+            "line; read: numbered lines; open() works too). Printed output and the "
+            "trailing expression's value come back"
         ),
         {"code": "string"},
         python,
@@ -1353,8 +1355,10 @@ Examples:
         python_line = (
             "- python(code): Run a Python snippet in a sandbox: no network, shell or "
             "environment, a standard-library subset, the workspace read-only at "
-            "/workspace, and read(path), glob(pat), grep(pat) callable inside it. "
-            "print() what you want to see; a trailing expression's value is returned\n"
+            "/workspace, and read(path), glob(pat), grep(pat) callable inside it, "
+            "returning the same text as the tools (glob: one path per line; read: "
+            "numbered lines; open() works too). print() what you want to see; a "
+            "trailing expression's value is returned\n"
         )
     respond_line = ""
     if (respond_schema := _respond_schema()) is not None:
