@@ -266,16 +266,20 @@ degrades to a structured summary.
 After each turn wrencode prints one dim line with what the backend reported:
 
 ```
-↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · Σ $0.21
+↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  42 tok/s ↗  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · Σ $0.21
 ```
 
 Up is the turn's input tokens, down its output, `×2` the number of model calls,
-`⚡` the share of input served from the prompt cache at the reduced rate, and the
-meter the context fill: the size of the latest request against the model's window,
-which is what the next turn starts from and what auto-compaction watches. The
-meter turns yellow at the compaction threshold. Then the turn's cost and, after
-the first turn, the session total. The terminal tab title shows the context fill,
-the session totals and the spend. `/usage` prints the full numbers:
+`⚡` the share of input served from the prompt cache at the reduced rate, then the
+speed: output tokens per second over the turn's requests, with an arrow against
+the previous turn (`↗` at least a tenth faster, `↘` a tenth slower, `→` about the
+same). The rate is measured over the whole request, so the network and the wait
+for the first token are in it; a drop usually means the provider is busy. The
+meter is the context fill: the size of the latest request against the model's
+window, which is what the next turn starts from and what auto-compaction watches.
+It turns yellow at the compaction threshold. Then the turn's cost and, after the
+first turn, the session total. The terminal tab title shows the context fill, the
+session totals, the spend and the speed. `/usage` prints the full numbers:
 
 ```
              input  cached written  output calls      cost
@@ -283,6 +287,7 @@ this turn     1.6k    1.6k      54     108     1   $0.0042
 session       4.7k    3.9k    1.6k     236     3    $0.213
 context: 1.6k of 128k (1%); input = uncached + cached (read) + written
 price: $2/$10 per MTok (cache read $0.20, write $2.50; built-in)
+speed: 42 tok/s this turn (↗ from 36 tok/s last turn); 39 tok/s this session; output tokens over the request's wall time
 ```
 
 While you type, a dim line under the prompt estimates what sending the message
@@ -313,7 +318,7 @@ card above 100K-token prompts is applied per call. The model picker in
 
 Headless runs print the line to stderr and add a `usage` object to the
 `--output-format json` result, with `cost_usd` when every call had a known
-price. Set `WRENCODE_SHOW_USAGE=0` to turn the line and the typing estimate off.
+price and `output_tokens_per_second` for the run. Set `WRENCODE_SHOW_USAGE=0` to turn the line and the typing estimate off.
 Backends that report no usage (local models, the local proxy) print nothing.
 
 ## Context management

@@ -3288,6 +3288,84 @@ class TestPricing(unittest.TestCase):
         self.assertTrue(shown.endswith(" input"))
 
 
+class TestSpeed(unittest.TestCase):
+    """Output tokens per second per turn, and the arrow against the previous turn."""
+
+    def setUp(self):
+        self._orig = backends.USAGE
+        backends.USAGE = backends.Usage()
+        self.addCleanup(setattr, backends, "USAGE", self._orig)
+
+    def _call(self, out: int, seconds: float) -> None:
+        with mock.patch("time.monotonic", side_effect=[100.0, 100.0 + seconds]):
+            backends.USAGE.begin_call()
+            backends._record_usage(
+                {"usage": {"input_tokens": 500, "output_tokens": out}}
+            )
+
+    def test_rate_trend_and_where_it_shows(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "MODEL", "claude-sonnet-5-5"),
+        ):
+            backends.USAGE.begin_turn()
+            self._call(300, 6.0)
+            first = backends.usage_line()
+            backends.USAGE.begin_turn()
+            self._call(400, 5.0)
+            self._call(200, 5.0)
+            faster = backends.usage_line()
+            report = backends.usage_report()
+            title = backends.usage_title()
+            backends.USAGE.begin_turn()
+            self._call(50, 2.0)
+            slower = backends.usage_line()
+            backends.USAGE.begin_turn()
+            self._call(270, 10.0)  # 27 tok/s against 25: within a tenth
+            steady = backends.usage_line()
+            as_dict = backends.USAGE.as_dict()
+        self.assertIn("  50 tok/s  ", first)  # no arrow on the first turn
+        self.assertNotIn("↗", first)
+        self.assertIn("  60 tok/s ↗  ", faster)
+        self.assertIn("  25 tok/s ↘  ", slower)
+        self.assertIn("  27 tok/s →  ", steady)
+        self.assertEqual(
+            report[-1],
+            "speed: 60 tok/s this turn (↗ from 50 tok/s last turn); 56 tok/s this "
+            "session; output tokens over the request's wall time",
+        )
+        self.assertTrue(title.endswith(" · 60 tok/s ↗"), title)
+        self.assertEqual(as_dict["output_tokens_per_second"], 43.6)
+
+    def test_untimed_calls_show_no_rate(self):
+        with mock.patch.object(backends, "BACKEND", "anthropic"):
+            backends._record_usage({"usage": {"input_tokens": 5, "output_tokens": 50}})
+        self.assertNotIn("tok/s", backends.usage_line())
+        self.assertNotIn("tok/s", backends.usage_title())
+        self.assertNotIn("output_tokens_per_second", backends.USAGE.as_dict())
+        self.assertFalse(any("speed:" in line for line in backends.usage_report()))
+        self.assertEqual(backends._speed(7.25), "7.2 tok/s")
+
+    def test_get_response_starts_the_clock(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "openrouter"),
+            mock.patch.object(backends, "API_BASE", "https://x/y"),
+            mock.patch.object(
+                backends,
+                "_http_post",
+                return_value={
+                    "choices": [{"message": {"content": "hi"}}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 40},
+                },
+            ),
+            mock.patch("time.monotonic", side_effect=[10.0, 12.0]),
+        ):
+            backends.get_response([{"role": "user", "content": "x"}], "sys", None)
+        self.assertEqual(backends.USAGE.turn_seconds, 2.0)
+        self.assertEqual(backends.USAGE.turn_rate(), 20.0)
+        self.assertEqual(backends.USAGE.call_started, 0.0)
+
+
 class TestComplete(unittest.TestCase):
     """backends.complete(): one-shot completions shared by compaction and synthesize."""
 

@@ -665,6 +665,10 @@ class Usage:
     of the latest request's prompt: what the context window currently holds.
     Costs are USD from price_for(); `unpriced_calls` counts the calls made
     without a known price, so a total is only shown when it is complete.
+    `*_seconds` is the wall time of the timed requests, for the output rate:
+    tokens per second over the whole request, so the time to the first token
+    and the network are in it. `prev_rate` is the previous turn's rate, for the
+    trend arrow.
     """
 
     turn_uncached: int = 0
@@ -674,6 +678,7 @@ class Usage:
     turn_calls: int = 0
     turn_cost: float = 0.0
     turn_unpriced: int = 0
+    turn_seconds: float = 0.0
     session_uncached: int = 0
     session_cache_read: int = 0
     session_cache_write: int = 0
@@ -681,14 +686,41 @@ class Usage:
     session_calls: int = 0
     session_cost: float = 0.0
     unpriced_calls: int = 0
+    session_seconds: float = 0.0
+    prev_rate: float = 0.0
+    call_started: float = 0.0  # time.monotonic() when the current request began
     prompt: int = 0
     last_cached: int = 0  # the latest request's cache reads + writes
     last_out: int = 0
 
     def begin_turn(self) -> None:
+        if self.turn_seconds:
+            self.prev_rate = self.turn_rate()
         self.turn_uncached = self.turn_cache_read = self.turn_cache_write = 0
         self.turn_out = self.turn_calls = self.turn_unpriced = 0
-        self.turn_cost = 0.0
+        self.turn_cost = self.turn_seconds = 0.0
+
+    def begin_call(self) -> None:
+        self.call_started = time.monotonic()
+
+    def turn_rate(self) -> float:
+        """Output tokens per second over this turn's timed requests, 0 when unknown."""
+        return self.turn_out / self.turn_seconds if self.turn_seconds else 0.0
+
+    def session_rate(self) -> float:
+        return self.session_out / self.session_seconds if self.session_seconds else 0.0
+
+    def trend(self) -> str:
+        """↗ ↘ or → against the previous turn's rate; '' without one to compare."""
+        rate = self.turn_rate()
+        if not rate or not self.prev_rate:
+            return ""
+        change = rate / self.prev_rate - 1
+        if change >= 0.1:
+            return "↗"
+        if change <= -0.1:
+            return "↘"
+        return "→"
 
     def add(
         self,
@@ -697,6 +729,7 @@ class Usage:
         cache_write: int,
         out: int,
         cost: float | None = None,
+        seconds: float = 0.0,
     ) -> None:
         self.turn_uncached += uncached
         self.turn_cache_read += cache_read
@@ -714,6 +747,9 @@ class Usage:
         else:
             self.turn_cost += cost
             self.session_cost += cost
+        if seconds > 0:
+            self.turn_seconds += seconds
+            self.session_seconds += seconds
         self.prompt = uncached + cache_read + cache_write
         self.last_cached = cache_read + cache_write
         self.last_out = out
@@ -732,6 +768,8 @@ class Usage:
         }
         if self.session_calls and not self.unpriced_calls:
             d["cost_usd"] = round(self.session_cost, 6)
+        if self.session_seconds:
+            d["output_tokens_per_second"] = round(self.session_rate(), 1)
         return d
 
 
@@ -762,7 +800,9 @@ def _record_usage(data: dict[str, Any]) -> None:
         cache_write = 0
         out = int(u.get("completion_tokens") or 0)
     cost = call_cost(price_for(), uncached, cache_read, cache_write, out)
-    USAGE.add(uncached, cache_read, cache_write, out, cost)
+    seconds = time.monotonic() - USAGE.call_started if USAGE.call_started else 0.0
+    USAGE.call_started = 0.0
+    USAGE.add(uncached, cache_read, cache_write, out, cost, seconds)
 
 
 def _count(n: int) -> str:
@@ -791,6 +831,20 @@ def context_fill() -> float:
     return min(USAGE.prompt / CONTEXT_TOKENS, 1.0) if CONTEXT_TOKENS else 0.0
 
 
+def _speed(rate: float) -> str:
+    """'42 tok/s', one decimal under ten."""
+    return f"{rate:.1f} tok/s" if rate < 10 else f"{rate:.0f} tok/s"
+
+
+def _pace() -> str:
+    """This turn's output rate with the trend arrow, or '' when no request was timed."""
+    u = USAGE
+    if not u.turn_seconds:
+        return ""
+    arrow = f" {u.trend()}" if u.trend() else ""
+    return f"  {_speed(u.turn_rate())}{arrow}"
+
+
 def _spend() -> str:
     """The turn's cost with the session total, or '' once a call had no price."""
     u = USAGE
@@ -817,7 +871,7 @@ def usage_line(warn_at: float = 0.0) -> str:
     if warn_at and fill >= warn_at and ui.colors_enabled():
         bar = f"{YELLOW}{bar}{RESET}{DIM}"
     return (
-        f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{calls}{hit}  "
+        f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{calls}{hit}{_pace()}  "
         f"{bar} {100 * fill:.0f}%{_spend()}"
     )
 
@@ -877,6 +931,14 @@ def usage_report() -> list[str]:
         f"input = uncached + cached (read) + written"
     )
     lines.append(price_note())
+    if u.turn_seconds or u.session_seconds:
+        speed = f"speed: {_speed(u.session_rate())} this session"
+        if u.turn_seconds:
+            speed = f"speed: {_speed(u.turn_rate())} this turn"
+            if u.trend():
+                speed += f" ({u.trend()} from {_speed(u.prev_rate)} last turn)"
+            speed += f"; {_speed(u.session_rate())} this session"
+        lines.append(speed + "; output tokens over the request's wall time")
     return lines
 
 
@@ -887,6 +949,8 @@ def usage_title() -> str:
     title = f"wrencode · ctx {100 * context_fill():.0f}% · ↑{_count(session_in)} ↓{_count(u.session_out)}"
     if not u.unpriced_calls:
         title += f" · {_money(u.session_cost)}"
+    if u.turn_seconds:
+        title += f" · {_speed(u.turn_rate())}" + (f" {u.trend()}" if u.trend() else "")
     return title
 
 
@@ -1389,6 +1453,7 @@ def get_response(
     flat = [
         {"role": m["role"], "content": flatten_content(m["content"])} for m in messages
     ]
+    USAGE.begin_call()  # _record_usage reads the clock when the reply is parsed
 
     # OpenAI - native function calling
     if BACKEND in OPENAI_FORMAT_BACKENDS:
