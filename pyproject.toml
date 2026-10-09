@@ -61,7 +61,7 @@ include = ["src/wrencode", "README.md"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.3.2"
+version = "0.3.3"
 version_scheme = "pep440"
 tag_format = "$version"
 legacy_tag_formats = ["v$version"]
