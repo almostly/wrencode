@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -641,6 +642,31 @@ class TestIntuitiveUI(unittest.TestCase):
             os.environ, {"WRENCODE_CONFIG_DIR": str(tmp), "WRENCODE_THEME": "dark"}
         ):
             self.assertEqual(ui.detect_theme(), ("dark", "env"))  # the variable wins
+
+    def test_the_terminal_is_asked_for_its_background(self):
+        import pty
+
+        def run(reply: bytes) -> str:
+            pid, fd = pty.fork()
+            if pid == 0:  # the child: in a terminal, ask and print the answer
+                import wrencode.ui as child_ui
+
+                sys.stdout.write("ANSWER=" + child_ui.query_background(1.0) + "\n")
+                sys.stdout.flush()
+                os._exit(0)
+            query = b""
+            while b"\x1b]11;?" not in query:  # the terminal sees the query...
+                query += os.read(fd, 64)
+            os.write(fd, reply)  # ...and answers
+            out = b""
+            with contextlib.suppress(OSError):
+                while b"ANSWER=" not in out or not out.endswith(b"\n"):
+                    out += os.read(fd, 256)
+            os.waitpid(pid, 0)
+            return out.decode(errors="replace").rsplit("ANSWER=", 1)[-1].strip()
+
+        self.assertEqual(run(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\"), "dark")
+        self.assertEqual(run(b"\x1b]11;rgb:ffff/ffff/ffff\x07"), "light")
 
     def test_theme_detection_and_text_colors(self):
         with mock.patch.dict(
