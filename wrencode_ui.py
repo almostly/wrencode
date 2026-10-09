@@ -40,7 +40,13 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
     "\033[31m",
 )
 BRIGHT_CYAN = "\033[96m"
-AGENT_TEXT = "\033[38;5;245m"  # muted grey for agent replies (Claude Code-style)
+AGENT_TEXT = (
+    "\033[38;5;252m"  # the assistant's prose: near-white, a shade off the user's
+)
+AGENT_MARK = (
+    f"{BRIGHT_CYAN}●{RESET}"  # opens every assistant reply (tool lines use a green dot)
+)
+CODE_TEXT = "\033[38;5;223m"  # fenced code: warm, so code reads apart from prose
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _LOADER_MODEL_MAX = 32
 
@@ -586,48 +592,63 @@ _CODE_TOKEN = re.compile(
 )
 
 
-def _highlight_code(code: str) -> str:
-    """Apply light ANSI syntax coloring to a code block (best-effort, any language)."""
+def _highlight_code(code: str, base: str = "") -> str:
+    """Apply light ANSI syntax coloring to a code block (best-effort, any language).
+
+    `base` is the color the rest of the code is drawn in; it is restored after
+    every token so the block keeps its tint.
+    """
 
     def color(m: re.Match[str]) -> str:
         g = m.lastgroup
         if g == "comment":
-            return f"{DIM}{m.group()}{RESET}"
+            return f"{DIM}{m.group()}{RESET}{base}"
         if g == "string":
-            return f"{GREEN}{m.group()}{RESET}"
+            return f"{GREEN}{m.group()}{RESET}{base}"
         if g == "num":
-            return f"{YELLOW}{m.group()}{RESET}"
+            return f"{YELLOW}{m.group()}{RESET}{base}"
         if g == "kw":
-            return f"{BLUE}{m.group()}{RESET}"
+            return f"{BLUE}{m.group()}{RESET}{base}"
         return m.group()
 
     return _CODE_TOKEN.sub(color, code)
 
 
 def render_markdown(text: str) -> str:
-    """Render fenced code blocks (lightly highlighted), inline code, and bold."""
+    """Render fenced code blocks (tinted and lightly highlighted), inline code,
+    bold, and headings; `prose` is the color to return to after a span."""
     blocks: list[str] = []
 
     def stash(m: re.Match[str]) -> str:
         lang = m.group(1) or ""
-        body = _highlight_code(m.group(2).rstrip("\n"))
+        body = _highlight_code(m.group(2).rstrip("\n"), CODE_TEXT)
         head = f"{DIM}┌─ {lang}{RESET}\n" if lang else f"{DIM}┌─{RESET}\n"
-        bordered = "\n".join(f"{DIM}│{RESET} {ln}" for ln in body.split("\n"))
+        bordered = "\n".join(
+            f"{DIM}│{RESET} {CODE_TEXT}{ln}{RESET}" for ln in body.split("\n")
+        )
         blocks.append(f"\n{head}{bordered}\n{DIM}└─{RESET}")
         return f"\x00B{len(blocks) - 1}\x00"
 
     text = re.sub(r"```(\w*)\n?(.*?)```", stash, text, flags=re.DOTALL)
     text = re.sub(r"`([^`\n]+)`", f"{CYAN}\\1{RESET}", text)
     text = re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
+    text = re.sub(r"^#{1,6} +(.+)$", f"{BOLD}\\1{RESET}", text, flags=re.MULTILINE)
     for i, b in enumerate(blocks):
         text = text.replace(f"\x00B{i}\x00", b)
-    return text
+    return re.sub(r"\n{3,}", "\n\n", text)  # one blank line around a block, not two
 
 
 def print_agent_message(text: str) -> None:
-    """Print the agent response in muted grey text — no label, no box."""
-    for line in render_markdown(visible(text)).split("\n"):
-        print(f"{AGENT_TEXT}{line}{RESET}")
+    """Print the agent's reply: a cyan dot opens it, the text hangs under it.
+
+    Prose is near-white, inline code cyan, fenced code warm with a gutter, so
+    what the model says, what it quotes and what it wrote stand apart; the
+    user's own line keeps the ❯ prompt.
+    """
+    rendered = render_markdown(visible(text)).replace(RESET, f"{RESET}{AGENT_TEXT}")
+    for i, line in enumerate(rendered.split("\n")):
+        lead = f"{AGENT_MARK} " if i == 0 else "  "
+        print(f"{lead}{AGENT_TEXT}{line}{RESET}")
     print()
 
 

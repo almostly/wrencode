@@ -114,18 +114,36 @@ class TestRenderMarkdown(unittest.TestCase):
 # Message blocks & confirm
 # ---------------------------------------------------------------------------
 class TestMessageBlocks(unittest.TestCase):
-    def test_print_agent_message_uses_muted_grey_no_label(self):
+    def test_print_agent_message_opens_with_a_dot_and_hangs_the_text(self):
         import io
 
         buf = io.StringIO()
         with mock.patch("sys.stdout", buf):
-            ui.print_agent_message("**done**")
+            ui.print_agent_message("**done**\nsecond line")
         out = buf.getvalue()
         self.assertIn(ui.AGENT_TEXT, out)
+        self.assertTrue(out.startswith(ui.AGENT_MARK + " "), repr(out[:30]))
+        self.assertIn("\n  " + ui.AGENT_TEXT + "second line", out)
         self.assertNotIn("Wren", out)
         self.assertNotIn("You", out)
         self.assertNotIn("\x1b[48;", out)  # no background color
         self.assertIn("done", strip_ansi(out))
+
+    def test_code_blocks_keep_their_tint_and_headings_are_bold(self):
+        out = ui.render_markdown("## Plan\n```python\nx = 1  # one\n```")
+        self.assertIn(f"{ui.BOLD}Plan{ui.RESET}", out)
+        self.assertIn(f"{ui.DIM}│{ui.RESET} {ui.CODE_TEXT}", out)
+        # after a highlighted token the code color comes back, not the prose color
+        self.assertIn(f"{ui.YELLOW}1{ui.RESET}{ui.CODE_TEXT}", out)
+        self.assertIn(f"{ui.DIM}# one{ui.RESET}{ui.CODE_TEXT}", out)
+        self.assertNotIn("\x1b[48;", out)  # no background color
+        spaced = ui.render_markdown("before:\n\n```\nx\n```\n\nafter")
+        self.assertNotIn("\n\n\n", spaced)
+
+    def test_search_snippets_fit_one_line(self):
+        self.assertEqual(wrencode._snippet("  first line\nsecond"), "first line…")
+        self.assertEqual(wrencode._snippet("\n\nonly\n"), "only")
+        self.assertEqual(wrencode._snippet("a" * 20, width=8), "aaaaaaaa…")
 
     def test_print_tool_action_has_no_background(self):
         import io

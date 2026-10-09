@@ -114,7 +114,7 @@ import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
 import wrencode_ui as ui
-from wrencode_ui import BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW
+from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
@@ -1964,6 +1964,13 @@ def run_headless(
     return 1 if is_error else 0
 
 
+def _snippet(text: str, width: int = 110) -> str:
+    """A search hit on one line: its first non-empty line, cut to `width`."""
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    more = "…" if len(first) > width or "\n" in text.strip() else ""
+    return first[:width].rstrip() + more
+
+
 def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
     """/sessions, /resume <id>, /search <text> and /sync, over the Postgres history store."""
     global _SESSION_ID
@@ -1979,11 +1986,13 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
     if word == "/sessions":
         rows = _STORE.sessions(ws)
         for r in rows:
-            mark = "›" if r["id"] == _SESSION_ID else " "
+            current = r["id"] == _SESSION_ID
+            mark = f"{BRIGHT_CYAN}›{RESET}" if current else " "
             when = r["updated_at"].strftime("%Y-%m-%d %H:%M")
             title = ui.visible(r["title"]) or "(empty)"
+            line = f"#{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
             ui.print_system(
-                f"{mark} #{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
+                f"{mark} {BOLD}{line}{RESET}" if current else f"{mark} {line}"
             )
         ui.print_system("/resume <id> continues one; /search <text> looks inside them.")
     elif word == "/sync":
@@ -2022,9 +2031,17 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
         if not hits:
             ui.print_system("No matches.")
         for h in hits:
-            ui.print_system(
-                f"#{h['session_id']:<5} {h['role']:<9} {ui.visible(h['text'])}"
-            )
+            text = _snippet(ui.visible(h["text"]))
+            if h["role"] == "user" and text.startswith("Tool result:"):
+                who, body = f"{DIM}{'tool':<9}{RESET}", f"{DIM}{text}{RESET}"
+            elif h["role"] == "user":
+                who, body = f"{BRIGHT_CYAN}{'❯ you':<9}{RESET}", text
+            else:
+                who, body = (
+                    f"{BRIGHT_CYAN}●{RESET} {'model':<7}",
+                    f"{ui.AGENT_TEXT}{text}{RESET}",
+                )
+            ui.print_system(f"{DIM}#{h['session_id']:<4}{RESET} {who} {body}")
 
 
 def _warn_dotenv_ignored() -> None:
