@@ -564,9 +564,10 @@ class TestIntuitiveUI(unittest.TestCase):
         self.assertEqual((palette.text, err), (by_name.text, ""))
         palette, err = ui.resolve_palette(str(tmp / "missing.json"), "")
         self.assertIn("could not read the theme", err)
-        self.assertEqual(palette.red, ui._ANSI_RED)
+        self.assertEqual(palette, dark)  # Baseline stands in
         palette, err = ui.resolve_palette("solarized", "")
         self.assertIn("is not a theme", err)
+        self.assertEqual(palette, dark)
         with mock.patch.object(ui, "PALETTE", dark):
             banner = ui.render_banner(True)
         self.assertIn(dark.accent + "██", banner)
