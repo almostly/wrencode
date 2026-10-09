@@ -11,9 +11,8 @@ import sys
 import time
 from typing import Any
 
-import wrencode_backends as backends
-import wrencode_ui as ui
-from wrencode_ui import BLUE, BOLD, DIM, RED, RESET, YELLOW
+from . import backends, ui
+from .ui import BLUE, BOLD, DIM, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # synthesize — fuse multiple agent chat transcripts into one provenance-cited synthesis.

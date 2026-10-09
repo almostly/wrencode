@@ -24,8 +24,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import wrencode_ui as ui
-from wrencode_ui import DIM, RED, RESET, YELLOW
+from . import ui
+from .ui import DIM, RED, RESET, YELLOW
 
 # Per-backend defaults. "kind" controls how a backend is treated:
 #   api         - hosted HTTP API, needs an API key

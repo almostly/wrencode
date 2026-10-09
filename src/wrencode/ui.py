@@ -16,7 +16,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-import wrencode_permissions as permissions
+from . import permissions
 
 _AGENT_LOCAL = threading.local()
 

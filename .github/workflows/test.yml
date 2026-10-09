@@ -27,7 +27,7 @@ jobs:
         continue-on-error: true
 
       - name: Run tests
-        run: python -m unittest test_wrencode -v
+        run: python -m unittest discover -s tests -t . -v
 
   lint:
     runs-on: ubuntu-latest

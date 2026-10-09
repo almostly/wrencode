@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
 """WrenCode — a minimal agentic coding assistant inspired by Harold Wren.
 
-A lightweight alternative to Claude Code. This file is the agent loop: the tools,
-the system prompt, the turn loop with its subagents and compaction, headless mode
-and main(). The wrencode_*.py modules beside it are what it calls: the model
-backends, backend/model configuration, the terminal UI, the Claude Agent SDK
-backend and the synthesize subcommand.
+A lightweight alternative to Claude Code. This module is the agent loop: the
+tools, the system prompt, the turn loop with its subagents and compaction,
+headless mode and main(). The modules beside it in the package are what it
+calls: the model backends, backend/model configuration, the terminal UI,
+permission rules, the MCP client, web access, history, the sandbox, the Claude
+Agent SDK backend and the synthesize subcommand.
 
 Supports multiple inference backends: local Apple Silicon via MLX,
 HuggingFace Transformers, Anthropic, OpenAI, OpenRouter, NanoGPT, and local proxy.
@@ -68,7 +68,8 @@ except ImportError:
 # What a project's own .env may set: credentials for the backends, nothing else.
 # Anything that steers the agent (BACKEND, WRENCODE_AUTO_APPROVE, a *_BASE_URL,
 # WRENCODE_CONFIG_DIR, WRENCODE_WORKSPACE, ...) comes only from the real environment
-# or the .env beside this script, so cloning a repository can't reconfigure wrencode.
+# or the .env at the root of a source checkout, so cloning a repository can't
+# reconfigure wrencode.
 DOTENV_PROJECT_KEYS = re.compile(r"^[A-Z0-9_]*_API_KEY$|^ANTHROPIC_WORKSPACE_ID$")
 _DOTENV_IGNORED: list[
     str
@@ -105,28 +106,38 @@ def load_dotenv(path: str, *, trusted: bool) -> list[str]:
     return skipped
 
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_SCRIPT_DIR, ".env"), trusted=True)
-if os.getcwd() != _SCRIPT_DIR:
-    _DOTENV_IGNORED = load_dotenv(os.path.join(os.getcwd(), ".env"), trusted=False)
+# A source checkout (src/wrencode/app.py under a pyproject.toml) may keep a
+# trusted .env at its root; an installed package or the frozen binary has none.
+_SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_TRUSTED_ENV = (
+    _SOURCE_ROOT / ".env" if (_SOURCE_ROOT / "pyproject.toml").is_file() else None
+)
+if _TRUSTED_ENV is not None:
+    load_dotenv(str(_TRUSTED_ENV), trusted=True)
+_PROJECT_ENV = pathlib.Path(os.getcwd()).resolve() / ".env"
+if _PROJECT_ENV != _TRUSTED_ENV:
+    _DOTENV_IGNORED = load_dotenv(str(_PROJECT_ENV), trusted=False)
 
 # The other modules read environment defaults at import, so they come after .env.
-import wrencode_backends as backends
-import wrencode_configure as configure
-import wrencode_history as history
-import wrencode_mcp as mcp
-import wrencode_permissions as permissions
-import wrencode_sandbox as sandbox
-import wrencode_sdk as agent_sdk
-import wrencode_synthesize as synthesize
-import wrencode_ui as ui
-import wrencode_web as web
-from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
+from . import (
+    __version__,
+    backends,
+    configure,
+    history,
+    mcp,
+    permissions,
+    sandbox,
+    synthesize,
+    ui,
+    web,
+)
+from . import sdk as agent_sdk
+from .ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.4.0"
+WRENCODE_VERSION = __version__
 # Project instruction files, in preference order per directory (see find_agents_files).
 AGENTS_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_AGENTS_MD_CHARS = 32_000
