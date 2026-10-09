@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import pathlib
 import shutil
@@ -486,6 +487,73 @@ class TestIntuitiveUI(unittest.TestCase):
         )
         self.assertTrue(lines[1].startswith("HTTP 401"))
         self.assertEqual(lines[2], "Error: something odd")
+
+    def test_themes_from_zed_files_and_the_built_in_baseline(self):
+        dark = ui.palette_from_zed(ui.BUILT_IN_THEMES["baseline-dark"])
+        self.assertEqual(dark.text, "\x1b[38;2;171;178;191m")  # #abb2bf
+        self.assertEqual(dark.keyword, "\x1b[38;2;225;109;118m")  # #e16d76
+        self.assertEqual(dark.number, "\x1b[38;2;198;120;222m")  # #c678de
+        self.assertEqual(dark.accent, "\x1b[38;2;82;139;255m")  # #528bff
+        self.assertEqual(dark.banner_face, dark.accent)
+        self.assertEqual(dark.code, dark.text)  # code reads by its highlighting
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        theme = tmp / "mine.json"
+        theme.write_text(
+            json.dumps(
+                {
+                    "themes": [
+                        {
+                            "name": "Mine Dark",
+                            "appearance": "dark",
+                            "style": {
+                                "text": "#aabbcc",
+                                "terminal.ansi.red": "#ff0000",
+                            },
+                        },
+                        {
+                            "name": "Mine Light",
+                            "appearance": "light",
+                            "style": {
+                                "text": "#112233",
+                                "syntax": {"keyword": {"color": "#00ff00"}},
+                            },
+                        },
+                    ]
+                }
+            )
+        )
+        by_name = ui.load_zed_theme(str(theme), "Mine Light")
+        self.assertEqual(by_name.text, "\x1b[38;2;17;34;51m")
+        self.assertEqual(by_name.keyword, "\x1b[38;2;0;255;0m")
+        self.assertEqual(by_name.red, ui._ANSI_RED)  # not given: the terminal's
+        self.assertEqual(ui.load_zed_theme(str(theme)).text, "\x1b[38;2;170;187;204m")
+        self.assertEqual(
+            ui.load_zed_theme(str(theme), background="light").text, by_name.text
+        )
+        with self.assertRaisesRegex(ValueError, "no theme called 'Nope'"):
+            ui.load_zed_theme(str(theme), "Nope")
+        palette, err = ui.resolve_palette(f"{theme}#Mine Light", "")
+        self.assertEqual((palette.text, err), (by_name.text, ""))
+        palette, err = ui.resolve_palette("baseline", "light")
+        self.assertEqual(palette.text, "\x1b[38;2;56;58;66m")  # the light variant
+        palette, err = ui.resolve_palette("baseline", "")
+        self.assertEqual(palette.text, dark.text)  # unknown background: dark
+        palette, err = ui.resolve_palette("", "")
+        self.assertEqual(
+            (palette.text, palette.red, err), ("\x1b[39m", ui._ANSI_RED, "")
+        )
+        palette, err = ui.resolve_palette(str(tmp / "missing.json"), "")
+        self.assertIn("could not read the theme", err)
+        self.assertEqual(palette.red, ui._ANSI_RED)
+        palette, err = ui.resolve_palette("solarized", "")
+        self.assertIn("is not a theme", err)
+        with mock.patch.object(ui, "PALETTE", dark):
+            banner = ui.render_banner(True)
+        self.assertIn(dark.accent + "██", banner)
+        self.assertIn(dark.muted + "╗", banner)
+        with self.assertRaises(ValueError):
+            ui.truecolor("#12345")
 
     def test_theme_detection_and_text_colors(self):
         with mock.patch.dict(

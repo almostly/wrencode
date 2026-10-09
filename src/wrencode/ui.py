@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pathlib
 import re
 import select
 import sys
 import threading
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from typing import Any
 
 from . import permissions
@@ -31,17 +33,14 @@ def _agent_tag() -> str:
 
 
 # -----------------------------------------------------------------------------------------------
-# Terminal colors
+# Terminal colors and themes
 # -----------------------------------------------------------------------------------------------
-RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
-BLUE, CYAN, GREEN, YELLOW, RED = (
-    "\033[34m",
-    "\033[36m",
-    "\033[32m",
-    "\033[33m",
-    "\033[31m",
-)
-BRIGHT_CYAN = "\033[96m"
+# The plain SGR codes: the terminal's own sixteen colors, which follow whatever
+# theme it has. A theme (WRENCODE_THEME) replaces them with exact colors.
+RESET, BOLD = "\033[0m", "\033[1m"
+_ANSI_DIM, _ANSI_BLUE, _ANSI_CYAN = "\033[2m", "\033[34m", "\033[36m"
+_ANSI_GREEN, _ANSI_YELLOW, _ANSI_RED = "\033[32m", "\033[33m", "\033[31m"
+_ANSI_BRIGHT_CYAN = "\033[96m"
 
 
 def terminal_theme() -> str:
@@ -51,6 +50,10 @@ def terminal_theme() -> str:
     theme = os.environ.get("WRENCODE_THEME", "").lower()
     if theme in ("light", "dark"):
         return theme
+    if theme.endswith("-light"):
+        return "light"
+    if theme.endswith("-dark"):
+        return "dark"
     fgbg = os.environ.get("COLORFGBG", "")
     if ";" in fgbg:
         bg = fgbg.rsplit(";", 1)[-1]
@@ -60,10 +63,11 @@ def terminal_theme() -> str:
 
 
 def text_colors(theme: str) -> tuple[str, str]:
-    """(prose, code) colors for the assistant's replies. On a known background
-    the prose is a shade off the user's text and code has a tint of its own; on
-    an unknown one both use the terminal's own text color, which is readable
-    everywhere, and code is told apart by its gutter and highlighting."""
+    """(prose, code) colors for the assistant's replies with the terminal's own
+    palette. On a known background the prose is a shade off the user's text and
+    code has a tint of its own; on an unknown one both use the terminal's own
+    text color, which is readable everywhere, and code is told apart by its
+    gutter and highlighting."""
     if theme == "light":
         return "\033[38;5;236m", "\033[38;5;94m"
     if theme == "dark":
@@ -71,11 +75,213 @@ def text_colors(theme: str) -> tuple[str, str]:
     return "\033[39m", "\033[39m"
 
 
+@dataclass(frozen=True)
+class Palette:
+    """Every color wrencode draws with, by role."""
+
+    text: str  # the assistant's prose
+    code: str  # fenced code
+    muted: str  # secondary text: results, hints, the loader
+    accent: str  # the assistant's dot, the loader symbol, the y/n prompt
+    red: str
+    green: str
+    yellow: str
+    blue: str  # the ❯ prompt, pickers
+    cyan: str  # inline code, subagent lines
+    keyword: str
+    string: str
+    number: str
+    comment: str
+    diff_add: str
+    diff_del: str
+    banner_face: str = ""  # "" keeps the built-in blue gradient
+    banner_shadow: str = ""
+
+
+def ansi_palette(theme: str) -> Palette:
+    """The terminal's own colors, with the prose and code tints for `theme`."""
+    text, code = text_colors(theme)
+    return Palette(
+        text=text,
+        code=code,
+        muted=_ANSI_DIM,
+        accent=_ANSI_BRIGHT_CYAN,
+        red=_ANSI_RED,
+        green=_ANSI_GREEN,
+        yellow=_ANSI_YELLOW,
+        blue=_ANSI_BLUE,
+        cyan=_ANSI_CYAN,
+        keyword=_ANSI_BLUE,
+        string=_ANSI_GREEN,
+        number=_ANSI_YELLOW,
+        comment=_ANSI_DIM,
+        diff_add=_ANSI_GREEN,
+        diff_del=_ANSI_RED,
+    )
+
+
+def truecolor(hex_color: str) -> str:
+    """An SGR for a "#rrggbb" or "#rrggbbaa" color (the alpha is ignored)."""
+    h = hex_color.strip().lstrip("#")
+    if len(h) not in (6, 8) or any(c not in "0123456789abcdefABCDEF" for c in h):
+        raise ValueError(f"not a color: {hex_color!r}")
+    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def palette_from_zed(style: dict[str, Any]) -> Palette:
+    """A palette from the `style` of a Zed theme: its text colors, terminal
+    colors and syntax colors. Zed's `text` is the terminal foreground, so the
+    prose and code keep it and code is told apart by its highlighting."""
+    syntax = style.get("syntax") or {}
+
+    def color(*keys: str, default: str) -> str:
+        for key in keys:
+            value = style.get(key)
+            if value is None and key.startswith("syntax."):
+                entry = syntax.get(key[len("syntax.") :])
+                value = entry.get("color") if isinstance(entry, dict) else None
+            if isinstance(value, str) and value:
+                return truecolor(value)
+        return default
+
+    text = color("text", "terminal.foreground", default="\033[39m")
+    muted = color("text.muted", "terminal.dim_foreground", default=_ANSI_DIM)
+    return Palette(
+        text=text,
+        code=text,
+        muted=muted,
+        accent=color("text.accent", "terminal.ansi.cyan", default=_ANSI_BRIGHT_CYAN),
+        red=color("terminal.ansi.red", "error", default=_ANSI_RED),
+        green=color("terminal.ansi.green", "success", default=_ANSI_GREEN),
+        yellow=color("terminal.ansi.yellow", "warning", default=_ANSI_YELLOW),
+        blue=color("terminal.ansi.blue", "info", default=_ANSI_BLUE),
+        cyan=color("terminal.ansi.cyan", "hint", default=_ANSI_CYAN),
+        keyword=color("syntax.keyword", default=_ANSI_BLUE),
+        string=color("syntax.string", default=_ANSI_GREEN),
+        number=color("syntax.number", default=_ANSI_YELLOW),
+        comment=color("syntax.comment", default=muted),
+        diff_add=color(
+            "syntax.diff.plus", "version_control.added", default=_ANSI_GREEN
+        ),
+        diff_del=color(
+            "syntax.diff.minus", "version_control.deleted", default=_ANSI_RED
+        ),
+        banner_face=color("text.accent", "terminal.ansi.blue", default=""),
+        banner_shadow=muted,
+    )
+
+
+# Baseline, a Zed theme by Denis Burakov, built in as `baseline`: the subset
+# of its style wrencode draws with.
+BUILT_IN_THEMES: dict[str, dict[str, Any]] = {
+    "baseline-dark": {
+        "text": "#abb2bf",
+        "text.muted": "#5c6370",
+        "text.accent": "#528bff",
+        "terminal.ansi.red": "#e16d76",
+        "terminal.ansi.green": "#72c45a",
+        "terminal.ansi.yellow": "#d19a66",
+        "terminal.ansi.blue": "#62afef",
+        "terminal.ansi.cyan": "#58b6c2",
+        "syntax": {
+            "keyword": {"color": "#e16d76"},
+            "string": {"color": "#d19a66"},
+            "number": {"color": "#c678de"},
+            "comment": {"color": "#5c6370"},
+            "diff.plus": {"color": "#72c45a"},
+            "diff.minus": {"color": "#e16d76"},
+        },
+    },
+    "baseline-light": {
+        "text": "#383a42",
+        "text.muted": "#b6b9c5",
+        "text.accent": "#528bff",
+        "terminal.ansi.red": "#e16d76",
+        "terminal.ansi.green": "#72c45a",
+        "terminal.ansi.yellow": "#d19a66",
+        "terminal.ansi.blue": "#62afef",
+        "terminal.ansi.cyan": "#58b6c2",
+        "syntax": {
+            "keyword": {"color": "#e16d76"},
+            "string": {"color": "#d19a66"},
+            "number": {"color": "#c678de"},
+            "comment": {"color": "#5c6370"},
+            "diff.plus": {"color": "#72c45a"},
+            "diff.minus": {"color": "#e16d76"},
+        },
+    },
+}
+
+
+def load_zed_theme(path: str, name: str = "", background: str = "") -> Palette:
+    """The palette of a Zed theme file (~/.config/zed/themes/*.json): the theme
+    called `name`, else the first one whose appearance matches `background`
+    ("dark" when unknown), else the first."""
+    import json
+
+    try:
+        data = json.loads(pathlib.Path(path).expanduser().read_text())
+    except (OSError, ValueError) as err:
+        raise ValueError(f"could not read the theme {path}: {err}") from err
+    themes = data.get("themes") if isinstance(data, dict) else None
+    if not isinstance(themes, list) or not themes:
+        raise ValueError(f"{path} has no themes in it (a Zed theme file has a list)")
+    themes = [
+        t for t in themes if isinstance(t, dict) and isinstance(t.get("style"), dict)
+    ]
+    if name:
+        chosen = next((t for t in themes if t.get("name") == name), None)
+        if chosen is None:
+            names = ", ".join(str(t.get("name")) for t in themes)
+            raise ValueError(f"{path} has no theme called {name!r} (it has: {names})")
+    else:
+        wanted = background or "dark"
+        chosen = next((t for t in themes if t.get("appearance") == wanted), themes[0])
+    return palette_from_zed(chosen["style"])
+
+
+def resolve_palette(spec: str, background: str) -> tuple[Palette, str]:
+    """The palette WRENCODE_THEME asks for, and an error to show when it
+    couldn't be used (the terminal's colors are used then). `spec` is "",
+    "ansi", "light" or "dark" (the terminal's colors, with tints for that
+    background), a built-in theme name, or a Zed theme file, with "#Name"
+    choosing one of its themes."""
+    spec = spec.strip()
+    low = spec.lower()
+    if low in ("", "ansi", "light", "dark"):
+        return ansi_palette(background if low in ("", "ansi") else low), ""
+    if low in BUILT_IN_THEMES:
+        return palette_from_zed(BUILT_IN_THEMES[low]), ""
+    if f"{low}-{background or 'dark'}" in BUILT_IN_THEMES:
+        return palette_from_zed(BUILT_IN_THEMES[f"{low}-{background or 'dark'}"]), ""
+    path, _, name = spec.partition("#")
+    if path.endswith(".json"):
+        try:
+            return load_zed_theme(path, name.strip(), background), ""
+        except ValueError as err:
+            return ansi_palette(background), str(err)
+    known = ", ".join(["ansi", "light", "dark", *BUILT_IN_THEMES])
+    return ansi_palette(background), (
+        f"WRENCODE_THEME={spec!r} is not a theme; use one of {known}, or a Zed theme file"
+    )
+
+
 THEME = terminal_theme()
 LIGHT = THEME == "light"
-AGENT_TEXT, CODE_TEXT = text_colors(THEME)
-AGENT_MARK = f"{BRIGHT_CYAN}●{RESET}"  # opens every assistant reply
-TOOL_MARK = f"{GREEN}●{RESET}"  # opens every tool call: same dot, its own color
+PALETTE, THEME_ERROR = resolve_palette(os.environ.get("WRENCODE_THEME", ""), THEME)
+DIM = PALETTE.muted
+BLUE, CYAN, GREEN, YELLOW, RED = (
+    PALETTE.blue,
+    PALETTE.cyan,
+    PALETTE.green,
+    PALETTE.yellow,
+    PALETTE.red,
+)
+BRIGHT_CYAN = PALETTE.accent
+AGENT_TEXT, CODE_TEXT = PALETTE.text, PALETTE.code
+AGENT_MARK = f"{PALETTE.accent}●{RESET}"  # opens every assistant reply
+TOOL_MARK = f"{PALETTE.green}●{RESET}"  # opens every tool call: same dot, its own color
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _LOADER_MODEL_MAX = 32
 
@@ -769,10 +975,10 @@ def render_banner(color: bool) -> str:
     """Return the startup banner, colored when color is True."""
     if not color:
         return "\n".join(_BANNER_ROWS)
-    shade = f"\033[38;5;{_BANNER_SHADOW}m"
+    shade = PALETTE.banner_shadow or f"\033[38;5;{_BANNER_SHADOW}m"
     lines = []
     for row, face in zip(_BANNER_ROWS, _BANNER_FACES):
-        tint = f"\033[38;5;{face}m"
+        tint = PALETTE.banner_face or f"\033[38;5;{face}m"
         runs = re.sub(
             r"█+|[^█ ]+",
             lambda m, tint=tint: (tint if m[0][0] == "█" else shade) + m[0],
@@ -988,13 +1194,13 @@ def _highlight_code(code: str, base: str = "") -> str:
     def color(m: re.Match[str]) -> str:
         g = m.lastgroup
         if g == "comment":
-            return f"{DIM}{m.group()}{RESET}{base}"
+            return f"{PALETTE.comment}{m.group()}{RESET}{base}"
         if g == "string":
-            return f"{GREEN}{m.group()}{RESET}{base}"
+            return f"{PALETTE.string}{m.group()}{RESET}{base}"
         if g == "num":
-            return f"{YELLOW}{m.group()}{RESET}{base}"
+            return f"{PALETTE.number}{m.group()}{RESET}{base}"
         if g == "kw":
-            return f"{BLUE}{m.group()}{RESET}{base}"
+            return f"{PALETTE.keyword}{m.group()}{RESET}{base}"
         return m.group()
 
     return _CODE_TOKEN.sub(color, code)
@@ -1016,9 +1222,9 @@ def print_diff(label: str, before: str, after: str, limit: int = 40) -> None:
             m = re.match(r"@@ -(\d+)", line)
             out.append(f"{DIM}@@ {visible(label)}:{m.group(1) if m else '?'}{RESET}")
         elif line.startswith("+"):
-            out.append(f"{GREEN}{shown}{RESET}")
+            out.append(f"{PALETTE.diff_add}{shown}{RESET}")
         elif line.startswith("-"):
-            out.append(f"{RED}{shown}{RESET}")
+            out.append(f"{PALETTE.diff_del}{shown}{RESET}")
         else:
             out.append(f"{DIM}{shown}{RESET}")
     for line in out[:limit]:

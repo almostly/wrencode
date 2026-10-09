@@ -2704,6 +2704,8 @@ def main() -> None:
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(ui.render_banner(ui.colors_enabled()))
+    if ui.THEME_ERROR:
+        print(f"{YELLOW}{ui.visible(ui.THEME_ERROR)}{RESET}")
     mlx_state = backends.load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()

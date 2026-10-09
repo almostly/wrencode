@@ -1,5 +1,9 @@
 ## 0.3.2 (2026-10-09)
 
+### Feat
+
+- **themes**: `WRENCODE_THEME` can name an exact palette: `baseline` (built in, dark and light) or any Zed theme file (`~/.config/zed/themes/mine.json#Name`), whose text, muted, accent, terminal and syntax colors become the prose, hints, marks, diffs and code highlighting; the default stays the terminal's own colors
+
 ### Fix
 
 - replies were barely readable on a light terminal that does not say so: the prose was a light grey chosen for a dark background. Replies now use the terminal's own text color unless the background is known (`COLORFGBG`, or `WRENCODE_THEME=light|dark`), in which case the tints apply as before
