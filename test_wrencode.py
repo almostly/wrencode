@@ -6017,6 +6017,138 @@ class TestHttpRetry(unittest.TestCase):
         self.assertEqual(op.call_count, 1)
 
 
+class TestInterruptedToolCalls(unittest.TestCase):
+    """A turn cut off between the reply and the tool runs must not poison the history."""
+
+    def test_missing_results_are_filled_in_each_format(self):
+        anthropic = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "ok"},
+                    {"type": "tool_use", "id": "a", "name": "read", "input": {}},
+                    {"type": "tool_use", "id": "b", "name": "grep", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "a", "content": "x"}
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "c", "name": "bash", "input": {}}
+                ],
+            },
+        ]
+        self.assertEqual(backends.repair_history(anthropic), 2)
+        self.assertEqual(
+            [b["tool_use_id"] for b in anthropic[2]["content"]], ["b", "a"]
+        )
+        self.assertEqual(anthropic[4]["role"], "user")
+        self.assertEqual(anthropic[4]["content"][0]["tool_use_id"], "c")
+        self.assertEqual(
+            anthropic[4]["content"][0]["content"], backends.INTERRUPTED_RESULT
+        )
+        self.assertEqual(backends.repair_history(anthropic), 0)  # now complete
+        openai = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "x",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    },
+                    {
+                        "id": "y",
+                        "type": "function",
+                        "function": {"name": "grep", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "x", "content": "done"},
+            {"role": "user", "content": "and?"},
+        ]
+        self.assertEqual(backends.repair_history(openai), 1)
+        self.assertEqual(
+            [(m["role"], m.get("tool_call_id")) for m in openai[2:4]],
+            [("tool", "x"), ("tool", "y")],
+        )
+        self.assertEqual(openai[4]["content"], "and?")
+        bedrock = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"toolUse": {"toolUseId": "t1", "name": "read", "input": {}}}
+                ],
+            }
+        ]
+        self.assertEqual(backends.repair_history(bedrock), 1)
+        self.assertEqual(bedrock[1]["content"][0]["toolResult"]["toolUseId"], "t1")
+        self.assertEqual(bedrock[1]["content"][0]["toolResult"]["status"], "error")
+        plain = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "yo"},
+        ]
+        self.assertEqual(backends.repair_history(plain), 0)
+        self.assertEqual(len(plain), 2)
+
+    def test_a_cancelled_turn_and_a_restored_history_are_sendable(self):
+        reply = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "r1",
+                    "name": "read",
+                    "input": {"path": "a"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "r2",
+                    "name": "read",
+                    "input": {"path": "b"},
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+        msgs: list[dict[str, Any]] = [{"role": "user", "content": "read both"}]
+
+        def cancel_on_first(name, args):
+            raise ui.UserCancelled()
+
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(
+                backends, "get_response", lambda *a, **k: json.dumps(reply)
+            ),
+            mock.patch.object(wrencode, "run_tool", cancel_on_first),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            reason = wrencode.run_agent_turn(msgs, "sys", None)
+        self.assertEqual(reason, "cancelled")
+        self.assertEqual([b["tool_use_id"] for b in msgs[-1]["content"]], ["r1", "r2"])
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "history.json").write_text(json.dumps(msgs[:2]))  # saved mid-turn
+        with (
+            mock.patch.dict(
+                os.environ, {"WRENCODE_HISTORY_FILE": str(tmp / "history.json")}
+            ),
+            mock.patch.object(wrencode, "_STORE", None),
+        ):
+            restored = wrencode.load_history()
+        self.assertEqual(restored[-1]["role"], "user")
+        self.assertEqual(
+            [b["tool_use_id"] for b in restored[-1]["content"]], ["r1", "r2"]
+        )
+
+
 class TestTruncationRecovery(unittest.TestCase):
     def setUp(self):
         self._patches = [

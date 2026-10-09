@@ -1121,6 +1121,105 @@ def _append_assistant(
         messages.append({"role": "assistant", "content": blocks})
 
 
+INTERRUPTED_RESULT = "cancelled: the turn was interrupted before this tool ran"
+
+
+def repair_history(messages: list[dict[str, Any]]) -> int:
+    """Give every tool call a result, so the conversation can be sent again.
+
+    A turn cancelled between the model's reply and the tool runs (Escape, a
+    declined approval, Ctrl-C, a crash) leaves an assistant message whose tool
+    calls have no results; the Messages API refuses such a history outright.
+    Missing results are filled in as cancellations, in the format the message
+    is in (Anthropic blocks, OpenAI tool messages or Bedrock Converse blocks).
+    Returns how many results were added.
+    """
+    added = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+        content = msg.get("content")
+        calls = msg.get("tool_calls")
+        if isinstance(calls, list) and calls:  # OpenAI format: tool messages follow
+            wanted = [str(c.get("id")) for c in calls if isinstance(c, dict)]
+            j = i + 1
+            seen: set[str] = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                seen.add(str(messages[j].get("tool_call_id")))
+                j += 1
+            missing = [cid for cid in wanted if cid not in seen]
+            for k, cid in enumerate(missing):
+                messages.insert(
+                    j + k,
+                    {
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "content": INTERRUPTED_RESULT,
+                    },
+                )
+            added += len(missing)
+            i = j + len(missing)
+            continue
+        if not isinstance(content, list):
+            i += 1
+            continue
+        anthropic_ids = [
+            str(b["id"])
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
+        ]
+        bedrock_ids = [
+            str(b["toolUse"].get("toolUseId"))
+            for b in content
+            if isinstance(b, dict) and isinstance(b.get("toolUse"), dict)
+        ]
+        if not anthropic_ids and not bedrock_ids:
+            i += 1
+            continue
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        results = (
+            nxt["content"]
+            if nxt is not None
+            and nxt.get("role") == "user"
+            and isinstance(nxt.get("content"), list)
+            else None
+        )
+        seen = set()
+        for b in results or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result":
+                seen.add(str(b.get("tool_use_id")))
+            elif isinstance(b.get("toolResult"), dict):
+                seen.add(str(b["toolResult"].get("toolUseId")))
+        fill: list[dict[str, Any]] = [
+            {"type": "tool_result", "tool_use_id": cid, "content": INTERRUPTED_RESULT}
+            for cid in anthropic_ids
+            if cid not in seen
+        ] + [
+            {
+                "toolResult": {
+                    "toolUseId": cid,
+                    "content": [{"text": INTERRUPTED_RESULT}],
+                    "status": "error",
+                }
+            }
+            for cid in bedrock_ids
+            if cid not in seen
+        ]
+        if fill:
+            if results is not None and seen:  # a partial result message: complete it
+                results[0:0] = fill
+            else:
+                messages.insert(i + 1, {"role": "user", "content": fill})
+            added += len(fill)
+        i += 1
+    return added
+
+
 def _append_tool_results(
     messages: list[dict[str, Any]],
     results: list[tuple[ToolCall, str]],
