@@ -2830,6 +2830,128 @@ class TestHistoryWiring(unittest.TestCase):
         self.assertIn("Could not save history", sys.stdout.getvalue())
 
 
+class TestUsage(unittest.TestCase):
+    """Token usage from every backend format, and the line the person sees."""
+
+    def setUp(self):
+        self._orig = backends.USAGE
+        backends.USAGE = backends.Usage()
+        self.addCleanup(setattr, backends, "USAGE", self._orig)
+
+    def test_anthropic_counts_cached_and_written_separately(self):
+        with mock.patch.object(backends, "BACKEND", "anthropic"):
+            backends._record_usage(
+                {
+                    "usage": {
+                        "input_tokens": 4,
+                        "output_tokens": 169,
+                        "cache_creation_input_tokens": 1472,
+                        "cache_read_input_tokens": 0,
+                    }
+                }
+            )
+            backends._record_usage(
+                {
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 217,
+                        "cache_creation_input_tokens": 264,
+                        "cache_read_input_tokens": 1472,
+                    }
+                }
+            )
+        u = backends.USAGE
+        self.assertEqual(
+            (u.turn_uncached, u.turn_cache_read, u.turn_cache_write), (6, 1472, 1736)
+        )
+        self.assertEqual(u.turn_out, 386)
+        self.assertEqual(u.prompt, 2 + 264 + 1472)  # the latest request's prompt
+        d = u.as_dict()
+        self.assertEqual(d["input_tokens"], 6 + 1472 + 1736)
+        self.assertEqual(d["model_calls"], 2)
+
+    def test_openai_cached_tokens_are_inside_prompt_tokens(self):
+        with mock.patch.object(backends, "BACKEND", "openai"):
+            backends._record_usage(
+                {
+                    "usage": {
+                        "prompt_tokens": 1000,
+                        "completion_tokens": 50,
+                        "prompt_tokens_details": {"cached_tokens": 900},
+                    }
+                }
+            )
+        u = backends.USAGE
+        self.assertEqual(
+            (u.turn_uncached, u.turn_cache_read, u.turn_out), (100, 900, 50)
+        )
+        self.assertEqual(u.prompt, 1000)
+
+    def test_bedrock_and_missing_usage(self):
+        with mock.patch.object(backends, "BACKEND", "bedrock"):
+            backends._record_usage(
+                {
+                    "usage": {
+                        "inputTokens": 10,
+                        "outputTokens": 5,
+                        "cacheReadInputTokens": 7,
+                    }
+                }
+            )
+            backends._record_usage({"output": {}})  # no usage block: ignored
+        self.assertEqual(backends.USAGE.turn_calls, 1)
+        self.assertEqual(backends.USAGE.prompt, 17)
+
+    def test_usage_line_reads_well(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "CONTEXT_TOKENS", 128000),
+        ):
+            backends._record_usage(
+                {
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 386,
+                        "cache_creation_input_tokens": 264,
+                        "cache_read_input_tokens": 1472,
+                    }
+                }
+            )
+            line = backends.usage_line()
+        self.assertEqual(
+            line,
+            "tokens: 1.9k in, 1.5k from cache, 264 cached for next time · 386 out"
+            " · context 1.9k of 128k (1%) · session 1.9k in, 386 out",
+        )
+
+    def test_turn_resets_but_session_accumulates(self):
+        with mock.patch.object(backends, "BACKEND", "anthropic"):
+            backends._record_usage({"usage": {"input_tokens": 10, "output_tokens": 1}})
+            backends.USAGE.begin_turn()
+            backends._record_usage({"usage": {"input_tokens": 20, "output_tokens": 2}})
+        u = backends.USAGE
+        self.assertEqual((u.turn_uncached, u.session_uncached), (20, 30))
+        self.assertEqual((u.turn_calls, u.session_calls), (1, 2))
+
+    def test_get_response_records_the_openrouter_reply(self):
+        with (
+            mock.patch.object(backends, "BACKEND", "openrouter"),
+            mock.patch.object(backends, "API_BASE", "https://x/y"),
+            mock.patch.object(
+                backends,
+                "_http_post",
+                return_value={
+                    "choices": [{"message": {"content": "hi"}}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 3},
+                },
+            ),
+        ):
+            backends.get_response([{"role": "user", "content": "x"}], "sys", None)
+        self.assertEqual(
+            (backends.USAGE.turn_uncached, backends.USAGE.turn_out), (30, 3)
+        )
+
+
 class TestComplete(unittest.TestCase):
     """backends.complete(): one-shot completions shared by compaction and synthesize."""
 

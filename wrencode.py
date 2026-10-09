@@ -135,6 +135,12 @@ RESPOND_TOOL = "respond"
 _OUTPUT_SCHEMA: dict[str, Any] | None = None
 _STRUCTURED_RESULT: list[Any] = []
 MAX_SUBAGENT_DEPTH = int(os.environ.get("WRENCODE_MAX_SUBAGENT_DEPTH", "2"))
+# A dim line after each turn with the tokens used, cached, and the context fill.
+SHOW_USAGE = os.environ.get("WRENCODE_SHOW_USAGE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 # Task calls made in one reply run this many at a time; 1 runs them in order.
 MAX_PARALLEL_SUBAGENTS = int(os.environ.get("WRENCODE_MAX_PARALLEL_SUBAGENTS", "4"))
 # Auto-compaction: once the estimated prompt passes COMPACT_AT of the model's
@@ -1899,6 +1905,8 @@ def run_headless(
                 )
             if verified is False and reason == "done":
                 reason = "verify_failed"
+            if SHOW_USAGE and backends.USAGE.session_calls:
+                print(f"{DIM}{backends.usage_line()}{RESET}")
         except (
             SystemExit
         ):  # setup failed (no backend, key, or model); reason is on stderr
@@ -1927,6 +1935,8 @@ def run_headless(
             "backend": backends.BACKEND,
             "model": backends.MODEL,
         }
+        if backends.USAGE.session_calls:
+            out["usage"] = backends.USAGE.as_dict()
         if sdk is not None:
             out["cost_usd"] = round(cost_usd, 6)
         if schema is not None:
@@ -2184,8 +2194,11 @@ def main() -> None:
                 agent_sdk_session().run(user_input)
                 continue
             messages.append({"role": "user", "content": user_input})
+            backends.USAGE.begin_turn()
             run_agent_turn(messages, system_prompt, mlx_state)
             save_history(messages)
+            if SHOW_USAGE and backends.USAGE.turn_calls:
+                print(f"{DIM}{backends.usage_line()}{RESET}")
         except KeyboardInterrupt:
             save_history(messages)
             print(f"\n{DIM}(use /q to quit){RESET}")

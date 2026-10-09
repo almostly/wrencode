@@ -261,6 +261,22 @@ latest decisions override earlier ones. A chat whose extraction doesn't come bac
 as JSON is reported and contributes nothing. With a single transcript the result
 degrades to a structured summary.
 
+## Token usage
+
+After each turn wrencode prints one dim line with what the backend reported:
+
+```
+tokens: 1.7k in, 1.5k from cache, 264 cached for next time · 386 out over 2 calls · context 1.7k of 128k (1%) · session 3.4k in, 555 out
+```
+
+"in" counts every input token of the turn's requests, "from cache" the part served
+by the prompt cache at the reduced rate, "cached for next time" the part written
+to it. "context" is the size of the latest request, which is what the next
+turn starts from and what auto-compaction watches. Headless runs print the line
+to stderr and add a `usage` object to the `--output-format json` result. Set
+`WRENCODE_SHOW_USAGE=0` to turn the line off. Backends that report no usage
+(local models, the local proxy) print nothing.
+
 ## Context management
 
 Long sessions are compacted automatically. Before each model call WrenCode
@@ -526,6 +542,7 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`WRENCODE_SANDBOX_MEMORY_MB` |`256`                  |Memory a `python` tool snippet may use|
 |`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
+|`WRENCODE_SHOW_USAGE`        |`1`                    |Print the token usage line after each turn|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
 |`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction and `synthesize`|

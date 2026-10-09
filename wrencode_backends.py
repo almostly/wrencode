@@ -499,6 +499,113 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
         )
 
 
+@dataclass
+class Usage:
+    """Token counts the backend reported: the current turn and the whole session.
+
+    `uncached` are input tokens charged in full, `cache_read` the ones served from
+    the prompt cache, `cache_write` the ones written to it. `prompt` is the size
+    of the latest request's prompt: what the context window currently holds.
+    """
+
+    turn_uncached: int = 0
+    turn_cache_read: int = 0
+    turn_cache_write: int = 0
+    turn_out: int = 0
+    turn_calls: int = 0
+    session_uncached: int = 0
+    session_cache_read: int = 0
+    session_cache_write: int = 0
+    session_out: int = 0
+    session_calls: int = 0
+    prompt: int = 0
+
+    def begin_turn(self) -> None:
+        self.turn_uncached = self.turn_cache_read = self.turn_cache_write = 0
+        self.turn_out = self.turn_calls = 0
+
+    def add(self, uncached: int, cache_read: int, cache_write: int, out: int) -> None:
+        self.turn_uncached += uncached
+        self.turn_cache_read += cache_read
+        self.turn_cache_write += cache_write
+        self.turn_out += out
+        self.turn_calls += 1
+        self.session_uncached += uncached
+        self.session_cache_read += cache_read
+        self.session_cache_write += cache_write
+        self.session_out += out
+        self.session_calls += 1
+        self.prompt = uncached + cache_read + cache_write
+
+    def as_dict(self) -> dict[str, int]:
+        """Session totals, for the headless JSON result."""
+        return {
+            "input_tokens": self.session_uncached
+            + self.session_cache_read
+            + self.session_cache_write,
+            "cache_read_tokens": self.session_cache_read,
+            "cache_write_tokens": self.session_cache_write,
+            "output_tokens": self.session_out,
+            "model_calls": self.session_calls,
+            "context_tokens": self.prompt,
+        }
+
+
+USAGE = Usage()
+
+
+def _record_usage(data: dict[str, Any]) -> None:
+    """Add a native response's usage block to USAGE, whatever the backend's format."""
+    u = data.get("usage") or {}
+    if not isinstance(u, dict) or not u:
+        return
+    if BACKEND == "bedrock":
+        uncached = int(u.get("inputTokens") or 0)
+        cache_read = int(u.get("cacheReadInputTokens") or 0)
+        cache_write = int(u.get("cacheWriteInputTokens") or 0)
+        out = int(u.get("outputTokens") or 0)
+    elif BACKEND in ANTHROPIC_FORMAT_BACKENDS:
+        uncached = int(u.get("input_tokens") or 0)  # excludes the cached tokens
+        cache_read = int(u.get("cache_read_input_tokens") or 0)
+        cache_write = int(u.get("cache_creation_input_tokens") or 0)
+        out = int(u.get("output_tokens") or 0)
+    else:  # OpenAI chat format: prompt_tokens includes the cached ones
+        details = u.get("prompt_tokens_details") or {}
+        cache_read = (
+            int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        )
+        uncached = max(int(u.get("prompt_tokens") or 0) - cache_read, 0)
+        cache_write = 0
+        out = int(u.get("completion_tokens") or 0)
+    USAGE.add(uncached, cache_read, cache_write, out)
+
+
+def _count(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    return f"{n // 1000}k" if n % 1000 == 0 else f"{n / 1000:.1f}k"
+
+
+def usage_line() -> str:
+    """One line for the person: this turn's tokens, the context fill, the session totals."""
+    u = USAGE
+    turn_in = u.turn_uncached + u.turn_cache_read + u.turn_cache_write
+    cached = f", {_count(u.turn_cache_read)} from cache" if u.turn_cache_read else ""
+    written = (
+        f", {_count(u.turn_cache_write)} cached for next time"
+        if u.turn_cache_write
+        else ""
+    )
+    calls = f" over {u.turn_calls} calls" if u.turn_calls > 1 else ""
+    pct = f" ({100 * u.prompt // CONTEXT_TOKENS}%)" if CONTEXT_TOKENS else ""
+    session_in = u.session_uncached + u.session_cache_read + u.session_cache_write
+    return (
+        f"tokens: {_count(turn_in)} in{cached}{written} · {_count(u.turn_out)} out{calls}"
+        f" · context {_count(u.prompt)} of {_count(CONTEXT_TOKENS)}{pct}"
+        f" · session {_count(session_in)} in, {_count(u.session_out)} out"
+    )
+
+
 def _log_usage_debug(data: dict[str, Any]) -> None:
     """When WRENCODE_DEBUG=1, print one stderr line per turn with token usage.
 
@@ -532,6 +639,7 @@ def _parse_native_response(data: dict[str, Any]) -> tuple[str, list[ToolCall]]:
     """Parse a native (Anthropic / Bedrock Converse / OpenAI) response into text + tool calls."""
     _warn_if_truncated(data)
     _log_usage_debug(data)
+    _record_usage(data)
     if BACKEND == "bedrock":
         blocks = data.get("output", {}).get("message", {}).get("content", [])
         text = "\n".join(b["text"] for b in blocks if "text" in b).strip()
@@ -1006,6 +1114,7 @@ def get_response(
             },
             _openai_headers(),
         )
+        _record_usage(data)
         return str(data["choices"][0]["message"]["content"])
 
     # AWS Bedrock — model-agnostic Converse API (Claude, Llama, Nova, GPT-OSS…).
