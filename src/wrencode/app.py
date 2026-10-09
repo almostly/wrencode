@@ -2025,6 +2025,9 @@ def handle_slash_command(
     if cmd == "/permissions" or cmd.startswith("/permissions "):
         _permissions_command(cmd)
         return "handled", configure._MLX_UNCHANGED
+    if cmd == "/theme" or cmd.startswith("/theme "):
+        _theme_command(cmd)
+        return "handled", configure._MLX_UNCHANGED
     if cmd == "/mcp" or cmd.startswith("/mcp "):
         _mcp_command(cmd)
         return "handled", configure._MLX_UNCHANGED
@@ -2411,6 +2414,44 @@ def _mcp_command(cmd: str) -> None:
     )
 
 
+def _setup_theme() -> None:
+    """When nothing says whether the terminal is dark or light, ask once on the
+    first run and keep the answer in the config file (/theme changes it)."""
+    if ui.THEME_SOURCE or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    answer = ui.ask_line("Is this terminal dark or light? d/l [d] ").strip().lower()
+    theme = "light" if answer.startswith("l") else "dark"
+    ui.apply_theme(theme)
+    backends.save_config({**backends.load_config(), "theme": theme})
+    ui.print_system(f"Using the {theme} colors; /theme changes that.")
+
+
+def _theme_command(cmd: str) -> None:
+    """/theme shows the colors in use; /theme light|dark|auto switches and saves."""
+    words = cmd.split()
+    choice = words[1].lower() if len(words) > 1 else ""
+    if choice not in ("", "light", "dark", "auto"):
+        ui.print_system(
+            "Usage: /theme  ·  /theme light  ·  /theme dark  ·  /theme auto"
+        )
+        return
+    if choice:
+        ui.apply_theme("" if choice == "auto" else choice)
+        cfg = backends.load_config()
+        if choice == "auto":
+            cfg.pop("theme", None)
+        else:
+            cfg["theme"] = choice
+        backends.save_config(cfg)
+    how = {
+        "env": "from WRENCODE_THEME",
+        "saved": "saved by /theme",
+        "terminal": "read from the terminal",
+        "": "the default; the terminal did not say",
+    }[ui.THEME_SOURCE]
+    ui.print_system(f"Baseline {ui.THEME or 'dark'} ({how}).")
+
+
 def _setup_permissions(interactive: bool) -> None:
     """Load the rules; on a terminal, show a project's allow rules once and ask
     whether to use them, since the repository could have put them there."""
@@ -2700,10 +2741,13 @@ def main() -> None:
         raise SystemExit(run_headless(prompt, fmt, int(turns), schema, verify))
 
     _warn_dotenv_ignored()
+    _setup_theme()
     configure.resolve_configuration()
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(ui.render_banner(ui.colors_enabled()))
+    if ui.THEME_ERROR:
+        print(f"{YELLOW}{ui.visible(ui.THEME_ERROR)}{RESET}")
     mlx_state = backends.load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()

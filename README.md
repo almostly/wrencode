@@ -723,76 +723,17 @@ What a session looks like, and the keys that drive it.
 - **Errors.** A failed request is reported as a sentence and a next step
   (`The API key was rejected. Run /configure to enter a new one.`), with the
   raw message under it; `WRENCODE_DEBUG=1` prints it in full.
-- **Light terminals.** The prose and code tints are chosen for a dark
-  background. Set `WRENCODE_THEME=light` on a light one (terminals that
-  export `COLORFGBG` are detected).
-
-## Environment Variables
-
-|Variable                     |Default                |Description                       |
-|-----------------------------|-----------------------|----------------------------------|
-|`BACKEND`                    |chooser/saved config   |Override the saved inference backend|
-|`MODEL`                      |backend-dependent      |Model path or ID                  |
-|`WRENCODE_CONFIG_DIR`        |`~/.wrencode`          |Dir for `config.json` (saved backend/key)|
-|`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
-|`WRENCODE_HISTORY_FILE`      |`<config dir>/history.json`|Conversation history file, without the Postgres store|
-|`WRENCODE_DATABASE_URL`      |-                      |Postgres URL for history; unset, embedded PGlite is used|
-|`WRENCODE_MIRROR_URL`        |-                      |A second Postgres that receives a copy of every saved session|
-|`WRENCODE_PGLITE_START_TIMEOUT`|`60`                 |Seconds to wait for the embedded PGlite to start|
-|`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
-|`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
-|`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
-|`WRENCODE_MAX_PARALLEL_SUBAGENTS`|`4`                |Subagents run at once from one reply; `1` runs them in order|
-|`WRENCODE_SANDBOX_TIMEOUT`   |`30`                   |Seconds a `python` tool snippet may run|
-|`WRENCODE_SANDBOX_MEMORY_MB` |`256`                  |Memory a `python` tool snippet may use|
-|`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
-|`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
-|`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
-|`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
-|`WRENCODE_STREAM`            |`1`                    |Stream replies as they are written (Anthropic and OpenAI-style backends)|
-|`WRENCODE_MCP_TIMEOUT`       |`120`                  |Seconds an MCP tool call may take|
-|`WRENCODE_WEB_SEARCH`        |`1`                    |Offer Anthropic's web search to Claude (anthropic backend)|
-|`WRENCODE_FETCH_MAX_CHARS`   |`40000`                |Characters of a fetched page returned per call|
-|`WRENCODE_FETCH_LOCAL`       |unset                  |`1` lets `fetch` reach loopback, private and link-local addresses|
-|`WRENCODE_MCP_CONNECT_TIMEOUT`|`20`                  |Seconds to connect to an MCP server|
-|`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
-|`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
-|`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
-|`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction and `synthesize`|
-|`WRENCODE_COMPACT_AT`        |`0.75`                 |Compact at this fraction of the window (`0` disables)|
-|`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |
-|`MAX_READ_LINES`             |`800`                  |Max lines returned per read       |
-|`GREP_MAX_MATCHES`           |`80`                   |Max grep results                  |
-|`BASH_TIMEOUT`               |`120`                  |Shell command timeout in seconds  |
-|`MAX_TOOL_OUTPUT_CHARS`      |`48000`                |Max tool output before truncation |
-|`GLOB_SKIP_DIRS`             |`.git,node_modules,...`|Directories to skip in glob       |
-|`OPENROUTER_API_KEY`         |-                      |OpenRouter API key                |
-|`NANOGPT_API_KEY`            |-                      |NanoGPT API key                   |
-|`OPENAI_API_KEY`             |-                      |OpenAI API key                    |
-|`ANTHROPIC_API_KEY`          |-                      |Anthropic API key                 |
-|`ANTHROPIC_WORKSPACE_ID`     |-                      |Anthropic workspace id (`wrkspc_…`); required for multi-workspace keys|
-|`LOCAL_API_KEY`              |`local`                |Local proxy API key               |
-|`LOCAL_PORT`                 |`8082`                 |Local proxy port                  |
-|`OLLAMA_HOST`                |`http://localhost:11434`|Ollama server base URL           |
-|`OPENAI_COMPATIBLE_BASE_URL` |`http://localhost:8000/v1`|OpenAI-compatible server base URL|
-|`OPENAI_COMPATIBLE_API_KEY`  |-                      |Key for that server, if it needs one|
-
-## History
-
-By default the conversation is saved to `~/.wrencode/history.json` and restored on
-the next launch (`WRENCODE_HISTORY_FILE` moves it; `/c` clears it).
-
-With the `history` extra, conversations live in Postgres instead, as sessions per
-project: wrencode resumes the project's latest session on launch, `/clear` starts a
-new one and keeps the old, `/sessions` lists them, `/resume` picks one to continue (or `/resume <id>`) and
-`/search <text>` looks inside all of them (Postgres full-text search).
-
-```bash
-pip install 'wrencode[history]'   # psycopg; Node.js is needed for the embedded engine
-```
-
-Two engines, both real Postgres:
-
+- **Colors.** wrencode draws in [Baseline](https://github.com/xRiskLab/vscode-themes),
+  dark or light to match the terminal's background: prose in the editor text
+  color, code the way the editor colors it (identifiers blue, keywords red,
+  strings, calls and attributes orange, constants magenta, comments muted), the
+  accent blue on the assistant's dot, the prompt and the banner. The background
+  is read from `COLORFGBG` or asked of the terminal itself (most answer); when
+  neither says, the first run asks you once and `/theme light|dark|auto`
+  changes the saved answer. `WRENCODE_THEME=light` or `dark` forces one, `ansi` draws with the terminal's
+  own colors instead, and a [Zed](https://zed.dev) theme file
+  (`~/.config/zed/themes/mine.json#Mine Light`) replaces the palette with its
+  own.
 - **Embedded PGlite** (the default): Postgres compiled to WebAssembly, run by Node.js
   with a persistent data directory under `~/.wrencode/pglite`. The first launch runs
   `npm install` there for the pinned `@electric-sql/pglite` packages; after that it
