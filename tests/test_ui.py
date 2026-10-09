@@ -501,6 +501,7 @@ class TestIntuitiveUI(unittest.TestCase):
         self.assertEqual(lines[2], "Error: something odd")
 
     def test_baseline_is_the_default_and_zed_files_load(self):
+        self.enterContext(mock.patch.object(ui, "TRUECOLOR", True))
         dark = ui.baseline_palette("dark")
         self.assertEqual(dark.text, "\x1b[38;2;171;178;191m")  # #abb2bf
         self.assertEqual(dark.code, "\x1b[38;2;98;175;239m")  # #62afef: identifiers
@@ -667,6 +668,26 @@ class TestIntuitiveUI(unittest.TestCase):
 
         self.assertEqual(run(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\"), "dark")
         self.assertEqual(run(b"\x1b]11;rgb:ffff/ffff/ffff\x07"), "light")
+
+    def test_colors_fall_back_to_256_where_truecolor_is_not_supported(self):
+        self.assertTrue(ui.supports_truecolor({"COLORTERM": "truecolor"}))
+        self.assertTrue(ui.supports_truecolor({"TERM_PROGRAM": "iTerm.app"}))
+        self.assertFalse(ui.supports_truecolor({"TERM_PROGRAM": "Apple_Terminal"}))
+        self.assertFalse(ui.supports_truecolor({}))
+        self.assertTrue(ui.supports_truecolor({"WRENCODE_TRUECOLOR": "1"}))
+        self.assertFalse(
+            ui.supports_truecolor({"COLORTERM": "truecolor", "WRENCODE_TRUECOLOR": "0"})
+        )
+        self.assertEqual(ui.nearest_256(0, 0, 0), 16)
+        self.assertEqual(ui.nearest_256(255, 255, 255), 231)
+        self.assertEqual(ui.nearest_256(128, 128, 128), 244)  # the grey ramp
+        self.assertEqual(ui.nearest_256(225, 109, 118), 168)  # #e16d76
+        with mock.patch.object(ui, "TRUECOLOR", False):
+            self.assertEqual(ui.truecolor("#e16d76"), "\x1b[38;5;168m")
+            palette = ui.baseline_palette("dark")
+        self.assertTrue(palette.keyword.startswith("\x1b[38;5;"))
+        with mock.patch.object(ui, "TRUECOLOR", True):
+            self.assertEqual(ui.truecolor("#e16d76"), "\x1b[38;2;225;109;118m")
 
     def test_theme_detection_and_text_colors(self):
         with mock.patch.dict(
