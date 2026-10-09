@@ -771,34 +771,53 @@ def python(args: dict[str, Any]) -> str:
     """Run a model-written Python snippet in the sandbox (see wrencode_sandbox).
 
     The snippet can't reach the network, a shell or the environment, and sees the
-    workspace read-only, so it runs without an approval prompt. wrencode's own
-    read, glob and grep are available inside it as functions.
+    workspace read-only, so it runs without an approval prompt. The workspace
+    tools are available inside it as functions that return Python values rather
+    than tool text: glob() a list of workspace-relative paths, read() the file's
+    text, grep() a list of "path:line:text" strings. A tool error is raised.
     """
     code = _require_str(args, "code")
+    root = workspace_root()
 
-    def as_tool(fn: ToolFn, **kw: Any) -> str:
-        return fn({k: v for k, v in kw.items() if v is not None})
+    def failing(text: str) -> str:
+        if text.startswith("error:"):
+            raise RuntimeError(text.removeprefix("error:").strip())
+        return text
 
-    functions = {
-        "read": lambda path, offset=None, limit=None: as_tool(
-            read, path=path, offset=offset, limit=limit
-        ),
-        "glob": lambda pat, path=None: as_tool(glob, pat=pat, path=path),
-        "grep": lambda pat, path=None: as_tool(grep, pat=pat, path=path),
-    }
-    return sandbox.run(code, workspace=workspace_root(), functions=functions)
+    def read_text(path: str) -> str:
+        p = resolve_tool_path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"not a file: {path}")
+        if p.stat().st_size > MAX_READ_BYTES:
+            raise ValueError(
+                f"file too large ({p.stat().st_size} bytes, max {MAX_READ_BYTES})"
+            )
+        return p.read_text(encoding="utf-8", errors="replace")
+
+    def glob_paths(pat: str, path: str | None = None) -> list[str]:
+        out = failing(glob({"pat": pat, **({"path": path} if path else {})}))
+        return [os.path.relpath(f, root) for f in out.splitlines() if out != "none"]
+
+    def grep_lines(pat: str, path: str | None = None) -> list[str]:
+        out = failing(grep({"pat": pat, **({"path": path} if path else {})}))
+        return [] if out == "none" else out.splitlines()
+
+    functions = {"read": read_text, "glob": glob_paths, "grep": grep_lines}
+    return sandbox.run(code, workspace=root, functions=functions)
 
 
 # An eighth tool when pydantic-monty is installed (pip install 'wrencode[sandbox]').
 if sandbox.available():
     TOOLS["python"] = (
         (
-            "Run a Python snippet in a sandbox: no network, shell or environment, "
-            "a standard-library subset, the workspace read-only at /workspace (the "
-            "working directory), and read(path), glob(pat), grep(pat) available as "
-            "functions returning the same text as the tools (glob: one path per "
-            "line; read: numbered lines; open() works too). Printed output and the "
-            "trailing expression's value come back"
+            "Run a Python snippet in a sandbox: no network, shell or environment, a "
+            "standard-library subset (no os.walk or os.listdir), the workspace "
+            "read-only at /workspace (the working directory, so open('x.py') works). "
+            "Functions available: glob(pat) -> list of workspace-relative paths, "
+            "read(path) -> the file's text, grep(pat) -> list of 'path:line:text'. "
+            "Each call is a fresh interpreter: nothing persists between calls, so do "
+            "the whole job in one snippet. Printed output and the trailing "
+            "expression's value come back"
         ),
         {"code": "string"},
         python,
@@ -1354,11 +1373,13 @@ Examples:
     if "python" in TOOLS:
         python_line = (
             "- python(code): Run a Python snippet in a sandbox: no network, shell or "
-            "environment, a standard-library subset, the workspace read-only at "
-            "/workspace, and read(path), glob(pat), grep(pat) callable inside it, "
-            "returning the same text as the tools (glob: one path per line; read: "
-            "numbered lines; open() works too). print() what you want to see; a "
-            "trailing expression's value is returned\n"
+            "environment, a standard-library subset (no os.walk or os.listdir), the "
+            "workspace read-only at /workspace (the working directory). Functions: "
+            "glob(pat) -> list of workspace-relative paths, read(path) -> the file's "
+            "text, grep(pat) -> list of 'path:line:text'. Each call is a fresh "
+            "interpreter, nothing persists between calls, so do the whole job in one "
+            "snippet; print() what you want to see, a trailing expression's value "
+            "is returned\n"
         )
     respond_line = ""
     if (respond_schema := _respond_schema()) is not None:

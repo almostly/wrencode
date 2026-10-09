@@ -2425,18 +2425,26 @@ class TestPythonTool(unittest.TestCase):
 
     def test_runs_with_the_workspace_tools(self):
         with tempfile.TemporaryDirectory() as d:
-            pathlib.Path(d, "f.txt").write_text("needle here\n")
+            pathlib.Path(d, "f.txt").write_text("needle here\nsecond\n")
+            pathlib.Path(d, "sub").mkdir()
+            pathlib.Path(d, "sub", "g.txt").write_text("nothing\n")
             with mock.patch.dict(os.environ, {"WRENCODE_WORKSPACE": d}):
                 out = wrencode.python(
                     {
-                        "code": "print(read('f.txt'))\n"
-                        "print(len(glob('*.txt').splitlines()))\n"
-                        "'needle' in grep('needle')"
+                        "code": "paths = sorted(glob('**/*.txt'))\n"
+                        "print(paths)\n"
+                        "print(len(read('f.txt').splitlines()))\n"
+                        "print(grep('needle'))\n"
+                        "open('f.txt').read().startswith('needle')"
                     }
                 )
-        self.assertIn("needle here", out)
-        self.assertIn("\n1\n", out)
+                missing = wrencode.python({"code": "read('nope.txt')"})
+        self.assertIn("['f.txt', 'sub/g.txt']", out)  # relative paths, a real list
+        self.assertIn("\n2\n", out)  # raw text, not numbered lines
+        self.assertIn("f.txt:1:needle here", out)
         self.assertTrue(out.endswith("True"))
+        self.assertTrue(missing.startswith("error:"))
+        self.assertIn("FileNotFoundError", missing)
 
 
 class TestHardening(unittest.TestCase):
