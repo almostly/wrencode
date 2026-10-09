@@ -3828,7 +3828,7 @@ class TestStreaming(unittest.TestCase):
         plain = strip_ansi(out)
         # raw while it streams, then the finished line redrawn in place, dot kept
         self.assertTrue(
-            plain.startswith("● Use `x`\r\x1b[K● Use x now\n"), repr(plain[:40])
+            plain.startswith("● Use `x`\r\x1b[J● Use x now\n"), repr(plain[:40])
         )
         self.assertIn("  ┌─ py\n", plain)
         self.assertIn("│ x = 1\n", plain)
