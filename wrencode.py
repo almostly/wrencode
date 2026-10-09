@@ -73,6 +73,7 @@ DOTENV_PROJECT_KEYS = re.compile(r"^[A-Z0-9_]*_API_KEY$|^ANTHROPIC_WORKSPACE_ID$
 _DOTENV_IGNORED: list[
     str
 ] = []  # names a project .env tried to set; reported at startup
+_DOTENV_APPLIED: list[str] = []  # names a project .env did set; reported too
 
 
 def load_dotenv(path: str, *, trusted: bool) -> list[str]:
@@ -97,7 +98,10 @@ def load_dotenv(path: str, *, trusted: bool) -> list[str]:
         if not trusted and not DOTENV_PROJECT_KEYS.match(key):
             skipped.append(key)
             continue
-        os.environ.setdefault(key, value)
+        if key not in os.environ:
+            os.environ[key] = value
+            if not trusted:
+                _DOTENV_APPLIED.append(key)
     return skipped
 
 
@@ -448,11 +452,15 @@ def glob(args: dict[str, Any]) -> str:
     base = resolve_tool_path(args.get("path", "."))
     if not base.is_dir():
         return f"error: not a directory: {base}"
-    files = [
-        f
-        for f in globlib.glob(str(base / pat), recursive=True)
-        if os.path.isfile(f) and all(p not in _GLOB_SKIP for p in pathlib.Path(f).parts)
-    ]
+    files = []
+    for f in globlib.glob(str(base / pat), recursive=True):
+        if not os.path.isfile(f) or any(p in _GLOB_SKIP for p in pathlib.Path(f).parts):
+            continue
+        try:  # a pattern with .. or a symlink can leave the workspace
+            resolve_tool_path(f)
+        except ValueError:
+            continue
+        files.append(f)
     return "\n".join(sorted(files, key=os.path.getmtime, reverse=True)) or "none"
 
 
@@ -908,8 +916,14 @@ def normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _hidden_path_note(path: Any) -> str:
-    """A warning for paths under a dot-directory or dotfile: hooks, workflows, rc files."""
-    parts = pathlib.PurePath(str(path)).parts
+    """A warning for paths under a dot-directory or dotfile: hooks, workflows, rc
+    files. Judged on the resolved, workspace-relative path, so `x/../.git/hooks`
+    is flagged too."""
+    try:
+        shown: Any = resolve_tool_path(path).relative_to(workspace_root())
+    except (ValueError, OSError, RuntimeError):
+        shown = path
+    parts = pathlib.PurePath(str(shown)).parts
     hidden = any(p.startswith(".") and p not in {".", ".."} for p in parts)
     return "  ⚠ hidden/config path" if hidden else ""
 
@@ -1655,6 +1669,10 @@ def run_agent_turn(
                 auto_compact(messages, mlx_state)
                 iters -= 1
                 continue
+            except BaseException:  # Escape: what the worker still streams is dropped
+                if printer is not None:
+                    printer.close()
+                raise
             retried_overflow = False
             display_text, tool_calls, raw_data = _parse_response(response_text)
             if printer is not None and printer.started:
@@ -2144,8 +2162,9 @@ def run_headless(
 
 
 def _permissions_command(cmd: str) -> None:
-    """/permissions lists the rules; `allow <rule>`, `deny <rule>` add one to
-    the project file (`--user` to the user file); `forget <rule>` removes it."""
+    """/permissions lists the rules; `allow <rule>`, `deny <rule>` add one for
+    this project (`--user` for every project, `--project` to the shared file
+    in the repository); `forget <rule>` removes it."""
     rules = permissions.ACTIVE
     if rules is None:
         ui.print_system("Permission rules are off in this run.")
@@ -2168,21 +2187,30 @@ def _permissions_command(cmd: str) -> None:
             mark = (
                 f"{GREEN}allow{RESET}" if r.effect == "allow" else f"{RED}deny {RESET}"
             )
-            ui.print_system(f"  {mark}  {r!s:<32} {DIM}{r.source}{RESET}{note}")
+            ui.print_system(
+                f"  {mark}  {ui.visible(str(r)):<32} {DIM}{r.source}{RESET}{note}"
+            )
         home = str(pathlib.Path.home())
         user_file = str(rules.user_file).replace(home, "~", 1)
         ui.print_system(
-            f"{DIM}{user_file} (user) · {permissions.PROJECT_FILE} (project) · "
-            f"/permissions allow|deny <rule> [--user] · forget <rule>{RESET}"
+            f"{DIM}{user_file} (user, local) · {permissions.PROJECT_FILE} (project) · "
+            f"/permissions allow|deny <rule> [--user|--project] · forget <rule>{RESET}"
         )
         return
     verb, rest = words[0], " ".join(words[1:])
-    scope = "user" if "--user" in rest else "project"
-    rest = rest.replace("--user", "").strip()
+    scope = "local"
+    for flag, name in (("--user", "user"), ("--project", "project")):
+        if flag in rest:
+            scope, rest = name, rest.replace(flag, "").strip()
     try:
         if verb in {"allow", "deny"} and rest:
             rule = rules.add(rest, verb, scope)
-            ui.print_system(f"{verb} {rule} saved to the {scope} rules.")
+            where = {
+                "local": "for this project",
+                "user": "for every project",
+                "project": f"to {permissions.PROJECT_FILE}",
+            }[scope]
+            ui.print_system(f"{verb} {ui.visible(str(rule))} saved {where}.")
         elif verb == "forget" and rest:
             n = rules.remove(rest)
             ui.print_system(
@@ -2190,48 +2218,57 @@ def _permissions_command(cmd: str) -> None:
             )
         else:
             ui.print_system(
-                "Usage: /permissions  ·  /permissions allow <rule> [--user]  ·  "
-                "/permissions deny <rule> [--user]  ·  /permissions forget <rule>"
+                "Usage: /permissions  ·  /permissions allow <rule> [--user|--project]"
+                "  ·  /permissions deny <rule> [--user|--project]  ·  "
+                "/permissions forget <rule>"
             )
     except ValueError as err:
         ui.print_system(str(err))
 
 
 def _mcp_tool_fn(tool: mcp.Tool) -> ToolFn:
-    """The callable behind an MCP tool: approval unless read-only, then the call."""
+    """The callable behind an MCP tool: the permission rules, a prompt unless
+    the tool is read-only, then the call."""
 
     def run(args: dict[str, Any]) -> str:
         registry = mcp.ACTIVE
         server = registry.server(tool.server) if registry is not None else None
         if server is None:
             return f"error: MCP server {tool.server} is not available"
-        if not tool.read_only:
-            approval = ui.confirm(
-                "mcp", f"Call {tool.server}:{tool.name}?", f"{tool.server}:{tool.name}"
-            )
-            if approval != "ok":
-                return approval
+        subject = f"{tool.server}:{tool.name}"
+        approval = ui.confirm(
+            "mcp", f"Call {subject}?", subject, ask=not tool.read_only
+        )
+        if approval != "ok":
+            return approval
         return server.call(tool.name, args)
 
     return run
 
 
-def _register_mcp_tools() -> int:
-    """Put every connected server's tools into TOOLS; returns how many."""
+def _register_mcp_tools() -> list[str]:
+    """Put every connected server's tools into TOOLS; returns the names that
+    could not be registered because another tool already has the same name."""
     for name in [n for n in TOOLS if n.startswith("mcp__")]:
         del TOOLS[name]
+    skipped: list[str] = []
     if mcp.ACTIVE is None:
-        return 0
+        return skipped
     for tool in mcp.ACTIVE.tools():
+        if tool.full_name in TOOLS:
+            skipped.append(f"{tool.server}:{tool.name}")
+            continue
         desc = tool.description or f"{tool.name} on the {tool.server} MCP server"
         if tool.read_only:
             desc += " (read-only)"
         TOOLS[tool.full_name] = (desc, tool.schema, _mcp_tool_fn(tool))
-    return len(mcp.ACTIVE.tools())
+    return skipped
 
 
 def _setup_mcp(interactive: bool) -> None:
     """Load the MCP servers; a project's are shown once and started only when accepted."""
+    if mcp.ACTIVE is not None:  # /mcp reload: stop the servers of the old registry
+        mcp.ACTIVE.close()
     registry = mcp.Registry(backends.CONFIG_DIR / "mcp.json", workspace_root())
     mcp.ACTIVE = registry
     if registry.project_servers and not registry.project_trusted():
@@ -2247,12 +2284,13 @@ def _setup_mcp(interactive: bool) -> None:
         else:
             print(f"{YELLOW}{where} would start these MCP servers:{RESET}")
             for name, spec in registry.project_servers.items():
-                how = spec.get("url") or " ".join(
-                    [str(spec.get("command", "")), *map(str, spec.get("args") or [])]
-                )
-                print(f"  {name}: {ui.visible(str(how))[:120]}")
+                shown = ui.visible(json.dumps(spec, ensure_ascii=False))
+                if len(shown) > 400:
+                    shown = shown[:397] + "…"
+                print(f"  {ui.visible(str(name))}: {shown}")
             print(
-                f"{DIM}They run on this machine, so they only start once you accept them.{RESET}"
+                f"{DIM}They run on this machine with your environment (API keys and "
+                f"loader variables left out), so they only start once you accept them.{RESET}"
             )
             if ui.ask_line("Start them? y/n [n] ").strip().lower() in {"y", "yes"}:
                 registry.trust_project()
@@ -2265,10 +2303,13 @@ def _setup_mcp(interactive: bool) -> None:
         return
     with thinking_spinner("connecting MCP servers"):
         registry.connect_all()
-    _register_mcp_tools()
+    for name in _register_mcp_tools():
+        print(f"{YELLOW}MCP {ui.visible(name)}: skipped, its tool name is taken{RESET}")
     for s in registry.servers:
         if s.error:
-            print(f"{YELLOW}MCP {s.name}: {ui.visible(s.error)[:200]}{RESET}")
+            print(
+                f"{YELLOW}MCP {ui.visible(s.name)}: {ui.visible(s.error)[:200]}{RESET}"
+            )
 
 
 def _mcp_command(cmd: str) -> None:
@@ -2473,6 +2514,8 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
 
 
 def _warn_dotenv_ignored() -> None:
+    if _DOTENV_APPLIED:  # a repository's file set a key: say which
+        print(f"{DIM}Using {', '.join(_DOTENV_APPLIED)} from ./.env{RESET}")
     if _DOTENV_IGNORED:
         names = ", ".join(sorted(set(_DOTENV_IGNORED)))
         print(
@@ -2606,8 +2649,8 @@ def main() -> None:
             ws, backends.BACKEND, backends.MODEL
         )
     messages = load_history()
-    _setup_permissions(interactive=True)
-    _setup_mcp(interactive=True)
+    _setup_permissions(interactive=sys.stdin.isatty())
+    _setup_mcp(interactive=sys.stdin.isatty())
     print(_status_line(messages))
     for path in find_agents_files():
         print(f"{DIM}Loaded {_display_path(pathlib.Path(path))}{RESET}")

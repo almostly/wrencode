@@ -106,20 +106,32 @@ def colors_enabled() -> bool:
     return sys.stdout.isatty()
 
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # keeps \t and \n
+# C0 controls except \t and \n, DEL, the C1 controls, and the Unicode bidi
+# overrides, embeddings and isolates that reorder what a line appears to say.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 
 
 def visible(text: str) -> str:
-    """Show control characters as ^X (Escape as ^[) instead of letting the terminal act on them.
+    """Show control characters as ^X (Escape as ^[), C1 controls and bidi
+    overrides as \\x85 / \\u202e, instead of letting the terminal act on them.
 
     Model output, file contents and command output are untrusted; a carriage
     return or escape sequence in them could redraw the screen or hide part of a
-    command from the approval prompt.
+    command from the approval prompt, and a right-to-left override could make
+    `rm -rf /` read as something else.
     """
-    return _CONTROL_CHARS.sub(
-        lambda m: "^?" if m.group() == "\x7f" else f"^{chr(ord(m.group()) ^ 0x40)}",
-        text,
-    )
+
+    def show(m: re.Match[str]) -> str:
+        ch = m.group()
+        if ch == "\x7f":
+            return "^?"
+        if ord(ch) < 0x20:
+            return f"^{chr(ord(ch) ^ 0x40)}"
+        if ord(ch) < 0x100:
+            return f"\\x{ord(ch):02x}"
+        return f"\\u{ord(ch):04x}"
+
+    return _CONTROL_CHARS.sub(show, text)
 
 
 # What a failure means and what to do about it, for the usual ones. The raw
@@ -360,12 +372,15 @@ def _read_tty_key(fd: int) -> str:
         if not select.select([fd], [], [], 0.02)[0]:
             return "esc"
         code = os.read(fd, 1)
-        while code.isdigit() or code == b";":  # ESC [ 1 ~, ESC [ 3 ~, ESC [ 1 ; 5 C
+        # ESC [ 1 ~, ESC [ 3 ~, ESC [ 1 ; 5 C: digits and ; up to the final byte
+        while code[-1:].isdigit() or code[-1:] == b";":
             if not select.select([fd], [], [], 0.02)[0]:
                 return "esc"
             code += os.read(fd, 1)
         if code == b"200~":  # bracketed paste: everything up to ESC [ 201 ~
             return "paste:" + _read_paste(fd)
+        if code not in _CSI_KEYS and b";" in code:  # a modifier: 1;5C is Ctrl+Right
+            code = code.split(b";")[-1][-1:]
         return _CSI_KEYS.get(code, "esc")
     if ch in "\r\n":
         return "enter"
@@ -779,7 +794,9 @@ def check_cancelled() -> None:
         raise UserCancelled()
 
 
-def confirm(action: str = "", question: str = "", subject: str = "") -> str:
+def confirm(
+    action: str = "", question: str = "", subject: str = "", ask: bool = True
+) -> str:
     """Prompt for approval. Returns 'ok' or a cancellation message for the agent.
 
     `question` is the one line asked ("Apply to app.py?"); `action` names the
@@ -789,11 +806,15 @@ def confirm(action: str = "", question: str = "", subject: str = "") -> str:
     approves once; ``a`` approves all remaining actions this session; ``s``
     saves a rule so this kind of action never asks again; ``n`` declines and
     asks what to do differently. Auto-approve via WRENCODE_AUTO_APPROVE / --yes
-    enables headless use and subagents.
+    enables headless use and subagents. `ask=False` (a read-only tool) applies
+    the rules and then approves without a prompt.
     """
     rules = permissions.ACTIVE
     rule = rules.check(action, subject) if rules is not None and subject else None
-    label = f"{action} {subject}".strip()[:120] if subject else (action or "action")
+    question = visible(question)
+    label = visible(
+        f"{action} {subject}".strip()[:120] if subject else (action or "action")
+    )
     if rule is not None and rule.effect == "deny":
         print(f"{YELLOW}⊘ {label} [denied by rule {rule}]{RESET}")
         return (
@@ -802,6 +823,8 @@ def confirm(action: str = "", question: str = "", subject: str = "") -> str:
         )
     if rule is not None:
         print(f"{DIM}✓ {label} [allowed by rule {rule}]{RESET}")
+        return "ok"
+    if not ask:
         return "ok"
     if (
         os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes")
@@ -855,13 +878,16 @@ def _confirm_from_subagent(action: str, question: str = "", subject: str = "") -
 def _confirm_prompt(question: str = "", action: str = "", subject: str = "") -> str:
     """The interactive approve / allow-all / save-rule / decline prompt: one line, then ❯."""
     global SESSION_AUTO_APPROVE
-    ask = question or "Allow this?"
+    ask = visible(question) or "Allow this?"
     offer = (
         permissions.suggest(action, subject)
         if permissions.ACTIVE is not None and action in permissions.TOOLS and subject
         else ""
     )
-    keys = "Enter yes · a always · " + (f"s allow {offer} · " if offer else "") + "n no"
+    shown = visible(offer)
+    if len(shown) > 60:
+        shown = shown[:57] + "…"
+    keys = "Enter yes · a always · " + (f"s allow {shown} · " if offer else "") + "n no"
     print(
         f"{BOLD}{ask}{RESET}  {DIM}{keys}{RESET}"
         if colors_enabled()
@@ -880,9 +906,9 @@ def _confirm_prompt(question: str = "", action: str = "", subject: str = "") -> 
             print(f"{DIM}Auto-approving remaining actions this session.{RESET}")
             return "ok"
         if choice in ("s", "save") and offer and permissions.ACTIVE is not None:
-            rule = permissions.ACTIVE.add(offer, "allow", "project")
+            rule = permissions.ACTIVE.add(offer, "allow", "local")
             print(
-                f"{DIM}Saved {rule} to {permissions.PROJECT_FILE}; it won't ask again "
+                f"{DIM}Saved {visible(str(rule))} for this project; it won't ask again "
                 f"(/permissions lists and removes rules).{RESET}"
             )
             return "ok"
@@ -946,7 +972,7 @@ def print_diff(label: str, before: str, after: str, limit: int = 40) -> None:
         shown = visible(line)
         if line.startswith("@@"):
             m = re.match(r"@@ -(\d+)", line)
-            out.append(f"{DIM}@@ {label}:{m.group(1) if m else '?'}{RESET}")
+            out.append(f"{DIM}@@ {visible(label)}:{m.group(1) if m else '?'}{RESET}")
         elif line.startswith("+"):
             out.append(f"{GREEN}{shown}{RESET}")
         elif line.startswith("-"):
@@ -1001,6 +1027,8 @@ class StreamPrinter:
         self._fence = False
         self._first_line = True
         self._cur_lead = "  "  # what the line in progress was opened with
+        self._prefix = 2  # columns before the text of the line in progress
+        self.closed = False
 
     def _lead(self) -> str:
         self._cur_lead = f"{AGENT_MARK} " if self._first_line else "  "
@@ -1008,7 +1036,7 @@ class StreamPrinter:
         return self._cur_lead
 
     def feed(self, text: str) -> None:
-        if not text:
+        if not text or self.closed:  # closed: the reply was cancelled
             return
         if not self.started:
             self.started = True
@@ -1025,6 +1053,7 @@ class StreamPrinter:
         if self._shown == 0 and (self._line or not self._fence):
             if not self._line:
                 return
+            self._prefix = 4 if self._fence else 2
             sys.stdout.write(
                 self._lead() + ("" if not self._fence else f"{DIM}│{RESET} ")
             )
@@ -1062,7 +1091,7 @@ class StreamPrinter:
             if _ANSI_RE.sub("", rendered) != raw:
                 # Redraw from the row the line started on; it may have wrapped.
                 width = max(shutil.get_terminal_size().columns, 20)
-                rows = _rows_of(2 + self._shown, width)
+                rows = _rows_of(self._prefix + self._shown, width)
                 up = f"\033[{rows - 1}A" if rows > 1 else ""
                 sys.stdout.write(up + "\r\033[J" + self._cur_lead + rendered + "\n")
             else:
@@ -1083,7 +1112,11 @@ class StreamPrinter:
         sys.stdout.flush()
 
     def close(self) -> None:
-        """End the reply: finish the last line and leave a blank one."""
+        """End the reply: finish the last line and leave a blank one. Text fed
+        after this (a cancelled stream still arriving) is dropped."""
+        if self.closed:
+            return
+        self.closed = True
         if not self.started:
             return
         if self._line:

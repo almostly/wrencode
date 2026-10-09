@@ -1249,6 +1249,7 @@ def _http_stream(
             continue
         with resp:
             for raw in resp:
+                ui.check_cancelled()  # Escape: stop reading, closing the connection
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -1343,6 +1344,11 @@ def _stream_anthropic(
         if raw.strip():
             with contextlib.suppress(ValueError):
                 blocks[index]["input"] = json.loads(raw)
+    # A text block opened but never written to (around a tool call, or a cut
+    # stream) must not go back to the API: it rejects empty text blocks.
+    message["content"] = [
+        b for b in blocks if b.get("type") != "text" or str(b.get("text", "")).strip()
+    ]
     return message
 
 
@@ -1391,7 +1397,12 @@ def _stream_openai(
                 text += piece
                 on_text(piece)
             for tc in delta.get("tool_calls") or []:
-                i = int(tc.get("index", 0))
+                if "index" in tc:
+                    i = int(tc["index"])
+                elif tc.get("id") and all(c["id"] != tc["id"] for c in calls.values()):
+                    i = len(calls)  # servers that send whole calls without an index
+                else:
+                    i = max(calls, default=0)
                 call = calls.setdefault(
                     i,
                     {

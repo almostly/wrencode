@@ -19,6 +19,7 @@ import pathlib
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -128,6 +129,27 @@ def _socket_dir(root: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(tempfile.gettempdir()) / f"wrencode-{os.getuid()}-{digest}"
 
 
+def _private_dir(d: pathlib.Path) -> None:
+    """Make `d` owner-only, or make sure it already is: in a shared temp
+    directory someone else could have created the name first."""
+    try:
+        d.mkdir(mode=0o700, parents=True)
+        return
+    except FileExistsError:
+        pass
+    st = d.lstat()
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or not stat.S_ISDIR(st.st_mode)
+        or st.st_uid != os.getuid()
+        or stat.S_IMODE(st.st_mode) & 0o077
+    ):
+        raise RuntimeError(
+            f"{d} exists but is not a private directory of yours; remove it or set "
+            "WRENCODE_DATABASE_URL to use a Postgres server"
+        )
+
+
 def _connectable(path: pathlib.Path) -> bool:
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(0.5)
@@ -171,9 +193,9 @@ class EmbeddedPGlite:
                 "set WRENCODE_DATABASE_URL to use a Postgres server"
             )
         self._install()
-        for d in (self.data, self.run):
-            d.mkdir(parents=True, exist_ok=True)
-            os.chmod(d, 0o700)
+        self.data.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.data, 0o700)
+        _private_dir(self.run)
         with contextlib.suppress(OSError):
             self.socket.unlink()  # a stale socket from a server that is gone
         self.proc = subprocess.Popen(
@@ -514,7 +536,10 @@ def redact(url: str) -> str:
         return "mirror"
     if not u.hostname:
         return "mirror"
-    port = f":{u.port}" if u.port else ""
+    try:
+        port = f":{u.port}" if u.port else ""
+    except ValueError:  # not a number
+        port = ""
     return f"{u.hostname}{port}/{u.path.lstrip('/')}"
 
 
@@ -563,8 +588,9 @@ class Mirror:
         while not self._stop.is_set():
             with self._lock:
                 item = next(iter(self._pending.items()), None)
+                if item is None:  # under the lock: an enqueue can't slip in between
+                    self._idle.set()
             if item is None:
-                self._idle.set()
                 self._wake.wait()
                 self._wake.clear()
                 continue

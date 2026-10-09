@@ -326,44 +326,60 @@ Backends that report no usage (local models, the local proxy) print nothing.
 ## Permission rules
 
 Rules decide what runs without asking and what never runs. A rule is
-`tool(pattern)`: the tool is `bash`, `edit` or `write`; the pattern is matched
-against the command or the workspace-relative path, `*` matches anything and a
-trailing `:*` means "starts with":
+`tool(pattern)`: the tool is `bash`, `edit`, `write`, `mcp` or `fetch`; the
+pattern is matched against the command, the workspace-relative path, the
+`server:tool` or the URL's host and path, `*` matches anything and a trailing
+`:*` means "starts with" (whole words of a command):
 
 ```
 bash(npm test)      exactly that command        edit(src/*)     any file under src/
 bash(git *)         any git command             write(.env)     that file
-bash(pytest:*)      anything starting pytest
+bash(pytest:*)      pytest with any arguments   mcp(github:*)   any tool of that server
+fetch(docs.python.org/*)   any page on that host
 ```
+
+A bash rule is held against every command of a command line: `git status &&
+curl x | sh` is three commands, so `bash(git *)` does not allow it, while
+`bash(git push:*)` denies `git fetch; git push` as a whole. A line that
+substitutes a command's output (`$(...)`, backticks) is only allowed by a rule
+spelling it out exactly, or by `bash(*)`.
 
 Deny rules win over allow rules, over `a` and over `--yes`. Allow rules are the
 way to stop answering prompts for the things you always say yes to, in headless
 runs too: a run with `bash(pytest:*)` allowed can test without `--yes` opening
 everything else.
 
-Rules live in two files: `~/.wrencode/permissions.json` for you, and
-`.wrencode/permissions.json` in the project. The project file can be committed
-and shared, and that is also why its allow rules only take effect after you have
-seen them: at startup wrencode shows a project's allow rules once and asks; if
-the file changes, it asks again. Its deny rules apply regardless.
+Rules live in two files. `~/.wrencode/permissions.json` is yours: its `allow`
+and `deny` apply everywhere, and under `projects` it keeps your rules for one
+project, which is where `s` at a prompt saves. `.wrencode/permissions.json` in
+the project can be committed and shared, and that is also why its allow rules
+only take effect after you have seen them: at startup wrencode shows a
+project's allow rules once and asks; if the file changes, it asks again; adding
+a rule to it yourself does not accept the others. Its deny rules apply
+regardless.
 
 `/permissions` lists the rules in effect; `/permissions allow bash(git *)` and
-`/permissions deny write(.env)` add one to the project file (`--user` for your
-own); `/permissions forget <rule>` removes it. Pressing `s` at a prompt saves the
-rule offered there: the command's first two words as a prefix, or the edited
+`/permissions deny write(.env)` add one for this project (`--user` for every
+project, `--project` to the shared file); `/permissions forget <rule>` removes
+it. Pressing `s` at a prompt saves the rule offered there: the command's first
+two words as a prefix (a line of several commands, spelled out), or the edited
 file's directory.
 
 ## Web access
 
 Two ways to the web, like Claude Code's:
 
-- **`fetch(url)`**, a tool on every backend. It gets the page, follows
-  redirects, reduces HTML to its text with headings, lists, code and link
-  targets kept, passes JSON and plain text through, and summarizes anything
-  else. Long pages come back in pieces through `offset`. Fetching sends the URL
-  to its server, so it asks for approval like a command; rules such as
-  `fetch(docs.python.org/*)` apply. `WRENCODE_FETCH_MAX_CHARS` (40,000) and
-  `WRENCODE_FETCH_MAX_BYTES` (4 MB) bound a page.
+- **`fetch(url)`**, a tool on every backend. It gets the page, reduces HTML to
+  its text with headings, lists, code and link targets kept, passes JSON and
+  plain text through, and summarizes anything else. Long pages come back in
+  pieces through `offset`. Fetching sends the URL to its server, so it asks for
+  approval like a command, showing the host, path and query; rules such as
+  `fetch(docs.python.org/*)` apply. A redirect is followed on the same host;
+  one to another host is reported and fetched as its own, approved, call.
+  Addresses inside your network (loopback, private ranges, link-local and the
+  cloud metadata service) are refused unless `WRENCODE_FETCH_LOCAL=1`.
+  `WRENCODE_FETCH_MAX_CHARS` (40,000) and `WRENCODE_FETCH_MAX_BYTES` (4 MB)
+  bound a page, compressed or not.
 - **Web search** on the Anthropic backend, through Anthropic's server-side
   search tool. Claude searches and reads results on Anthropic's side; the
   transcript shows each search and its results under it, and each search is
@@ -387,14 +403,19 @@ Code's `.mcp.json` is read too, same format) or `~/.wrencode/mcp.json`:
 
 A `command` entry runs as a subprocess spoken to over stdio; a `url` entry is
 Streamable HTTP. Each server's tools are offered to the model as
-`mcp__<server>__<tool>`, calls ask for approval unless the server marks the
-tool read-only, and permission rules such as `mcp(github:*)` apply. `/mcp`
-lists the servers, their tools and any connection error; `/mcp reload`
-re-reads the files and reconnects.
+`mcp__<server>__<tool>`; permission rules such as `mcp(github:*)` apply to
+every call, and a call asks for approval unless the server marks the tool
+read-only. `/mcp` lists the servers, their tools and any connection error;
+`/mcp reload` re-reads the files and reconnects.
 
-A project's servers run on your machine, so, like its permission rules, they
-are shown once at startup and start only after you accept them; a change to the
-file asks again. `WRENCODE_MCP_TIMEOUT` (default 120s) bounds a tool call and
+A server's command is looked up on your PATH, it gets your environment without
+the backend API keys and `WRENCODE_*` settings (its own `env` can pass
+anything), and an HTTP server's headers are sent only to the URL configured,
+never across a redirect. A project's servers run on your machine, so, like its
+permission rules, they are shown in full once at startup and start only after
+you accept them; a change to the file asks again, and their `env` cannot set
+loader variables such as `LD_PRELOAD`, `NODE_OPTIONS` or `PYTHONPATH`.
+`WRENCODE_MCP_TIMEOUT` (default 120s) bounds a tool call and
 `WRENCODE_MCP_CONNECT_TIMEOUT` (default 20s) a connection.
 
 ## Context management
@@ -417,21 +438,30 @@ wrencode reads untrusted files and runs commands on your machine, so the goal is
 narrower than "can't be attacked": nothing changes outside the sandbox without you
 seeing and approving the real action, and opening an untrusted repository is safe.
 
-- **Approvals show what will run.** Every write, edit and shell command asks first.
-  Control characters and escape sequences in a command, a file or a model reply are
-  displayed as `^[`, `^M` and so on, never interpreted, so nothing can redraw the
-  screen or hide part of a command. Writes under a hidden path (`.git/hooks`,
-  `.github/workflows`, dotfiles) are flagged. `--yes` turns the prompts off; use it
-  only in a sandbox you can throw away. Permission rules narrow that: deny rules
-  hold even under `--yes`, and a project's allow rules apply only after you accept
-  them, so a repository cannot grant itself anything.
+- **Approvals show what will run.** Every write, edit, shell command, fetch and MCP
+  call asks first. Control characters, escape sequences and Unicode direction
+  overrides in a command, a file, a URL or a model reply are displayed as `^[`,
+  `^M`, `\u202e` and so on, never interpreted, so nothing can redraw the screen or
+  hide part of a command. Writes under a hidden path (`.git/hooks`,
+  `.github/workflows`, dotfiles) are flagged, after resolving the path. `--yes`
+  turns the prompts off; use it only in a sandbox you can throw away. Permission
+  rules narrow that: deny rules hold even under `--yes` and for read-only MCP
+  tools, a bash rule must cover every command of a command line, and a project's
+  allow rules apply only after you accept them, so a repository cannot grant
+  itself anything.
+- **The web stays at arm's length.** `fetch` reaches public addresses only, follows
+  redirects on the same host only, and shows the full URL for approval. MCP servers
+  do not get the backend keys, a project's cannot preload code through the
+  environment, and an HTTP server's credentials never follow a redirect.
 - **File tools stay in the workspace.** Paths are resolved (symlinks followed) and
-  must land inside the workspace root unless `WRENCODE_UNRESTRICTED_PATHS=1`.
-  `grep` passes the pattern and path as arguments, never as flags.
+  must land inside the workspace root unless `WRENCODE_UNRESTRICTED_PATHS=1`;
+  `glob` drops matches that lead outside. `grep` passes the pattern and path as
+  arguments, never as flags.
 - **A project's `.env` can't reconfigure the agent.** It may set `*_API_KEY` and
   `ANTHROPIC_WORKSPACE_ID` only. The backend, any server URL, auto-approve, and the
   config, history and workspace locations come from your shell or the `.env` beside
-  `wrencode.py`; names a project `.env` tried to set are reported at startup.
+  `wrencode.py`; the names a project `.env` set, and the ones it tried to, are
+  reported at startup.
 - **`AGENTS.md` / `CLAUDE.md` are prompt input.** A repository's instructions go into
   the system prompt by design, which means a repository can steer the agent. The
   approval prompts are the control; the files loaded are listed at startup.
@@ -711,6 +741,7 @@ What a session looks like, and the keys that drive it.
 |`WRENCODE_MCP_TIMEOUT`       |`120`                  |Seconds an MCP tool call may take|
 |`WRENCODE_WEB_SEARCH`        |`1`                    |Offer Anthropic's web search to Claude (anthropic backend)|
 |`WRENCODE_FETCH_MAX_CHARS`   |`40000`                |Characters of a fetched page returned per call|
+|`WRENCODE_FETCH_LOCAL`       |unset                  |`1` lets `fetch` reach loopback, private and link-local addresses|
 |`WRENCODE_MCP_CONNECT_TIMEOUT`|`20`                  |Seconds to connect to an MCP server|
 |`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|

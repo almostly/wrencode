@@ -18,6 +18,12 @@ server marks it read-only, and permission rules `mcp(server:tool)` apply.
 A project's file is part of the repository and its servers run commands on
 this machine, so, like permission rules, they are shown once and only start
 after they are accepted; their hash is kept under `trusted` in the user file.
+A command is looked up on wrencode's own PATH (a server's `env` can't redirect
+it), the backend API keys and WRENCODE_* settings are kept out of a server's
+environment unless its `env` passes them, and a project server's `env` can't
+set the loader variables (LD_PRELOAD, NODE_OPTIONS, PYTHONPATH, ...) that
+would run code before the command does. HTTP servers are not followed across
+redirects, so an Authorization header only ever reaches the URL configured.
 """
 
 from __future__ import annotations
@@ -29,8 +35,10 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -41,6 +49,26 @@ PROJECT_FILES = (pathlib.Path(".wrencode") / "mcp.json", pathlib.Path(".mcp.json
 CONNECT_TIMEOUT = float(os.environ.get("WRENCODE_MCP_CONNECT_TIMEOUT", "20"))
 CALL_TIMEOUT = float(os.environ.get("WRENCODE_MCP_TIMEOUT", "120"))
 _NAME_OK = re.compile(r"[^A-Za-z0-9_-]")
+# Kept out of a server's environment unless its own `env` sets them.
+HIDDEN_ENV = re.compile(r"^(?:[A-Z0-9_]*_API_KEY|WRENCODE_[A-Z0-9_]*)$")
+# What a project's server may not set: they run code before the command does.
+LOADER_ENV = frozenset(
+    {
+        "PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PERL5OPT",
+        "RUBYOPT",
+        "BASH_ENV",
+        "ENV",
+    }
+)
 
 
 def tool_name(server: str, tool: str) -> str:
@@ -63,12 +91,16 @@ class _Stdio:
     def __init__(
         self, command: str, args: list[str], env: dict[str, str], cwd: str
     ) -> None:
+        exe = shutil.which(command) if os.sep not in command else command
+        if not exe:
+            raise MCPError(f"command not found: {command}")
+        inherited = {k: v for k, v in os.environ.items() if not HIDDEN_ENV.match(k)}
         self.proc = subprocess.Popen(
-            [command, *args],
+            [exe, *args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            env={**os.environ, **env},
+            env={**inherited, **env},
             cwd=cwd,
             text=True,
             encoding="utf-8",
@@ -102,6 +134,8 @@ class _Stdio:
                 if slot is not None:
                     slot[1].append(msg)
                     slot[0].set()
+            elif "id" in msg and "method" in msg:  # a request from the server
+                self._answer(msg)
             else:
                 self.notifications.append(msg)
         # the server is gone: wake every waiter with an error
@@ -110,6 +144,20 @@ class _Stdio:
                 box.append({"error": {"message": "server exited"}})
                 event.set()
             self._pending.clear()
+
+    def _answer(self, msg: dict[str, Any]) -> None:
+        """Keep the session alive: ping gets an empty result, anything else
+        (sampling, roots) a method-not-found error."""
+        reply: dict[str, Any] = {"jsonrpc": "2.0", "id": msg["id"]}
+        if msg["method"] == "ping":
+            reply["result"] = {}
+        else:
+            reply["error"] = {
+                "code": -32601,
+                "message": f"{msg['method']} not supported",
+            }
+        with contextlib.suppress(MCPError):
+            self._send(reply)
 
     def _send(self, msg: dict[str, Any]) -> None:
         assert self.proc.stdin is not None
@@ -155,6 +203,24 @@ class _Stdio:
             self.proc.kill()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the Authorization header somewhere else: refuse it."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class _Http:
     """Streamable HTTP: JSON-RPC over POST; a reply is JSON or an SSE stream."""
 
@@ -179,7 +245,7 @@ class _Http:
             self.url, data=json.dumps(msg).encode(), headers=headers
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
                 return (
                     resp.status,
                     resp.headers.get("Content-Type", ""),
@@ -187,6 +253,11 @@ class _Http:
                     dict(resp.headers),
                 )
         except urllib.error.HTTPError as err:
+            if 300 <= err.code < 400:
+                raise MCPError(
+                    f"{self.url} redirects to {err.headers.get('Location', '?')}; "
+                    "configure that URL instead (redirects are not followed)"
+                ) from err
             body = err.read().decode(errors="replace")[:300]
             raise MCPError(f"HTTP {err.code} from {self.url}: {body}") from err
         except (urllib.error.URLError, OSError) as err:
@@ -271,10 +342,13 @@ class Server:
                     str(self.spec["url"]), dict(self.spec.get("headers") or {})
                 )
             elif self.spec.get("command"):
+                env = {str(k): str(v) for k, v in (self.spec.get("env") or {}).items()}
+                if self.source == "project":
+                    env = {k: v for k, v in env.items() if k not in LOADER_ENV}
                 self.transport = _Stdio(
                     str(self.spec["command"]),
                     [str(a) for a in self.spec.get("args") or []],
-                    {str(k): str(v) for k, v in (self.spec.get("env") or {}).items()},
+                    env,
                     cwd,
                 )
             else:
@@ -365,13 +439,20 @@ class Server:
 # ---------------------------------------------------------------------------
 # Configuration and the set of servers in use
 # ---------------------------------------------------------------------------
-def _read(path: pathlib.Path) -> dict[str, Any]:
+def _parse(raw: bytes | str) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+        data = json.loads(raw or b"{}")
+    except ValueError:
         return {}
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     return servers if isinstance(servers, dict) else {}
+
+
+def _read(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        return _parse(path.read_bytes())
+    except OSError:
+        return {}
 
 
 class Registry:
@@ -390,15 +471,18 @@ class Registry:
             loaded = json.loads(user_file.read_text())
             if isinstance(loaded, dict):
                 self._user_data = loaded
-        self.project_servers = _read(self.project_file) if self.project_file else {}
+        self._project_bytes = b""
+        if self.project_file is not None:
+            with contextlib.suppress(OSError):
+                self._project_bytes = self.project_file.read_bytes()
+        self.project_servers = _parse(self._project_bytes)
         atexit.register(self.close)
 
     def _project_hash(self) -> str:
-        if self.project_file is None:
+        """The hash of the file as it was read: what was shown is what is trusted."""
+        if not self._project_bytes:
             return ""
-        with contextlib.suppress(OSError):
-            return hashlib.sha256(self.project_file.read_bytes()).hexdigest()
-        return ""
+        return hashlib.sha256(self._project_bytes).hexdigest()
 
     def project_trusted(self) -> bool:
         if not self.project_servers:
@@ -437,10 +521,15 @@ class Registry:
         ]
         for t in threads:
             t.start()
+        deadline = time.monotonic() + CONNECT_TIMEOUT + 5
         for t in threads:
-            t.join(CONNECT_TIMEOUT + 5)
-        for s in self.servers:
-            if s.transport is None and not s.error:
+            t.join(max(deadline - time.monotonic(), 0))
+        for s, t in zip(self.servers, threads, strict=True):
+            if t.is_alive():  # still connecting or listing tools: not usable
+                s.error = s.error or "did not answer in time"
+                s.tools = []
+                s.close()
+            elif s.transport is None and not s.error:
                 s.error = "did not answer in time"
         return self.servers
 
