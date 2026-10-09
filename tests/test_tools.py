@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 from typing import Any
@@ -279,6 +280,28 @@ class TestFileTools(unittest.TestCase):
         app.write({"path": "single.py", "content": "needle = 1"})
         result = app.grep({"pat": "needle", "path": "single.py"})
         self.assertIn("needle", result)
+
+    def test_grep_without_ripgrep_skips_vcs_venv_and_caches(self):
+        seen: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        with (
+            mock.patch.object(
+                app.shutil,
+                "which",
+                lambda name: None if name == "rg" else "/usr/bin/grep",
+            ),
+            mock.patch.object(app.subprocess, "run", fake_run),
+        ):
+            self.assertEqual(app.grep({"pat": "x", "path": "."}), "none")
+        cmd = seen[0]
+        self.assertEqual(cmd[:4], ["/usr/bin/grep", "-R", "-n", "-I"])
+        for d in (".git", ".venv", "node_modules", "__pycache__", ".mypy_cache"):
+            self.assertIn(f"--exclude-dir={d}", cmd)
+        self.assertEqual(cmd[-3:], ["--", "x", "."])
 
     def test_grep_missing_path_returns_error(self):
         result = app.grep({"pat": "x", "path": "missing.py"})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from typing import Any
 from unittest import mock
@@ -658,6 +660,82 @@ class TestAutoCompactInLoop(unittest.TestCase):
         ):
             app.run_agent_turn([{"role": "user", "content": "x"}], "sys", None)
         ac.assert_not_called()
+
+
+class TestToolLoader(unittest.TestCase):
+    """Every tool run shows the loader once it outlasts a moment, and prompts
+    take it off the line."""
+
+    def test_loader_waits_for_the_delay_pauses_and_clears(self):
+        out = io.StringIO()
+        s = app._Spinner("running grep · m", delay=0.3, out=out)
+        s.start()
+        time.sleep(0.1)
+        self.assertEqual(out.getvalue(), "")  # too soon to draw
+        time.sleep(0.6)
+        self.assertIn("running grep", out.getvalue())
+        s.pause()
+        self.assertTrue(out.getvalue().endswith("\r\x1b[2K"))
+        drawn = len(out.getvalue())
+        time.sleep(0.3)
+        self.assertEqual(len(out.getvalue()), drawn)  # nothing while paused
+        s.resume()
+        time.sleep(0.3)
+        self.assertGreater(len(out.getvalue()), drawn)
+        s.stop()
+        self.assertTrue(out.getvalue().endswith("\r\x1b[2K"))
+        self.assertFalse(s._thread.is_alive())
+        s.stop()  # idempotent
+
+    def test_prompts_pause_the_loader(self):
+        calls: list[str] = []
+
+        class Handle:
+            def pause(self):
+                calls.append("pause")
+
+            def resume(self):
+                calls.append("resume")
+
+        ui.set_loader(Handle())
+        self.addCleanup(ui.set_loader, None)
+        with (
+            mock.patch("builtins.input", return_value="y"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(ui._confirm_prompt("Run?", "bash", "ls"), "ok")
+            self.assertEqual(ui.ask_line("ok? "), "y")
+        self.assertEqual(calls, ["pause", "resume", "pause", "resume"])
+
+    def test_every_tool_runs_under_the_loader(self):
+        seen: list[tuple[str, float]] = []
+
+        @contextlib.contextmanager
+        def fake_spinner(activity="thinking", delay=0.0):
+            seen.append((activity, delay))
+            yield app._NO_SPINNER
+
+        reply = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "g1",
+                    "name": "glob",
+                    "input": {"pat": "*.py"},
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+        done = {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        replies = iter([json.dumps(reply), json.dumps(done)])
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "get_response", lambda *a, **k: next(replies)),
+            mock.patch.object(app, "thinking_spinner", fake_spinner),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            app.run_agent_turn([{"role": "user", "content": "x"}], "sys", None)
+        self.assertIn(("running glob", app.TOOL_SPINNER_DELAY), seen)
 
 
 class TestInterruptedToolCalls(unittest.TestCase):

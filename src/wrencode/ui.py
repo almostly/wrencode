@@ -13,7 +13,7 @@ import re
 import select
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from typing import Any
 
 from . import permissions
@@ -659,25 +659,50 @@ def _read_user_input_interactive(hint: Callable[[str], str] | None = None) -> st
     return text
 
 
+# The running loader (a _Spinner in the app), if any: prompts take it off the
+# line while they read, so the question and the answer stay readable.
+_LOADER: Any = None
+
+
+def set_loader(handle: Any) -> None:
+    global _LOADER
+    _LOADER = handle
+
+
+@contextlib.contextmanager
+def loader_paused() -> Generator[None]:
+    """Pause the running loader for a prompt; nests."""
+    handle = _LOADER
+    if handle is not None:
+        handle.pause()
+    try:
+        yield
+    finally:
+        if handle is not None:
+            handle.resume()
+
+
 def ask_line(prompt: str) -> str:
     """Read one short answer at a plain prompt (y/n questions at startup)."""
-    try:
-        return input(
-            f"{BRIGHT_CYAN}❯{RESET} {prompt}" if colors_enabled() else f"❯ {prompt}"
-        )
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return ""
+    with loader_paused():
+        try:
+            return input(
+                f"{BRIGHT_CYAN}❯{RESET} {prompt}" if colors_enabled() else f"❯ {prompt}"
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
 
 
 def read_feedback_line() -> str:
     """Read decline feedback after choosing n in the approval picker."""
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        sys.stdout.write(f"\n{YELLOW}What should I do differently?{RESET}\n")
-        sys.stdout.flush()
-        return _read_tty_line(f"{BRIGHT_CYAN}❯{RESET} ")
-    prompt = f"{YELLOW}What should I do differently?{RESET} "
-    return input(prompt).strip()
+    with loader_paused():
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            sys.stdout.write(f"\n{YELLOW}What should I do differently?{RESET}\n")
+            sys.stdout.flush()
+            return _read_tty_line(f"{BRIGHT_CYAN}❯{RESET} ")
+        prompt = f"{YELLOW}What should I do differently?{RESET} "
+        return input(prompt).strip()
 
 
 def read_user_input(hint: Callable[[str], str] | None = None) -> str:
@@ -877,6 +902,11 @@ def _confirm_from_subagent(action: str, question: str = "", subject: str = "") -
 
 def _confirm_prompt(question: str = "", action: str = "", subject: str = "") -> str:
     """The interactive approve / allow-all / save-rule / decline prompt: one line, then ❯."""
+    with loader_paused():
+        return _confirm_prompt_lines(question, action, subject)
+
+
+def _confirm_prompt_lines(question: str, action: str, subject: str) -> str:
     global SESSION_AUTO_APPROVE
     ask = visible(question) or "Allow this?"
     offer = (

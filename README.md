@@ -698,7 +698,9 @@ What a session looks like, and the keys that drive it.
   stops asking for the rest of the session, `s` saves a rule so this kind of
   action never asks again, `n` asks what to do differently.
 - **Waiting.** The spinner says what is happening (`thinking`, `running
-  python`), how long it has been, and that Escape cancels the turn. On the
+  grep`, `running bash`), how long it has been, and that Escape cancels the
+  turn; a tool that finishes within half a second shows nothing, and a prompt
+  takes the spinner off the line while it waits for you. On the
   Anthropic and OpenAI-style backends the reply then streams in as the model
   writes it, rendered line by line; Escape stops it mid-sentence. The usage
   line still counts the whole request. `WRENCODE_STREAM=0` waits for whole

@@ -174,10 +174,13 @@ _GLOB_SKIP: set[str] = {
     s
     for s in os.environ.get(
         "GLOB_SKIP_DIRS",
-        ".git,node_modules,__pycache__,.venv,venv,dist,build,.mypy_cache,.pytest_cache,target",
+        ".git,node_modules,__pycache__,.venv,venv,dist,build,.mypy_cache,"
+        ".pytest_cache,.ruff_cache,.tox,.nox,target",
     ).split(",")
     if s
 }
+# Seconds a tool may take before the loader shows what is running.
+TOOL_SPINNER_DELAY = float(os.environ.get("WRENCODE_TOOL_SPINNER_DELAY", "0.5"))
 
 
 # -----------------------------------------------------------------------------------------------
@@ -493,10 +496,21 @@ def grep(args: dict[str, Any]) -> str:
         return "error: neither ripgrep (rg) nor grep is installed"
     tool = rg or grep_bin
     assert tool is not None  # guaranteed by the check above
+    # ripgrep skips hidden and ignored files itself; grep gets the skip list
+    # (.git, virtualenvs, caches) so a repository search stays fast without rg.
     cmd = (
         [tool, "-n", "--color", "never", "--no-heading", "-e", pat, "--", scope]
         if rg
-        else [tool, "-R", "-n", "-I", "--", pat, scope]
+        else [
+            tool,
+            "-R",
+            "-n",
+            "-I",
+            *(f"--exclude-dir={d}" for d in sorted(_GLOB_SKIP)),
+            "--",
+            pat,
+            scope,
+        ]
     )
     try:
         proc = subprocess.run(
@@ -1071,56 +1085,91 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
 
 
 class _Spinner:
-    """Handle on a running loader: stop() clears it, once, from any thread."""
+    """A loader on its own line: what is happening, for how long, and that Escape
+    cancels. It draws only once `delay` seconds have passed, so a quick tool
+    shows nothing; it leaves the line while a prompt reads input (pause/resume,
+    which nest); stop() clears it once, from any thread."""
 
-    def __init__(self, stop: threading.Event, thread: threading.Thread) -> None:
-        self._stop = stop
-        self._thread = thread
+    def __init__(self, context: str = "", delay: float = 0.0, out: Any = None) -> None:
+        self._context = context
+        self._delay = delay
+        self._out = out if out is not None else sys.stdout
+        self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._paused = 0
+        self._drawn = False
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _animate(self) -> None:
+        started = time.monotonic()
+        step = 0
+        while not self._stop.is_set():
+            elapsed = time.monotonic() - started
+            with self._lock:
+                if (
+                    not self._paused
+                    and elapsed >= self._delay
+                    and not self._stop.is_set()
+                ):
+                    bar = ui.loader_display(step, self._context, int(elapsed))
+                    step += 1
+                    self._out.write(f"\r{bar}")
+                    self._out.flush()
+                    self._drawn = True
+            time.sleep(0.07)
+
+    def _clear(self) -> None:  # under the lock
+        if self._drawn:
+            self._out.write("\r\033[2K")
+            self._out.flush()
+            self._drawn = False
+
+    def pause(self) -> None:
+        """Take the loader off the line, for a prompt."""
+        with self._lock:
+            self._paused += 1
+            self._clear()
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = max(self._paused - 1, 0)
 
     def stop(self) -> None:
         with self._lock:
             if self._stop.is_set():
                 return
             self._stop.set()
+        if self._thread.is_alive():
             self._thread.join(timeout=0.4)
-            sys.stdout.write("\r\033[2K")
-            sys.stdout.flush()
+        with self._lock:
+            self._clear()
 
 
-_NO_SPINNER = _Spinner(threading.Event(), threading.Thread())
+_NO_SPINNER = _Spinner()
 _NO_SPINNER._stop.set()
 
 
 @contextlib.contextmanager
-def thinking_spinner(activity: str = "thinking") -> Any:
+def thinking_spinner(activity: str = "thinking", delay: float = 0.0) -> Any:
     """Loader on the line below the user's input: what is happening, for how
     long, and that Escape cancels. Yields a handle whose stop() clears it early
-    (when the first streamed token arrives)."""
+    (when the first streamed token arrives). With `delay`, nothing is drawn
+    unless the activity outlasts it."""
     if not sys.stdout.isatty() or ui._agent_tag():  # parallel agents share the screen
         yield _NO_SPINNER
         return
-
-    stop = threading.Event()
-    step = 0
-    context = ui.loader_context(backends.BACKEND, backends.MODEL, activity)
-    started = time.monotonic()
-
-    def animate() -> None:
-        nonlocal step
-        while not stop.is_set():
-            bar = ui.loader_display(step, context, int(time.monotonic() - started))
-            step += 1
-            sys.stdout.write(f"\r{bar}")
-            sys.stdout.flush()
-            time.sleep(0.07)
-
-    thread = threading.Thread(target=animate, daemon=True)
-    thread.start()
-    handle = _Spinner(stop, thread)
+    handle = _Spinner(
+        ui.loader_context(backends.BACKEND, backends.MODEL, activity), delay
+    )
+    handle.start()
+    ui.set_loader(handle)  # prompts take it off the line while they read
     try:
         yield handle
     finally:
+        ui.set_loader(None)
         handle.stop()
 
 
@@ -1764,10 +1813,9 @@ def run_agent_turn(
                     result = parallel[i]
                 else:
                     print_tool_action(tc.name, tc.input)
-                    if tc.name == "python":  # the sandbox can take a while
-                        with thinking_spinner("running python"):
-                            result = run_tool(tc.name, tc.input)
-                    else:
+                    # A tool that outlasts a moment (a search, a command, a page)
+                    # shows the loader; a quick one draws nothing.
+                    with thinking_spinner(f"running {tc.name}", TOOL_SPINNER_DELAY):
                         result = run_tool(tc.name, tc.input)
                 last_tool_error, repeated_tool_error_count, stop = _track_error(
                     result, last_tool_error, repeated_tool_error_count
