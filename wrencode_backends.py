@@ -852,7 +852,7 @@ def _spend() -> str:
         return ""
     if u.session_calls == u.turn_calls:
         return f"  {_money(u.session_cost)}"
-    return f"  {_money(u.turn_cost)} · Σ {_money(u.session_cost)}"
+    return f"  {_money(u.turn_cost)} · total {_money(u.session_cost)}"
 
 
 def usage_line(warn_at: float = 0.0) -> str:

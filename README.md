@@ -266,7 +266,7 @@ degrades to a structured summary.
 After each turn wrencode prints one dim line with what the backend reported:
 
 ```
-↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  42 tok/s ↗  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · Σ $0.21
+↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  42 tok/s ↗  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · total $0.21
 ```
 
 Up is the turn's input tokens, down its output, `×2` the number of model calls,

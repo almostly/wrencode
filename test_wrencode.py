@@ -3100,7 +3100,7 @@ class TestPricing(unittest.TestCase):
             title = backends.usage_title()
             as_dict = backends.USAGE.as_dict()
         self.assertTrue(first.endswith("▱▱▱▱▱▱▱▱▱▱ 2%  $0.0052"), first)
-        self.assertTrue(second.endswith("1%  $0.0030 · Σ $0.0082"), second)
+        self.assertTrue(second.endswith("1%  $0.0030 · total $0.0082"), second)
         self.assertEqual(report[1].split()[-1], "$0.0030")
         self.assertEqual(report[2].split()[-1], "$0.0082")
         self.assertEqual(
