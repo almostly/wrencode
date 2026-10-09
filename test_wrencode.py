@@ -3836,6 +3836,21 @@ class TestStreaming(unittest.TestCase):
         self.assertTrue(plain.endswith("done\n\n"), repr(plain[-20:]))
         self.assertIn(f"{ui.CODE_TEXT}", out)
 
+    def test_stream_printer_redraws_a_wrapped_line_from_its_first_row(self):
+        with (
+            mock.patch("sys.stdout", io.StringIO()),
+            mock.patch(
+                "shutil.get_terminal_size", return_value=os.terminal_size((20, 40))
+            ),
+        ):
+            p = ui.StreamPrinter()
+            p.feed("- **bold** " + "x" * 30)  # 2 + 41 cells: three rows
+            p.feed("\n")
+            out = sys.stdout.getvalue()
+        plain = strip_ansi(out)
+        self.assertIn("\x1b[2A\r\x1b[J", out)  # back to the first row, then clear
+        self.assertIn("● - bold " + "x" * 30 + "\n", plain)
+
     def test_stream_printer_stays_quiet_without_text(self):
         with mock.patch("sys.stdout", io.StringIO()):
             p = ui.StreamPrinter()

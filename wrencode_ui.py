@@ -1059,9 +1059,12 @@ class StreamPrinter:
         import shutil
 
         if lead is None:  # part of the raw line is on screen already
-            width = shutil.get_terminal_size().columns
-            if len(raw) + 2 < width and _ANSI_RE.sub("", rendered) != raw:
-                sys.stdout.write("\r\033[K" + self._cur_lead + rendered + "\n")
+            if _ANSI_RE.sub("", rendered) != raw:
+                # Redraw from the row the line started on; it may have wrapped.
+                width = max(shutil.get_terminal_size().columns, 20)
+                rows = _rows_of(2 + self._shown, width)
+                up = f"\033[{rows - 1}A" if rows > 1 else ""
+                sys.stdout.write(up + "\r\033[J" + self._cur_lead + rendered + "\n")
             else:
                 rest = raw[self._shown :]
                 color = CODE_TEXT if self._fence else AGENT_TEXT
