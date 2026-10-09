@@ -358,7 +358,7 @@ class Server:
                 {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "wrencode", "version": "0.4"},
+                    "clientInfo": {"name": "wrencode", "version": "0.3"},
                 },
                 CONNECT_TIMEOUT,
             )

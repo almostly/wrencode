@@ -33,7 +33,7 @@ MAX_CHARS = int(os.environ.get("WRENCODE_FETCH_MAX_CHARS", "40000"))
 TIMEOUT = float(os.environ.get("WRENCODE_FETCH_TIMEOUT", "30"))
 ALLOW_LOCAL = os.environ.get("WRENCODE_FETCH_LOCAL", "").lower() in ("1", "true", "yes")
 MAX_REDIRECTS = 5
-USER_AGENT = "wrencode/0.4 (+https://github.com/almostly/wrencode)"
+USER_AGENT = "wrencode/0.3 (+https://github.com/almostly/wrencode)"
 _SKIP = {"script", "style", "noscript", "template", "svg"}
 _BLOCK = {
     "p",

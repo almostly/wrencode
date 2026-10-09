@@ -126,7 +126,7 @@ from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.4.0"
+WRENCODE_VERSION = "0.3.1"
 # Project instruction files, in preference order per directory (see find_agents_files).
 AGENTS_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_AGENTS_MD_CHARS = 32_000
