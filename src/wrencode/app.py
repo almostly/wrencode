@@ -1289,12 +1289,17 @@ def history_file_path() -> pathlib.Path:
 
 
 def load_history() -> list[dict[str, Any]]:
-    """Load the current session's messages from the store, else the JSON history file."""
+    """Load the current session's messages from the store, else the JSON history
+    file. A turn interrupted mid-tool-call last time is completed with
+    cancellation results, so the history can be sent again."""
+    messages: list[dict[str, Any]] = []
     if _STORE is not None and _SESSION_ID is not None:
-        return _STORE.load(_SESSION_ID)
-    with contextlib.suppress(Exception), open(history_file_path()) as f:
-        return list(json.load(f))
-    return []
+        messages = _STORE.load(_SESSION_ID)
+    else:
+        with contextlib.suppress(Exception), open(history_file_path()) as f:
+            messages = list(json.load(f))
+    backends.repair_history(messages)
+    return messages
 
 
 def save_history(messages: list[dict[str, Any]]) -> None:
@@ -1796,6 +1801,8 @@ def run_agent_turn(
             if _STRUCTURED_RESULT and _respond_schema() is not None:
                 return "done"
     except (ui.UserCancelled, KeyboardInterrupt):
+        # Tool calls left without results would make every later request fail.
+        backends.repair_history(messages)
         if ui._agent_tag():
             print(f"{YELLOW}cancelled{RESET}")
             return "cancelled"
