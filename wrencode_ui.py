@@ -16,6 +16,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+import wrencode_permissions as permissions
+
 _AGENT_LOCAL = threading.local()
 
 
@@ -211,6 +213,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/search": "find a past session by its words: /search <text>",
     "/sync": "copy this project's history to the mirror now",
     "/usage": "token usage and spend: this turn and the session",
+    "/permissions": "rules that allow or deny actions without asking",
     "/help": "list commands",
     "/quit": "save history and exit",
 }
@@ -640,6 +643,17 @@ def _read_user_input_interactive(hint: Callable[[str], str] | None = None) -> st
     return text
 
 
+def ask_line(prompt: str) -> str:
+    """Read one short answer at a plain prompt (y/n questions at startup)."""
+    try:
+        return input(
+            f"{BRIGHT_CYAN}❯{RESET} {prompt}" if colors_enabled() else f"❯ {prompt}"
+        )
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
 def read_feedback_line() -> str:
     """Read decline feedback after choosing n in the approval picker."""
     if sys.stdin.isatty() and sys.stdout.isatty():
@@ -764,15 +778,30 @@ def check_cancelled() -> None:
         raise UserCancelled()
 
 
-def confirm(action: str = "", question: str = "") -> str:
+def confirm(action: str = "", question: str = "", subject: str = "") -> str:
     """Prompt for approval. Returns 'ok' or a cancellation message for the agent.
 
     `question` is the one line asked ("Apply to app.py?"); `action` names the
-    action in auto-approve and headless notices. Enter/y approves once; ``a``
-    approves all remaining actions this session; ``n`` declines and asks what
-    to do differently. Auto-approve via WRENCODE_AUTO_APPROVE / --yes enables
-    headless use and subagents.
+    tool (bash, edit, write) and `subject` what it acts on (the command or the
+    path), which the permission rules are matched against: a deny rule refuses
+    without asking, an allow rule approves without asking. Otherwise Enter/y
+    approves once; ``a`` approves all remaining actions this session; ``s``
+    saves a rule so this kind of action never asks again; ``n`` declines and
+    asks what to do differently. Auto-approve via WRENCODE_AUTO_APPROVE / --yes
+    enables headless use and subagents.
     """
+    rules = permissions.ACTIVE
+    rule = rules.check(action, subject) if rules is not None and subject else None
+    label = f"{action} {subject}".strip()[:120] if subject else (action or "action")
+    if rule is not None and rule.effect == "deny":
+        print(f"{YELLOW}⊘ {label} [denied by rule {rule}]{RESET}")
+        return (
+            f"cancelled: denied by the permission rule {rule} ({rule.source}). "
+            "Do what you can without it and say what is left to do."
+        )
+    if rule is not None:
+        print(f"{DIM}✓ {label} [allowed by rule {rule}]{RESET}")
+        return "ok"
     if (
         os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes")
         or SESSION_AUTO_APPROVE
@@ -787,8 +816,8 @@ def confirm(action: str = "", question: str = "") -> str:
             "approved. Do what you can without it and say what is left to do."
         )
     if _agent_tag():
-        return _confirm_from_subagent(action, question)
-    return _confirm_prompt(question)
+        return _confirm_from_subagent(action, question, subject)
+    return _confirm_prompt(question, action, subject)
 
 
 # One approval prompt at a time across parallel subagents.
@@ -797,7 +826,7 @@ _APPROVAL_LOCK = threading.Lock()
 PARALLEL_ESC: _EscWatch | None = None
 
 
-def _confirm_from_subagent(action: str, question: str = "") -> str:
+def _confirm_from_subagent(action: str, question: str = "", subject: str = "") -> str:
     """Ask for approval on behalf of a parallel subagent.
 
     Prompts take turns, the Escape listener lets go of stdin, and the other
@@ -814,7 +843,7 @@ def _confirm_from_subagent(action: str, question: str = "") -> str:
         try:
             detail = getattr(_AGENT_LOCAL, "last_action", "") or action
             print(f"{YELLOW}[{_agent_tag()}] needs approval:{RESET} {detail}")
-            return _confirm_prompt(question)
+            return _confirm_prompt(question, action, subject)
         finally:
             if esc is not None:
                 esc.start()
@@ -822,11 +851,16 @@ def _confirm_from_subagent(action: str, question: str = "") -> str:
                 out.release()
 
 
-def _confirm_prompt(question: str = "") -> str:
-    """The interactive approve / allow-all / decline prompt: one line, then ❯."""
+def _confirm_prompt(question: str = "", action: str = "", subject: str = "") -> str:
+    """The interactive approve / allow-all / save-rule / decline prompt: one line, then ❯."""
     global SESSION_AUTO_APPROVE
     ask = question or "Allow this?"
-    keys = "Enter yes · a always · n no"
+    offer = (
+        permissions.suggest(action, subject)
+        if permissions.ACTIVE is not None and action in permissions.TOOLS and subject
+        else ""
+    )
+    keys = "Enter yes · a always · " + (f"s allow {offer} · " if offer else "") + "n no"
     print(
         f"{BOLD}{ask}{RESET}  {DIM}{keys}{RESET}"
         if colors_enabled()
@@ -844,6 +878,13 @@ def _confirm_prompt(question: str = "") -> str:
             SESSION_AUTO_APPROVE = True
             print(f"{DIM}Auto-approving remaining actions this session.{RESET}")
             return "ok"
+        if choice in ("s", "save") and offer and permissions.ACTIVE is not None:
+            rule = permissions.ACTIVE.add(offer, "allow", "project")
+            print(
+                f"{DIM}Saved {rule} to {permissions.PROJECT_FILE}; it won't ask again "
+                f"(/permissions lists and removes rules).{RESET}"
+            )
+            return "ok"
         if choice in ("n", "no"):
             try:
                 feedback = read_feedback_line()
@@ -853,7 +894,7 @@ def _confirm_prompt(question: str = "") -> str:
             if feedback:
                 return f"cancelled: user declined — {feedback}"
             return "cancelled: user declined without instructions"
-        print(f"{DIM}Choose Enter, a, or n.{RESET}")
+        print(f"{DIM}Choose Enter, a, {'s, ' if offer else ''}or n.{RESET}")
 
 
 # Lightweight, language-agnostic code coloring — no pygments, keeps the binary lean.

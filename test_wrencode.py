@@ -27,6 +27,7 @@ import wrencode
 import wrencode_backends as backends
 import wrencode_configure as configure
 import wrencode_history as history
+import wrencode_permissions as permissions
 import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
@@ -3953,6 +3954,145 @@ class TestLineEditor(unittest.TestCase):
                 out.endswith("\x1b[2A\r\x1b[5C"), repr(out[-12:])
             )  # row 0, col 2+3
             self.assertEqual(ui._LAST_CURSOR_ROW, 0)
+
+
+class TestPermissions(unittest.TestCase):
+    """Rules that approve or refuse without asking, and where they come from."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.user = self.tmp / "cfg" / "permissions.json"
+        self.project = self.tmp / "proj"
+        self.project.mkdir()
+        self.rules = permissions.Permissions(self.user, self.project)
+        self._orig = permissions.ACTIVE
+        permissions.ACTIVE = self.rules
+        self.addCleanup(setattr, permissions, "ACTIVE", self._orig)
+
+    def test_rule_syntax_and_matching(self):
+        self.assertEqual(permissions.parse("bash(git *)"), ("bash", "git *"))
+        with self.assertRaises(ValueError):
+            permissions.parse("read(x)")
+        with self.assertRaises(ValueError):
+            permissions.parse("bash()")
+        r = permissions.Rule("bash", "git *", "allow", "user")
+        self.assertTrue(r.matches("bash", "git status"))
+        self.assertFalse(r.matches("bash", "gitk"))
+        self.assertFalse(r.matches("edit", "git status"))
+        self.assertTrue(
+            permissions.Rule("bash", "pytest:*", "allow", "user").matches(
+                "bash", "pytest -q tests"
+            )
+        )
+        self.assertTrue(
+            permissions.Rule("edit", "src/*", "allow", "user").matches(
+                "edit", "src/a/b.py"
+            )
+        )
+        self.assertFalse(
+            permissions.Rule("edit", "src/*", "allow", "user").matches(
+                "edit", "lib/b.py"
+            )
+        )
+        self.assertTrue(
+            permissions.Rule("write", ".env", "deny", "user").matches("write", ".env")
+        )
+
+    def test_suggestions(self):
+        self.assertEqual(
+            permissions.suggest("bash", "npm test -- --watch"), "bash(npm test:*)"
+        )
+        self.assertEqual(permissions.suggest("bash", "make"), "bash(make)")
+        self.assertEqual(permissions.suggest("edit", "src/app/x.py"), "edit(src/app/*)")
+        self.assertEqual(permissions.suggest("write", "README.md"), "write(README.md)")
+
+    def test_user_rules_apply_and_deny_wins(self):
+        self.rules.add("bash(git *)", "allow", "user")
+        self.rules.add("bash(git push *)", "deny", "user")
+        self.assertEqual(stat.S_IMODE(self.user.stat().st_mode), 0o600)
+        self.assertEqual(str(self.rules.check("bash", "git status")), "bash(git *)")
+        self.assertEqual(
+            self.rules.check("bash", "git push origin main").effect, "deny"
+        )
+        self.assertIsNone(self.rules.check("bash", "rm -rf x"))
+        self.assertEqual(self.rules.remove("bash(git *)"), 1)
+        self.assertIsNone(self.rules.check("bash", "git status"))
+
+    def test_project_allow_rules_need_acceptance_but_deny_rules_do_not(self):
+        pf = self.project / permissions.PROJECT_FILE
+        pf.parent.mkdir()
+        pf.write_text(json.dumps({"allow": ["bash(*)"], "deny": ["write(.env)"]}))
+        rules = permissions.Permissions(self.user, self.project)
+        self.assertFalse(rules.project_trusted())
+        self.assertIsNone(
+            rules.check("bash", "anything")
+        )  # shipped by the repo: ignored
+        self.assertEqual(rules.check("write", ".env").effect, "deny")
+        rules.trust_project()
+        self.assertTrue(rules.project_trusted())
+        self.assertEqual(rules.check("bash", "anything").source, "project")
+        pf.write_text(
+            json.dumps({"allow": ["bash(*)", "edit(*)"]})
+        )  # changed since: ask again
+        rules = permissions.Permissions(self.user, self.project)
+        self.assertFalse(rules.project_trusted())
+        rules.add(
+            "edit(docs/*)", "allow", "project"
+        )  # written by the person: trusted as it stands
+        self.assertTrue(rules.project_trusted())
+
+    def test_confirm_follows_the_rules(self):
+        self.rules.add("edit(src/*)", "allow", "user")
+        self.rules.add("bash(rm *)", "deny", "user")
+        with (
+            mock.patch("sys.stdout", io.StringIO()),
+            mock.patch.object(ui, "SESSION_AUTO_APPROVE", True),
+        ):
+            self.assertEqual(ui.confirm("edit", "Apply to src/a.py?", "src/a.py"), "ok")
+            denied = ui.confirm("bash", "Run it?", "rm -rf /")
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertTrue(
+            denied.startswith("cancelled: denied by the permission rule bash(rm *)")
+        )
+        self.assertIn("✓ edit src/a.py [allowed by rule edit(src/*)]", out)
+        self.assertIn("⊘ bash rm -rf / [denied by rule bash(rm *)]", out)
+
+    def test_s_at_the_prompt_saves_a_project_rule(self):
+        with (
+            mock.patch("builtins.input", return_value="s"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(
+                ui._confirm_prompt("Run it?", "bash", "npm test -- -q"), "ok"
+            )
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertIn("s allow bash(npm test:*)", out)
+        self.assertIn("Saved bash(npm test:*)", out)
+        saved = json.loads((self.project / permissions.PROJECT_FILE).read_text())
+        self.assertEqual(saved["allow"], ["bash(npm test:*)"])
+        self.assertEqual(
+            str(self.rules.check("bash", "npm test --watch")), "bash(npm test:*)"
+        )
+
+    def test_permissions_command(self):
+        with mock.patch("sys.stdout", io.StringIO()):
+            wrencode.handle_slash_command("/permissions", [], None)
+            wrencode.handle_slash_command(
+                "/permissions allow bash(git *) --user", [], None
+            )
+            wrencode.handle_slash_command("/permissions deny write(.env)", [], None)
+            wrencode.handle_slash_command("/permissions", [], None)
+            wrencode.handle_slash_command("/permissions forget bash(git *)", [], None)
+            wrencode.handle_slash_command("/permissions allow nope", [], None)
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertIn("No rules", out)
+        self.assertIn("allow  bash(git *)", out)
+        self.assertIn("user", out)
+        self.assertIn("deny   write(.env)", out)
+        self.assertIn("Removed 1 rule", out)
+        self.assertIn("not a rule", out)
+        self.assertEqual([str(r) for r in self.rules.rules()], ["write(.env)"])
 
 
 class TestSpeed(unittest.TestCase):

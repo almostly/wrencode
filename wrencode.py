@@ -110,11 +110,12 @@ if os.getcwd() != _SCRIPT_DIR:
 import wrencode_backends as backends
 import wrencode_configure as configure
 import wrencode_history as history
+import wrencode_permissions as permissions
 import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
 import wrencode_ui as ui
-from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, RED, RESET, YELLOW
+from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
@@ -264,7 +265,7 @@ def write(args: dict[str, Any]) -> str:
     rel = _display_path(path)
     if path.is_file():
         ui.print_diff(rel, path.read_text(encoding="utf-8", errors="replace"), content)
-    approval = ui.confirm("write", f"Write {rel}?")
+    approval = ui.confirm("write", f"Write {rel}?", rel)
     if approval != "ok":
         return approval
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +316,7 @@ def edit(args: dict[str, Any]) -> str:
             return f"error: edit would make invalid JSON: {exc}"
     rel = _display_path(path)
     ui.print_diff(rel, text, updated)
-    approval = ui.confirm("edit", f"Apply to {rel}?")
+    approval = ui.confirm("edit", f"Apply to {rel}?", rel)
     if approval != "ok":
         return approval
     path.write_text(updated, encoding="utf-8")
@@ -536,7 +537,7 @@ def get_response_cancellable(
 def bash(args: dict[str, Any]) -> str:
     """Run a shell command with a timeout, streaming output to the terminal."""
     cmd = _require_str(args, "cmd")
-    approval = ui.confirm("run", "Run it?")
+    approval = ui.confirm("bash", "Run it?", cmd)
     if approval != "ok":
         return approval
     proc = subprocess.Popen(
@@ -1853,6 +1854,9 @@ def handle_slash_command(
         for line in backends.usage_report():
             ui.print_system(line)
         return "handled", configure._MLX_UNCHANGED
+    if cmd == "/permissions" or cmd.startswith("/permissions "):
+        _permissions_command(cmd)
+        return "handled", configure._MLX_UNCHANGED
     if cmd in {"/sessions", "/resume", "/search", "/sync"} or cmd.startswith(
         ("/resume ", "/search ")
     ):
@@ -1939,6 +1943,7 @@ def run_headless(
     """
     global _MLX_STATE, _OUTPUT_SCHEMA
     ui.HEADLESS = True
+    _setup_permissions(interactive=False)
     _OUTPUT_SCHEMA = schema
     _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
@@ -2050,6 +2055,93 @@ def run_headless(
     return 1 if is_error else 0
 
 
+def _permissions_command(cmd: str) -> None:
+    """/permissions lists the rules; `allow <rule>`, `deny <rule>` add one to
+    the project file (`--user` to the user file); `forget <rule>` removes it."""
+    rules = permissions.ACTIVE
+    if rules is None:
+        ui.print_system("Permission rules are off in this run.")
+        return
+    words = cmd.split()[1:]
+    if not words:
+        rules.reload()
+        listed = rules.rules()
+        if not listed:
+            ui.print_system(
+                "No rules: every write, edit and command asks. Press s at a prompt to "
+                "save one, or: /permissions allow bash(git *)  ·  /permissions deny write(.env)"
+            )
+            return
+        trusted = rules.project_trusted()
+        for r in listed:
+            note = ""
+            if r.source == "project" and r.effect == "allow" and not trusted:
+                note = f"  {YELLOW}(not accepted yet; see startup){RESET}"
+            mark = (
+                f"{GREEN}allow{RESET}" if r.effect == "allow" else f"{RED}deny {RESET}"
+            )
+            ui.print_system(f"  {mark}  {r!s:<32} {DIM}{r.source}{RESET}{note}")
+        home = str(pathlib.Path.home())
+        user_file = str(rules.user_file).replace(home, "~", 1)
+        ui.print_system(
+            f"{DIM}{user_file} (user) · {permissions.PROJECT_FILE} (project) · "
+            f"/permissions allow|deny <rule> [--user] · forget <rule>{RESET}"
+        )
+        return
+    verb, rest = words[0], " ".join(words[1:])
+    scope = "user" if "--user" in rest else "project"
+    rest = rest.replace("--user", "").strip()
+    try:
+        if verb in {"allow", "deny"} and rest:
+            rule = rules.add(rest, verb, scope)
+            ui.print_system(f"{verb} {rule} saved to the {scope} rules.")
+        elif verb == "forget" and rest:
+            n = rules.remove(rest)
+            ui.print_system(
+                f"Removed {n} rule{'s' if n != 1 else ''}." if n else "No such rule."
+            )
+        else:
+            ui.print_system(
+                "Usage: /permissions  ·  /permissions allow <rule> [--user]  ·  "
+                "/permissions deny <rule> [--user]  ·  /permissions forget <rule>"
+            )
+    except ValueError as err:
+        ui.print_system(str(err))
+
+
+def _setup_permissions(interactive: bool) -> None:
+    """Load the rules; on a terminal, show a project's allow rules once and ask
+    whether to use them, since the repository could have put them there."""
+    rules = permissions.Permissions(
+        backends.CONFIG_DIR / "permissions.json", workspace_root()
+    )
+    permissions.ACTIVE = rules
+    pending = rules.project_allow_rules()
+    if not pending or rules.project_trusted():
+        return
+    if not interactive:
+        print(
+            f"{YELLOW}{permissions.PROJECT_FILE} has {len(pending)} allow rules you have "
+            f"not accepted; they are ignored in this run.{RESET}",
+            file=sys.stderr,
+        )
+        return
+    print(f"{YELLOW}{permissions.PROJECT_FILE} would allow without asking:{RESET}")
+    for r in pending:
+        print(f"  {r}")
+    print(
+        f"{DIM}A repository can ship this file, so it only applies once you accept it.{RESET}"
+    )
+    answer = ui.ask_line("Use these rules? y/n [n] ")
+    if answer.strip().lower() in {"y", "yes"}:
+        rules.trust_project()
+        ui.print_system("Accepted; /permissions lists them.")
+    else:
+        ui.print_system(
+            "Not accepted; they stay ignored until the file changes and you accept it."
+        )
+
+
 def _status_line(messages: list[dict[str, Any]]) -> str:
     """The one line under the banner: the model and its price, the session and
     how much of it came back, and where history lives."""
@@ -2071,6 +2163,8 @@ def _status_line(messages: list[dict[str, Any]]) -> str:
             )
         elif chats:
             parts.append(f"{chats} chats restored from history.json")
+    if permissions.ACTIVE is not None and (n := len(permissions.ACTIVE.rules())):
+        parts.append(f"{n} permission rule{'s' if n != 1 else ''}")
     return f"{DIM} · {RESET}".join(parts)
 
 
@@ -2312,6 +2406,7 @@ def main() -> None:
             ws, backends.BACKEND, backends.MODEL
         )
     messages = load_history()
+    _setup_permissions(interactive=True)
     print(_status_line(messages))
     for path in find_agents_files():
         print(f"{DIM}Loaded {_display_path(pathlib.Path(path))}{RESET}")

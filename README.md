@@ -319,6 +319,36 @@ Headless runs print the line to stderr and add a `usage` object to the
 price and `output_tokens_per_second` for the run. Set `WRENCODE_SHOW_USAGE=0` to turn the line and the typing estimate off.
 Backends that report no usage (local models, the local proxy) print nothing.
 
+## Permission rules
+
+Rules decide what runs without asking and what never runs. A rule is
+`tool(pattern)`: the tool is `bash`, `edit` or `write`; the pattern is matched
+against the command or the workspace-relative path, `*` matches anything and a
+trailing `:*` means "starts with":
+
+```
+bash(npm test)      exactly that command        edit(src/*)     any file under src/
+bash(git *)         any git command             write(.env)     that file
+bash(pytest:*)      anything starting pytest
+```
+
+Deny rules win over allow rules, over `a` and over `--yes`. Allow rules are the
+way to stop answering prompts for the things you always say yes to, in headless
+runs too: a run with `bash(pytest:*)` allowed can test without `--yes` opening
+everything else.
+
+Rules live in two files: `~/.wrencode/permissions.json` for you, and
+`.wrencode/permissions.json` in the project. The project file can be committed
+and shared, and that is also why its allow rules only take effect after you have
+seen them: at startup wrencode shows a project's allow rules once and asks; if
+the file changes, it asks again. Its deny rules apply regardless.
+
+`/permissions` lists the rules in effect; `/permissions allow bash(git *)` and
+`/permissions deny write(.env)` add one to the project file (`--user` for your
+own); `/permissions forget <rule>` removes it. Pressing `s` at a prompt saves the
+rule offered there: the command's first two words as a prefix, or the edited
+file's directory.
+
 ## Context management
 
 Long sessions are compacted automatically. Before each model call WrenCode
@@ -344,7 +374,9 @@ seeing and approving the real action, and opening an untrusted repository is saf
   displayed as `^[`, `^M` and so on, never interpreted, so nothing can redraw the
   screen or hide part of a command. Writes under a hidden path (`.git/hooks`,
   `.github/workflows`, dotfiles) are flagged. `--yes` turns the prompts off; use it
-  only in a sandbox you can throw away.
+  only in a sandbox you can throw away. Permission rules narrow that: deny rules
+  hold even under `--yes`, and a project's allow rules apply only after you accept
+  them, so a repository cannot grant itself anything.
 - **File tools stay in the workspace.** Paths are resolved (symlinks followed) and
   must land inside the workspace root unless `WRENCODE_UNRESTRICTED_PATHS=1`.
   `grep` passes the pattern and path as arguments, never as flags.
@@ -560,6 +592,7 @@ This publishes release assets:
 |`/search <text>`|Find past sessions by their words, then `/resume` one|
 |`/sync`       |Copy this project's history to the mirror now (Postgres history)|
 |`/usage`      |Token usage and spend for this turn and the session, and the price in effect|
+|`/permissions`|Rules that allow or deny actions without asking: list, `allow`, `deny`, `forget`|
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 
@@ -577,7 +610,9 @@ What a session looks like, and the keys that drive it.
 - **Approvals.** Before a write, edit or shell command runs, you see exactly
   what it does: a unified diff of the file with a few lines of context, red
   and green, headed by the file and line; then one question, `Apply to
-  app.py?  Enter yes · a always · n no`. `n` asks what to do differently.
+  app.py?  Enter yes · a always · s allow bash(npm test:*) · n no`. `a`
+  stops asking for the rest of the session, `s` saves a rule so this kind of
+  action never asks again, `n` asks what to do differently.
 - **Waiting.** The spinner says what is happening (`thinking`, `running
   python`), how long it has been, and that Escape cancels the turn. On the
   Anthropic and OpenAI-style backends the reply then streams in as the model
