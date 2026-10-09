@@ -558,8 +558,8 @@ This publishes release assets:
 |`/backend`, `/configure`|Switch backend, model and API key   |
 |`/clear` or `/c`|Clear the conversation (a new session with Postgres history)|
 |`/sessions`   |List this project's conversations (Postgres history)|
-|`/resume <id>`|Continue an earlier conversation             |
-|`/search <text>`|Search past conversations                  |
+|`/resume [id]`|Continue an earlier session: a picker, or by id|
+|`/search <text>`|Find past sessions by their words, then `/resume` one|
 |`/sync`       |Copy this project's history to the mirror now (Postgres history)|
 |`/usage`      |Token usage and spend for this turn and the session, and the price in effect|
 |`/compact`    |Summarize history to reduce context          |
@@ -617,7 +617,7 @@ the next launch (`WRENCODE_HISTORY_FILE` moves it; `/c` clears it).
 
 With the `history` extra, conversations live in Postgres instead, as sessions per
 project: wrencode resumes the project's latest session on launch, `/clear` starts a
-new one and keeps the old, `/sessions` lists them, `/resume <id>` continues one and
+new one and keeps the old, `/sessions` lists them, `/resume` picks one to continue (or `/resume <id>`) and
 `/search <text>` looks inside all of them (Postgres full-text search).
 
 ```bash

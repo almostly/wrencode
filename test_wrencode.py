@@ -2852,8 +2852,25 @@ class TestHistoryWiring(unittest.TestCase):
         wrencode.handle_slash_command("/resume 99", [], None)
         self.assertIn("No session #99", sys.stdout.getvalue())
         wrencode.handle_slash_command("/search hi", [], None)
-        self.assertIn("hi there", sys.stdout.getvalue())
+        out = sys.stdout.getvalue()
+        self.assertIn("hi there", out)  # the matching line, under the session's row
+        self.assertIn("2026-10-08 12:00", out)
+        self.assertNotIn("model", out.split("/search hi")[-1])
         self.store.search.assert_called_with(mock.ANY, "hi")
+
+    def test_bare_resume_offers_a_picker_on_a_terminal(self):
+        msgs: list = []
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch.object(ui, "pick_from_list", return_value=0) as pick,
+        ):
+            wrencode.handle_slash_command("/resume", msgs, None)
+        self.assertEqual(pick.call_args[0][1], ["7"])
+        self.assertIn("#7", pick.call_args[1]["labels"][0])
+        self.assertEqual(msgs, [{"role": "user", "content": "hi"}])
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            wrencode.handle_slash_command("/resume", [], None)
+        self.assertIn("Usage: /resume <id>", sys.stdout.getvalue())
 
     def test_sync_reports_the_mirror(self):
         self.store.mirror = None

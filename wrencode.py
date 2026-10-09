@@ -1971,8 +1971,18 @@ def _snippet(text: str, width: int = 110) -> str:
     return first[:width].rstrip() + more
 
 
+def _session_line(r: dict[str, Any]) -> str:
+    """One session as /sessions and /search list it; the current one is marked and bold."""
+    current = r["id"] == _SESSION_ID
+    mark = f"{BRIGHT_CYAN}›{RESET}" if current else " "
+    when = r["updated_at"].strftime("%Y-%m-%d %H:%M")
+    title = ui.visible(r["title"]) or "(empty)"
+    line = f"#{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
+    return f"{mark} {BOLD}{line}{RESET}" if current else f"{mark} {line}"
+
+
 def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
-    """/sessions, /resume <id>, /search <text> and /sync, over the Postgres history store."""
+    """/sessions, /resume [id], /search <text> and /sync, over the Postgres history store."""
     global _SESSION_ID
     if _STORE is None:
         ui.print_system(
@@ -1984,17 +1994,11 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
     word, _, arg = cmd.partition(" ")
     arg = arg.strip()
     if word == "/sessions":
-        rows = _STORE.sessions(ws)
-        for r in rows:
-            current = r["id"] == _SESSION_ID
-            mark = f"{BRIGHT_CYAN}›{RESET}" if current else " "
-            when = r["updated_at"].strftime("%Y-%m-%d %H:%M")
-            title = ui.visible(r["title"]) or "(empty)"
-            line = f"#{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
-            ui.print_system(
-                f"{mark} {BOLD}{line}{RESET}" if current else f"{mark} {line}"
-            )
-        ui.print_system("/resume <id> continues one; /search <text> looks inside them.")
+        for r in _STORE.sessions(ws):
+            ui.print_system(_session_line(r))
+        ui.print_system(
+            "/resume <id> continues one; /search <text> finds one by its words."
+        )
     elif word == "/sync":
         if _STORE.mirror is None:
             ui.print_system(
@@ -2012,10 +2016,23 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
         else:
             ui.print_system(f"Mirrored {queued} sessions to {_STORE.mirror.label}")
     elif word == "/resume":
+        rows = _STORE.sessions(ws, limit=1000)
+        if not arg and sys.stdin.isatty():  # like Claude Code's /resume: pick one
+            if not rows:
+                ui.print_system("No sessions for this workspace yet.")
+                return
+            idx = ui.pick_from_list(
+                "Resume a session",
+                [str(r["id"]) for r in rows],
+                labels=[_session_line(r) for r in rows],
+            )
+            if idx is None:
+                return
+            arg = str(rows[idx]["id"])
         if not arg.isdigit():
             ui.print_system("Usage: /resume <id>  (ids from /sessions)")
             return
-        if not any(r["id"] == int(arg) for r in _STORE.sessions(ws, limit=1000)):
+        if not any(r["id"] == int(arg) for r in rows):
             ui.print_system(f"No session #{arg} for this workspace.")
             return
         save_history(messages)
@@ -2027,21 +2044,24 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
         if not arg:
             ui.print_system("Usage: /search <text>")
             return
+        # The sessions whose conversation mentions the words, newest hit first,
+        # each with the line that matched, so /resume <id> can follow.
         hits = _STORE.search(ws, arg)
         if not hits:
             ui.print_system("No matches.")
+            return
+        by_id = {r["id"]: r for r in _STORE.sessions(ws, limit=1000)}
+        seen: set[int] = set()
         for h in hits:
-            text = _snippet(ui.visible(h["text"]))
-            if h["role"] == "user" and text.startswith("Tool result:"):
-                who, body = f"{DIM}{'tool':<9}{RESET}", f"{DIM}{text}{RESET}"
-            elif h["role"] == "user":
-                who, body = f"{BRIGHT_CYAN}{'❯ you':<9}{RESET}", text
-            else:
-                who, body = (
-                    f"{BRIGHT_CYAN}●{RESET} {'model':<7}",
-                    f"{ui.AGENT_TEXT}{text}{RESET}",
-                )
-            ui.print_system(f"{DIM}#{h['session_id']:<4}{RESET} {who} {body}")
+            sid = h["session_id"]
+            if sid in seen or sid not in by_id:
+                continue
+            seen.add(sid)
+            ui.print_system(_session_line(by_id[sid]))
+            ui.print_system(
+                f"        {DIM}{_snippet(ui.visible(h['text']), 100)}{RESET}"
+            )
+        ui.print_system("/resume <id> continues one.")
 
 
 def _warn_dotenv_ignored() -> None:
