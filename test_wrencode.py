@@ -149,7 +149,7 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn("write", plain)
         self.assertNotIn("write write", plain)
 
-    def test_print_system_uses_banner_cyan(self):
+    def test_print_system_is_plain_text(self):
         import io
 
         buf = io.StringIO()
@@ -159,9 +159,8 @@ class TestMessageBlocks(unittest.TestCase):
         ):
             ui.print_system("Cleared")
         out = buf.getvalue()
-        self.assertIn("\033[96m", out)
-        self.assertIn("\033[1m", out)
-        self.assertIn("Cleared", strip_ansi(out))
+        self.assertNotIn("\033[", out)  # notices read as replies, not banners
+        self.assertEqual(out.strip(), "Cleared")
 
     def test_context_loader_frame(self):
         with (
@@ -2690,6 +2689,40 @@ class TestHistoryStore(unittest.TestCase):
         type(self).server, type(self).store = server, store  # for the other tests
         self.assertEqual(store.latest_session(ws), sid)
         self.assertEqual(store.load(sid)[0]["content"], "keep me")
+
+
+class TestEmbeddedPaths(unittest.TestCase):
+    """The embedded server's socket must fit a Unix socket path; errors read clean."""
+
+    def test_socket_stays_under_a_short_root_and_moves_for_a_long_one(self):
+        short = pathlib.Path("/home/me/.wrencode/pglite")
+        self.assertEqual(history._socket_dir(short), short / "run")
+        long = pathlib.Path("/tmp/" + "x" * 100 + "/pglite")
+        moved = history._socket_dir(long)
+        self.assertLessEqual(len(str(moved / history.SOCKET_NAME).encode()), 108)
+        self.assertTrue(str(moved).startswith(tempfile.gettempdir()))
+        self.assertEqual(moved, history._socket_dir(long))  # stable per root
+        self.assertNotEqual(
+            moved, history._socket_dir(pathlib.Path("/tmp/" + "y" * 100))
+        )
+        pg = history.EmbeddedPGlite(long)
+        self.assertEqual(pg.socket.parent, moved)
+        self.assertIn(f"host={moved}", pg.dsn())
+
+    def test_node_errors_lose_their_color_codes(self):
+        self.assertEqual(
+            history._ANSI.sub("", "\x1b[90mat main\x1b[39m {"), "at main {"
+        )
+
+    def test_history_json_lives_in_the_config_dir(self):
+        with (
+            mock.patch.dict(os.environ, {"WRENCODE_HISTORY_FILE": ""}),
+            mock.patch.object(backends, "CONFIG_DIR", pathlib.Path("/cfg")),
+        ):
+            os.environ.pop("WRENCODE_HISTORY_FILE", None)
+            self.assertEqual(
+                wrencode.history_file_path(), pathlib.Path("/cfg/history.json")
+            )
 
 
 class TestMirrorQueue(unittest.TestCase):

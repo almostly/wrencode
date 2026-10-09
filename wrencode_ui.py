@@ -99,12 +99,11 @@ def visible(text: str) -> str:
 
 
 def print_system(text: str, *, end: str = "\n") -> None:
-    """Print slash-command / configure feedback in banner cyan."""
-    s = f"{BOLD}{BRIGHT_CYAN}" if colors_enabled() else ""
-    e = RESET if colors_enabled() else ""
+    """Print slash-command / configure feedback: plain text, so it reads as a reply
+    rather than a banner (the ❯ prompt and tool lines carry the color)."""
     if sys.stdout.isatty():
         sys.stdout.write("\r")
-    sys.stdout.write(f"{s}{text}{e}{end}")
+    sys.stdout.write(f"{text}{end}")
     sys.stdout.flush()
 
 

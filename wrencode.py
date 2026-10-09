@@ -1124,10 +1124,10 @@ _SESSION_ID: int | None = None
 
 
 def history_file_path() -> pathlib.Path:
-    """Return the history file path from env override or user-level default."""
+    """The history file: WRENCODE_HISTORY_FILE, else history.json in the config dir."""
     if p := os.environ.get("WRENCODE_HISTORY_FILE"):
         return pathlib.Path(p).expanduser()
-    return pathlib.Path.home() / ".wrencode" / "history.json"
+    return backends.CONFIG_DIR / "history.json"
 
 
 def load_history() -> list[dict[str, Any]]:

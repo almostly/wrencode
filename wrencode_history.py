@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -108,6 +111,23 @@ def available() -> bool:
     return psycopg is not None
 
 
+SOCKET_NAME = ".s.PGSQL.5432"  # what libpq looks for inside the host directory
+# A Unix socket path is limited to about 108 bytes (sun_path); over that, listen()
+# silently binds a truncated path, or fails. Keep room for the name.
+MAX_SOCKET_DIR = 90
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _socket_dir(root: pathlib.Path) -> pathlib.Path:
+    """Where the socket lives: under `root`, or a short per-root directory in the
+    system temp dir when `root` is too long for a Unix socket path."""
+    run = root / "run"
+    if len(str(run).encode()) <= MAX_SOCKET_DIR:
+        return run
+    digest = hashlib.sha256(str(root).encode()).hexdigest()[:12]
+    return pathlib.Path(tempfile.gettempdir()) / f"wrencode-{os.getuid()}-{digest}"
+
+
 def _connectable(path: pathlib.Path) -> bool:
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(0.5)
@@ -133,8 +153,8 @@ class EmbeddedPGlite:
     def __init__(self, root: pathlib.Path | None = None) -> None:
         self.root = root if root is not None else backends.CONFIG_DIR / "pglite"
         self.data = self.root / "data"
-        self.run = self.root / "run"
-        self.socket = self.run / ".s.PGSQL.5432"
+        self.run = _socket_dir(self.root)
+        self.socket = self.run / SOCKET_NAME
         self.proc: subprocess.Popen[bytes] | None = None
 
     def dsn(self) -> str:
@@ -175,8 +195,9 @@ class EmbeddedPGlite:
                 return self.dsn()
             if self.proc.poll() is not None:
                 err = (self.proc.stderr.read() if self.proc.stderr else b"").decode()
+                err = _ANSI.sub("", err).strip()
                 raise RuntimeError(
-                    f"PGlite exited: {err.strip()[-400:] or self.proc.returncode}"
+                    f"PGlite exited: {err[-400:] or self.proc.returncode}"
                 )
             time.sleep(0.1)
         self.stop()

@@ -575,7 +575,7 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`MODEL`                      |backend-dependent      |Model path or ID                  |
 |`WRENCODE_CONFIG_DIR`        |`~/.wrencode`          |Dir for `config.json` (saved backend/key)|
 |`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
-|`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file, without the Postgres store|
+|`WRENCODE_HISTORY_FILE`      |`<config dir>/history.json`|Conversation history file, without the Postgres store|
 |`WRENCODE_DATABASE_URL`      |-                      |Postgres URL for history; unset, embedded PGlite is used|
 |`WRENCODE_MIRROR_URL`        |-                      |A second Postgres that receives a copy of every saved session|
 |`WRENCODE_PGLITE_START_TIMEOUT`|`60`                 |Seconds to wait for the embedded PGlite to start|
