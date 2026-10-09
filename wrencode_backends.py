@@ -1317,9 +1317,12 @@ def _stream_anthropic(
             index = int(event.get("index", -1))
             if index in partial:
                 raw = partial.pop(index)
-                try:
-                    blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
-                except ValueError:
+                if raw.strip():  # otherwise the input came whole with the block start
+                    try:
+                        blocks[index]["input"] = json.loads(raw)
+                    except ValueError:
+                        blocks[index]["input"] = {}
+                elif not isinstance(blocks[index].get("input"), dict):
                     blocks[index]["input"] = {}
             if (
                 on_block is not None
@@ -1337,8 +1340,9 @@ def _stream_anthropic(
                 f"stream error: {err.get('type', '')}: {err.get('message', '')}"
             )
     for index, raw in partial.items():  # a stream cut before the block closed
-        with contextlib.suppress(ValueError):
-            blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
+        if raw.strip():
+            with contextlib.suppress(ValueError):
+                blocks[index]["input"] = json.loads(raw)
     return message
 
 
@@ -1347,11 +1351,14 @@ SERVER_BLOCKS: frozenset[str] = frozenset({"server_tool_use", "web_search_tool_r
 
 
 def describe_server_block(block: dict[str, Any]) -> str:
-    """One line for a server-side tool block: the search, or how many results."""
+    """One line for a server-side tool block: the search, or how many results;
+    '' for the code the search runs to filter its results, which is noise."""
     kind = block.get("type")
     if kind == "server_tool_use":
+        if block.get("name") != "web_search":
+            return ""
         query = (block.get("input") or {}).get("query", "")
-        return f"{block.get('name', 'server tool')} {json.dumps(query, ensure_ascii=False)}"
+        return f"web_search {json.dumps(query, ensure_ascii=False)}"
     content = block.get("content")
     if isinstance(content, dict):  # an error
         return f"search failed: {content.get('error_code', 'error')}"

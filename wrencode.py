@@ -511,6 +511,8 @@ def _server_block_printer(
     printer: ui.StreamPrinter, spinner: Any
 ) -> Callable[[dict[str, Any]], None]:
     def show(block: dict[str, Any]) -> None:
+        if not backends.describe_server_block(block):
+            return
         spinner.stop()
         printer.note(_server_block_line(block))
 
@@ -1663,6 +1665,7 @@ def run_agent_turn(
                         if (
                             isinstance(block, dict)
                             and block.get("type") in backends.SERVER_BLOCKS
+                            and backends.describe_server_block(block)
                         ):
                             print(_server_block_line(block))
                 if display_text:

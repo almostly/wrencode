@@ -4585,6 +4585,32 @@ class TestWeb(unittest.TestCase):
         finally:
             backends.USAGE = orig
 
+    def test_filter_code_is_hidden_and_a_whole_input_survives_the_stream(self):
+        code = {
+            "type": "server_tool_use",
+            "name": "code_execution",
+            "input": {"code": "x"},
+        }
+        self.assertEqual(backends.describe_server_block(code), "")
+        whole = backends._stream_anthropic(
+            iter(
+                [
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "server_tool_use",
+                            "name": "web_search",
+                            "input": {"query": "given whole"},
+                        },
+                    },
+                    {"type": "content_block_stop", "index": 0},
+                ]
+            ),
+            lambda t: None,
+        )
+        self.assertEqual(whole["content"][0]["input"], {"query": "given whole"})
+
     def test_server_blocks_print_without_streaming(self):
         block = {
             "type": "server_tool_use",
