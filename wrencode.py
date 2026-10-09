@@ -110,6 +110,7 @@ if os.getcwd() != _SCRIPT_DIR:
 import wrencode_backends as backends
 import wrencode_configure as configure
 import wrencode_history as history
+import wrencode_mcp as mcp
 import wrencode_permissions as permissions
 import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
@@ -741,7 +742,9 @@ def validate_json(value: Any, schema: Any, path: str = "$") -> list[str]:
 
 
 ToolFn = Callable[[dict[str, Any]], str]
-ToolEntry = tuple[str, dict[str, str], ToolFn]
+# params: {"name": "string"/"number?"/...} for the built-in tools, or a whole
+# JSON Schema object for tools that bring their own (MCP).
+ToolEntry = tuple[str, dict[str, Any], ToolFn]
 
 TOOLS: dict[str, ToolEntry] = {
     "read": (
@@ -907,6 +910,10 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
         lines = code.split("\n")
         more = f"  (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
         return f"python {lines[0][:160]}{more}"
+    if name.startswith("mcp__"):
+        _, server, tool = name.split("__", 2)
+        shown = json.dumps(args, ensure_ascii=False)[:200]
+        return f"mcp {server}:{tool} {shown}"
     return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
 
@@ -1143,6 +1150,9 @@ def tool_specs() -> list[backends.ToolSpec]:
     """
     specs: list[backends.ToolSpec] = []
     for name, (desc, params, _) in TOOLS.items():
+        if params.get("type") == "object":  # a ready JSON Schema (MCP tools)
+            specs.append((name, desc, params))
+            continue
         props = {k: {"type": _TYPE_MAP.get(v, "string")} for k, v in params.items()}
         req = [k for k, v in params.items() if not v.endswith("?")]
         specs.append(
@@ -1460,6 +1470,13 @@ Examples:
             "snippet; print() what you want to see, a trailing expression's value "
             "is returned\n"
         )
+    mcp_lines = ""
+    for name, (desc, params, _) in TOOLS.items():
+        if name.startswith("mcp__"):
+            args = ", ".join((params.get("properties") or {}).keys())
+            mcp_lines += f"- {name}({args}): {desc[:300]}\n"
+    if mcp_lines:
+        mcp_lines = "Tools from MCP servers (call them like the others):\n" + mcp_lines
     respond_line = ""
     if (respond_schema := _respond_schema()) is not None:
         respond_line = (
@@ -1481,7 +1498,7 @@ Available tools:
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
 - task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result. Several task calls in one reply run in parallel, so batch independent subtasks together
-{python_line}
+{python_line}{mcp_lines}
 {respond_line}{tool_format}
 
 When reading a file, always pass offset and limit. When you finish a task, summarize what you changed.
@@ -1857,6 +1874,9 @@ def handle_slash_command(
     if cmd == "/permissions" or cmd.startswith("/permissions "):
         _permissions_command(cmd)
         return "handled", configure._MLX_UNCHANGED
+    if cmd == "/mcp" or cmd.startswith("/mcp "):
+        _mcp_command(cmd)
+        return "handled", configure._MLX_UNCHANGED
     if cmd in {"/sessions", "/resume", "/search", "/sync"} or cmd.startswith(
         ("/resume ", "/search ")
     ):
@@ -1944,6 +1964,7 @@ def run_headless(
     global _MLX_STATE, _OUTPUT_SCHEMA
     ui.HEADLESS = True
     _setup_permissions(interactive=False)
+    _setup_mcp(interactive=False)
     _OUTPUT_SCHEMA = schema
     _STRUCTURED_RESULT.clear()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
@@ -2109,6 +2130,113 @@ def _permissions_command(cmd: str) -> None:
         ui.print_system(str(err))
 
 
+def _mcp_tool_fn(tool: mcp.Tool) -> ToolFn:
+    """The callable behind an MCP tool: approval unless read-only, then the call."""
+
+    def run(args: dict[str, Any]) -> str:
+        registry = mcp.ACTIVE
+        server = registry.server(tool.server) if registry is not None else None
+        if server is None:
+            return f"error: MCP server {tool.server} is not available"
+        if not tool.read_only:
+            approval = ui.confirm(
+                "mcp", f"Call {tool.server}:{tool.name}?", f"{tool.server}:{tool.name}"
+            )
+            if approval != "ok":
+                return approval
+        return server.call(tool.name, args)
+
+    return run
+
+
+def _register_mcp_tools() -> int:
+    """Put every connected server's tools into TOOLS; returns how many."""
+    for name in [n for n in TOOLS if n.startswith("mcp__")]:
+        del TOOLS[name]
+    if mcp.ACTIVE is None:
+        return 0
+    for tool in mcp.ACTIVE.tools():
+        desc = tool.description or f"{tool.name} on the {tool.server} MCP server"
+        if tool.read_only:
+            desc += " (read-only)"
+        TOOLS[tool.full_name] = (desc, tool.schema, _mcp_tool_fn(tool))
+    return len(mcp.ACTIVE.tools())
+
+
+def _setup_mcp(interactive: bool) -> None:
+    """Load the MCP servers; a project's are shown once and started only when accepted."""
+    registry = mcp.Registry(backends.CONFIG_DIR / "mcp.json", workspace_root())
+    mcp.ACTIVE = registry
+    if registry.project_servers and not registry.project_trusted():
+        where = (
+            _display_path(registry.project_file) if registry.project_file else "project"
+        )
+        if not interactive:
+            print(
+                f"{YELLOW}{where} declares {len(registry.project_servers)} MCP servers you "
+                f"have not accepted; they are not started in this run.{RESET}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"{YELLOW}{where} would start these MCP servers:{RESET}")
+            for name, spec in registry.project_servers.items():
+                how = spec.get("url") or " ".join(
+                    [str(spec.get("command", "")), *map(str, spec.get("args") or [])]
+                )
+                print(f"  {name}: {ui.visible(str(how))[:120]}")
+            print(
+                f"{DIM}They run on this machine, so they only start once you accept them.{RESET}"
+            )
+            if ui.ask_line("Start them? y/n [n] ").strip().lower() in {"y", "yes"}:
+                registry.trust_project()
+                ui.print_system("Accepted; /mcp shows them.")
+            else:
+                ui.print_system(
+                    "Not started; they stay off until the file changes and you accept it."
+                )
+    if not registry.project_servers and not registry.user_file.is_file():
+        return
+    with thinking_spinner("connecting MCP servers"):
+        registry.connect_all()
+    _register_mcp_tools()
+    for s in registry.servers:
+        if s.error:
+            print(f"{YELLOW}MCP {s.name}: {ui.visible(s.error)[:200]}{RESET}")
+
+
+def _mcp_command(cmd: str) -> None:
+    """/mcp lists the servers and their tools; /mcp reload re-reads the files and reconnects."""
+    registry = mcp.ACTIVE
+    if registry is None:
+        ui.print_system("MCP is off in this run.")
+        return
+    if cmd.strip() == "/mcp reload":
+        _setup_mcp(interactive=sys.stdin.isatty())
+        registry = mcp.ACTIVE
+    if registry is None or not registry.servers:
+        ui.print_system(
+            "No MCP servers. Declare them in .wrencode/mcp.json (or .mcp.json) in the "
+            f"project, or {registry.user_file if registry else 'mcp.json in the config dir'}: "
+            '{"mcpServers": {"name": {"command": "...", "args": [...]}}}'
+        )
+        return
+    for s in registry.servers:
+        if s.error:
+            ui.print_system(
+                f"  {RED}✗{RESET} {s.name:<16} {DIM}{s.source}{RESET}  {ui.visible(s.error)[:160]}"
+            )
+            continue
+        names = ", ".join(t.name for t in s.tools[:8]) + (
+            " …" if len(s.tools) > 8 else ""
+        )
+        ui.print_system(
+            f"  {GREEN}✓{RESET} {s.name:<16} {DIM}{s.source}{RESET}  {len(s.tools)} tools: {names}"
+        )
+    ui.print_system(
+        f"{DIM}tools are mcp__<server>__<tool>; /mcp reload reconnects{RESET}"
+    )
+
+
 def _setup_permissions(interactive: bool) -> None:
     """Load the rules; on a terminal, show a project's allow rules once and ask
     whether to use them, since the repository could have put them there."""
@@ -2165,6 +2293,11 @@ def _status_line(messages: list[dict[str, Any]]) -> str:
             parts.append(f"{chats} chats restored from history.json")
     if permissions.ACTIVE is not None and (n := len(permissions.ACTIVE.rules())):
         parts.append(f"{n} permission rule{'s' if n != 1 else ''}")
+    if mcp.ACTIVE is not None and (m := len(mcp.ACTIVE.tools())):
+        servers = sum(1 for s in mcp.ACTIVE.servers if not s.error)
+        parts.append(
+            f"{m} MCP tools from {servers} server{'s' if servers != 1 else ''}"
+        )
     return f"{DIM} · {RESET}".join(parts)
 
 
@@ -2407,6 +2540,7 @@ def main() -> None:
         )
     messages = load_history()
     _setup_permissions(interactive=True)
+    _setup_mcp(interactive=True)
     print(_status_line(messages))
     for path in find_agents_files():
         print(f"{DIM}Loaded {_display_path(pathlib.Path(path))}{RESET}")

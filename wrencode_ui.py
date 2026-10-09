@@ -214,12 +214,13 @@ SLASH_COMMANDS: dict[str, str] = {
     "/sync": "copy this project's history to the mirror now",
     "/usage": "token usage and spend: this turn and the session",
     "/permissions": "rules that allow or deny actions without asking",
+    "/mcp": "MCP servers and their tools (/mcp reload reconnects)",
     "/help": "list commands",
     "/quit": "save history and exit",
 }
 # Short aliases: accepted and highlighted, but kept out of the menu.
 SLASH_ALIASES: dict[str, str] = {"/c": "/clear", "/q": "/quit", "/exit": "/quit"}
-MAX_SLASH_MENU = 12
+MAX_SLASH_MENU = 14
 
 
 def slash_matches(text: str) -> list[str]:

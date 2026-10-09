@@ -22,6 +22,8 @@ Read `wrencode.py` top to bottom to understand the agent; the files beside it ar
 |`wrencode_backends.py`  |Talking to models: backend tables and state, HTTP with retries, request/response formats (Anthropic, OpenAI, Bedrock Converse, local), `get_response()`|
 |`wrencode_configure.py` |Picking a backend and model: the first-run chooser, `/configure` and `/model`, API-key prompts and verification, model lists, saved config|
 |`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
+|`wrencode_permissions.py`|Permission rules: allow and deny by tool and pattern, user and project files|
+|`wrencode_mcp.py`       |MCP client: stdio and HTTP servers, their tools as `mcp__server__tool`|
 |`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
 |`wrencode_sandbox.py`   |The `python` tool's sandbox, on pydantic-monty                    |
 |`wrencode_history.py`   |Conversation history in Postgres: a server or embedded PGlite     |
@@ -349,6 +351,32 @@ own); `/permissions forget <rule>` removes it. Pressing `s` at a prompt saves th
 rule offered there: the command's first two words as a prefix, or the edited
 file's directory.
 
+## MCP servers
+
+Tools from [Model Context Protocol](https://modelcontextprotocol.io) servers
+join the tool list. Declare them in `.wrencode/mcp.json` in the project (Claude
+Code's `.mcp.json` is read too, same format) or `~/.wrencode/mcp.json`:
+
+```json
+{"mcpServers": {
+  "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+             "env": {"GITHUB_TOKEN": "..."}},
+  "docs":   {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
+}}
+```
+
+A `command` entry runs as a subprocess spoken to over stdio; a `url` entry is
+Streamable HTTP. Each server's tools are offered to the model as
+`mcp__<server>__<tool>`, calls ask for approval unless the server marks the
+tool read-only, and permission rules such as `mcp(github:*)` apply. `/mcp`
+lists the servers, their tools and any connection error; `/mcp reload`
+re-reads the files and reconnects.
+
+A project's servers run on your machine, so, like its permission rules, they
+are shown once at startup and start only after you accept them; a change to the
+file asks again. `WRENCODE_MCP_TIMEOUT` (default 120s) bounds a tool call and
+`WRENCODE_MCP_CONNECT_TIMEOUT` (default 20s) a connection.
+
 ## Context management
 
 Long sessions are compacted automatically. Before each model call WrenCode
@@ -593,6 +621,7 @@ This publishes release assets:
 |`/sync`       |Copy this project's history to the mirror now (Postgres history)|
 |`/usage`      |Token usage and spend for this turn and the session, and the price in effect|
 |`/permissions`|Rules that allow or deny actions without asking: list, `allow`, `deny`, `forget`|
+|`/mcp`        |MCP servers and their tools; `/mcp reload` reconnects|
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 
@@ -659,6 +688,8 @@ What a session looks like, and the keys that drive it.
 |`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
 |`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
 |`WRENCODE_STREAM`            |`1`                    |Stream replies as they are written (Anthropic and OpenAI-style backends)|
+|`WRENCODE_MCP_TIMEOUT`       |`120`                  |Seconds an MCP tool call may take|
+|`WRENCODE_MCP_CONNECT_TIMEOUT`|`20`                  |Seconds to connect to an MCP server|
 |`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
