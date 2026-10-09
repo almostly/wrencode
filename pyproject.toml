@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "wrencode"
 dynamic = ["version"]
-description = "A minimal agent harness for coding, in a single Python file"
+description = "A minimal agent harness for coding: the agent loop in one readable file"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -36,6 +36,11 @@ mlx = ["mlx-lm"]
 transformers = ["transformers", "torch"]
 # Claude Code's agent loop as a backend; the SDK needs Python 3.10+.
 agent-sdk = ["claude-agent-sdk; python_version >= '3.10'"]
+# The `python` tool: model-written snippets run in the pydantic-monty sandbox.
+sandbox = ["pydantic-monty"]
+# Conversation history in Postgres: a server (WRENCODE_DATABASE_URL) or embedded
+# PGlite, which also needs Node.js.
+history = ["psycopg[binary]"]
 
 [project.scripts]
 wrencode = "wrencode:main"
@@ -49,15 +54,16 @@ Issues = "https://github.com/almostly/wrencode/issues"
 path = "wrencode.py"
 pattern = 'WRENCODE_VERSION = "(?P<version>[^"]+)"'
 
+# wrencode.py is the agent loop; the wrencode_*.py modules are what it imports.
 [tool.hatch.build.targets.wheel]
-include = ["wrencode.py"]
+include = ["wrencode.py", "wrencode_*.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["wrencode.py", "README.md"]
+include = ["wrencode.py", "wrencode_*.py", "README.md"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.3.0"
+version = "0.4.0"
 version_scheme = "pep440"
 tag_format = "$version"
 legacy_tag_formats = ["v$version"]
@@ -67,11 +73,31 @@ changelog_incremental = true
 # Pre-commitizen four-part tags (0.1.4.x); their history is in CHANGELOG.md.
 ignored_tag_formats = ["$major.$minor.$patch.*"]
 
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+# ruff's defaults plus the families the code is kept clean under. No `# noqa`
+# anywhere: a rule the design contradicts is turned off here, with its reason.
+extend-select = ["I", "UP", "B", "SIM", "BLE", "TRY", "RUF", "PLW", "FA", "FLY", "S110"]
+ignore = [
+    "BLE001",  # the tool boundary, the interactive loop and the model-list fallbacks
+               # must survive any failure, so they catch Exception on purpose
+    "PLW0603", # module-level state is set with `global` on purpose (see apply_backend)
+    "TRY003",  # exception messages are written where they are raised
+    "TRY300",  # `return` inside `try` reads fine here
+    "TRY301",  # so does `raise` inside `try`
+    "RUF001",  # em dashes, ellipses and arrows are used deliberately in UI text...
+    "RUF002",  # ...in docstrings...
+    "RUF003",  # ...and in comments
+]
+
 [tool.ty.analysis]
 # Optional at runtime, so not installed in the dev environment: certifi is
 # soft-imported for the frozen binary's CA bundle, mlx-lm and transformers/torch
 # are the [mlx]/[transformers] extras, claude_agent_sdk is the [agent-sdk]
-# extra, and modal is only for examples/modal_vllm.py.
+# extra, pydantic_monty is the [sandbox] extra, psycopg is the [history] extra,
+# and modal is only for examples/modal_vllm.py.
 allowed-unresolved-imports = [
     "certifi",
     "mlx_lm",
@@ -81,4 +107,6 @@ allowed-unresolved-imports = [
     "modal",
     "claude_agent_sdk",
     "claude_agent_sdk.*",
+    "pydantic_monty",
+    "psycopg",
 ]

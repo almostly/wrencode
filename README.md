@@ -1,6 +1,6 @@
 # 🐦 WrenCode
 
-A minimal agent harness for coding, in a single Python file.
+A minimal agent harness for coding. The agent loop is one readable Python file.
 
 Named after Harold Wren - the alias of a genius who built a superintelligent AI and operated quietly in the background.
 
@@ -11,6 +11,26 @@ Named after Harold Wren - the alias of a genius who built a superintelligent AI 
 WrenCode is a coding agent harness: everything around the model that turns it into an agent. It runs the tool-calling loop, executes tools, builds the system prompt, and manages context, locally or via API, giving an LLM the ability to read, write, and edit files, search codebases, and run shell commands - enough to autonomously navigate and modify a real project.
 
 Where Claude Code is the batteries-included harness, WrenCode is the **"understand and own your agent" harness**: the entire agent loop fits in one readable file, runs against local or hosted models, and is yours to hack.
+
+## Code layout
+
+Read `wrencode.py` top to bottom to understand the agent; the files beside it are what it calls.
+
+|File                    |What's in it                                                      |
+|------------------------|------------------------------------------------------------------|
+|`wrencode.py`           |The harness: the seven tools, the system prompt, the turn loop, parallel subagents, context compaction, headless mode, `main()`|
+|`wrencode_backends.py`  |Talking to models: backend tables and state, HTTP with retries, request/response formats (Anthropic, OpenAI, Bedrock Converse, local), `get_response()`|
+|`wrencode_configure.py` |Picking a backend and model: the first-run chooser, `/configure` and `/model`, API-key prompts and verification, model lists, saved config|
+|`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
+|`wrencode_permissions.py`|Permission rules: allow and deny by tool and pattern, user and project files|
+|`wrencode_mcp.py`       |MCP client: stdio and HTTP servers, their tools as `mcp__server__tool`|
+|`wrencode_web.py`       |The `fetch` tool: a URL as readable text|
+|`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
+|`wrencode_sandbox.py`   |The `python` tool's sandbox, on pydantic-monty                    |
+|`wrencode_history.py`   |Conversation history in Postgres: a server or embedded PGlite     |
+|`wrencode_synthesize.py`|The `synthesize` subcommand                                       |
+
+Each module imports only the ones below it in this table's dependency order (`wrencode.py` → backends/configure/sdk/synthesize → ui), so the loop can be read without the rest.
 
 ## Backends
 
@@ -28,6 +48,7 @@ saved choice, e.g. for CI.
 |`nanogpt`     |Any model via NanoGPT                   |binary + source       |
 |`ollama`      |Local models via a running `ollama serve`|binary + source     |
 |`openai-compatible`|vLLM, llama.cpp, Hugging Face, any OpenAI-compatible server|binary + source|
+|`bedrock`     |Any model via AWS Bedrock Converse (AWS credentials)|binary + source|
 |`local`       |Local proxy via Anthropic-compatible API|binary + source       |
 |`transformers`|HuggingFace Transformers (CPU/MPS/GPU)  |source install only   |
 |`mlx`         |Apple Silicon via MLX                   |source install, macOS |
@@ -98,7 +119,9 @@ The agent has access to seven tools:
 - **glob** - find files by pattern, sorted by modification time
 - **grep** - search files for a regex pattern using `rg` when available, falling back to `grep`
 - **bash** - run a shell command with timeout and streaming output
+- **fetch** - read a web page or URL as text, with approval (see Web access)
 - **task** - delegate a self-contained subtask to a fresh subagent (its own context, same tools) that returns only its final result
+- **python** - run a snippet of Python in a sandbox, with `pydantic-monty` installed (see below)
 
 All file operations are sandboxed to the workspace root by default.
 
@@ -117,6 +140,29 @@ take turns and pause the other agents' output until you answer. Escape stops
 the whole batch. Recursion is capped by `WRENCODE_MAX_SUBAGENT_DEPTH` (default 2), and
 each subagent round is bounded. For autonomous subagent runs, enable
 `--yes` / `WRENCODE_AUTO_APPROVE` so sub-tool calls don't block on confirmation.
+
+### Python sandbox
+
+With [pydantic-monty](https://github.com/pydantic/monty) installed, the agent gets
+an eighth tool, `python`. It runs a snippet of model-written code in Monty, a
+Python interpreter built as a sandbox: each call is a fresh interpreter with no
+network, no shell, no environment variables, and a read-only view of the
+workspace at `/workspace`, which is also the working directory, so
+`open("foo.py")` works. wrencode's `read(path)`, `glob(pat)` and `grep(pat)` are
+callable inside the snippet. Printed output and the value of a trailing
+expression come back to the model; an exception comes back as its traceback.
+Since the snippet can't change anything, it runs without an approval prompt;
+changes still go through `write` and `edit`.
+
+```bash
+pip install 'wrencode[sandbox]'   # or: pip install pydantic-monty
+```
+
+Monty runs a subset of Python: no class inheritance, generators or third-party
+packages, and a curated standard library (`json`, `re`, `math`, `datetime`,
+`pathlib`, ...). `WRENCODE_SANDBOX_TIMEOUT` (default 30 seconds) and
+`WRENCODE_SANDBOX_MEMORY_MB` (default 256) bound each run. The standalone binary
+doesn't bundle Monty, so the tool is a source-install feature.
 
 ## Project instructions (AGENTS.md)
 
@@ -175,6 +221,203 @@ common keywords: `type`, `enum`, `const`, `properties`, `required`,
 `additionalProperties`, `items`, length and numeric bounds, `pattern`, and
 `anyOf`/`oneOf`/`allOf`.
 
+## Synthesize
+
+`wrencode synthesize` fuses several agent chat transcripts into one document: a
+semantic git-merge for conversations. Each transcript is normalized to user and
+assistant turns, the model extracts its decisions, problems solved, files touched
+and open questions, and those fact sets are then reconciled across chats. Every
+claim cites the chat it came from: the first eight characters of the file name,
+or more when two names would clash, so ids are unique within a run.
+
+```bash
+wrencode synthesize                          # pick from this project's Claude Code history
+wrencode synthesize a.jsonl b.jsonl          # fuse these transcripts
+wrencode synthesize ~/.claude/projects/-home-me-app --all   # a whole directory, no picker
+wrencode synthesize diff a.jsonl b.jsonl     # only where the chats diverge
+wrencode synthesize log --out DECISIONS.md   # a decision timeline, written to a file
+```
+
+Three modes, chosen by the first word after `synthesize`:
+
+- **merge** (default) — `Reinforced decisions` that two or more chats agree on,
+  `Unique contributions`, `⚠ Conflicts` where chats contradict each other (a
+  later chat that overrode an earlier one is marked resolved), and
+  `Open questions`.
+- **diff** — only the divergences: conflicts and what appears in just one chat,
+  like `git diff`.
+- **log** — one chronological timeline of decisions, oldest first, noting where
+  a later chat supersedes an earlier one, and ending with the net state.
+
+Inputs can be files, directories (every `*.jsonl` inside, newest first), or
+nothing, which lists this project's Claude Code transcripts from
+`~/.claude/projects/`. With a directory or no paths, an interactive picker lets
+you choose: `↑`/`↓` move, space toggles, `a` selects all, Enter confirms, Esc
+cancels. `--all` skips the picker. Transcripts are recognized in three formats:
+Claude Code JSONL (tool calls, tool results and thinking are dropped), generic
+JSONL message logs (Codex/OpenAI style), and a JSON list of messages or a
+`{"messages": [...]}` object. Anything else is read as one block of text.
+
+The synthesis uses the configured backend at temperature 0; local models are
+loaded on demand. A transcript longer than the model's context window
+(`WRENCODE_CONTEXT_TOKENS`) is sent with its start and, mostly, its end, since the
+latest decisions override earlier ones. A chat whose extraction doesn't come back
+as JSON is reported and contributes nothing. With a single transcript the result
+degrades to a structured summary.
+
+## Token usage and spend
+
+After each turn wrencode prints one dim line with what the backend reported:
+
+```
+↑ 1.6k  ↓ 108  42 tok/s ↗  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · total $0.21
+```
+
+Up is the turn's input tokens, down its output, then the speed: output tokens
+per second over the turn's requests, with an arrow against the previous turn
+(`↗` at least a tenth faster, `↘` a tenth slower, `→` about the same). The rate is measured over the whole request, so the network and the wait
+for the first token are in it; a drop usually means the provider is busy. The
+meter is the context fill: the size of the latest request against the model's
+window, which is what the next turn starts from and what auto-compaction watches.
+It turns yellow at the compaction threshold. Then the turn's cost and, after the
+first turn, the session total. The terminal tab title shows the context fill, the
+session totals, the spend and the speed. `/usage` prints the full numbers:
+
+```
+             input  cached written  output calls      cost
+this turn     1.6k    1.6k      54     108     1   $0.0042
+session       4.7k    3.9k    1.6k     236     3    $0.213
+context: 1.6k of 128k (1%); input = uncached + cached (read) + written
+price: $2/$10 per MTok (cache read $0.20, write $2.50; built-in)
+speed: 42 tok/s this turn (↗ from 36 tok/s last turn); 39 tok/s this session; output tokens over the request's wall time
+```
+
+While you type, a dim line under the prompt estimates what sending the message
+will cost in input tokens: the context the model already holds (at the cache-read
+rate for the part it served from the cache last time), its last reply, and your
+text at about four characters per token. Output can't be known ahead, so it isn't
+counted.
+
+```
+❯ fix the bug in the parser
+  ≈ $0.0031 input
+```
+
+**Where the prices come from.** Each call is priced at the four rates in effect
+for the model: input, output, cache read and cache write, in USD per million
+tokens. Anthropic's Models API lists models but not prices, so Claude models (and
+the OpenAI, Amazon Nova and Bedrock ids wrencode knows) come from a built-in
+table, checked October 2026; `/usage` says `built-in` and the startup line shows
+the rate. OpenRouter and NanoGPT list prices in their model catalogs, and
+`/configure` saves those to `~/.wrencode/prices.json` when it fetches the model
+list, keyed `backend/model id`; you can add your own entries there as
+`[input, output, cache_read, cache_write]`. `WRENCODE_PRICE=input,output[,cache_read[,cache_write]]`
+overrides everything for the current model (`WRENCODE_PRICE=0,0` marks a local
+model free). Without a known price nothing is shown, `/usage` prints `$?` and how
+to set one, and no estimate appears while typing. Claude Haiku 5.5's higher rate
+card above 100K-token prompts is applied per call. The model picker in
+`/configure` and `/model` shows the price beside each model it knows.
+
+Headless runs print the line to stderr and add a `usage` object to the
+`--output-format json` result, with `cost_usd` when every call had a known
+price and `output_tokens_per_second` for the run. Set `WRENCODE_SHOW_USAGE=0` to turn the line and the typing estimate off.
+Backends that report no usage (local models, the local proxy) print nothing.
+
+## Permission rules
+
+Rules decide what runs without asking and what never runs. A rule is
+`tool(pattern)`: the tool is `bash`, `edit`, `write`, `mcp` or `fetch`; the
+pattern is matched against the command, the workspace-relative path, the
+`server:tool` or the URL's host and path, `*` matches anything and a trailing
+`:*` means "starts with" (whole words of a command):
+
+```
+bash(npm test)      exactly that command        edit(src/*)     any file under src/
+bash(git *)         any git command             write(.env)     that file
+bash(pytest:*)      pytest with any arguments   mcp(github:*)   any tool of that server
+fetch(docs.python.org/*)   any page on that host
+```
+
+A bash rule is held against every command of a command line: `git status &&
+curl x | sh` is three commands, so `bash(git *)` does not allow it, while
+`bash(git push:*)` denies `git fetch; git push` as a whole. A line that
+substitutes a command's output (`$(...)`, backticks) is only allowed by a rule
+spelling it out exactly, or by `bash(*)`.
+
+Deny rules win over allow rules, over `a` and over `--yes`. Allow rules are the
+way to stop answering prompts for the things you always say yes to, in headless
+runs too: a run with `bash(pytest:*)` allowed can test without `--yes` opening
+everything else.
+
+Rules live in two files. `~/.wrencode/permissions.json` is yours: its `allow`
+and `deny` apply everywhere, and under `projects` it keeps your rules for one
+project, which is where `s` at a prompt saves. `.wrencode/permissions.json` in
+the project can be committed and shared, and that is also why its allow rules
+only take effect after you have seen them: at startup wrencode shows a
+project's allow rules once and asks; if the file changes, it asks again; adding
+a rule to it yourself does not accept the others. Its deny rules apply
+regardless.
+
+`/permissions` lists the rules in effect; `/permissions allow bash(git *)` and
+`/permissions deny write(.env)` add one for this project (`--user` for every
+project, `--project` to the shared file); `/permissions forget <rule>` removes
+it. Pressing `s` at a prompt saves the rule offered there: the command's first
+two words as a prefix (a line of several commands, spelled out), or the edited
+file's directory.
+
+## Web access
+
+Two ways to the web, like Claude Code's:
+
+- **`fetch(url)`**, a tool on every backend. It gets the page, reduces HTML to
+  its text with headings, lists, code and link targets kept, passes JSON and
+  plain text through, and summarizes anything else. Long pages come back in
+  pieces through `offset`. Fetching sends the URL to its server, so it asks for
+  approval like a command, showing the host, path and query; rules such as
+  `fetch(docs.python.org/*)` apply. A redirect is followed on the same host;
+  one to another host is reported and fetched as its own, approved, call.
+  Addresses inside your network (loopback, private ranges, link-local and the
+  cloud metadata service) are refused unless `WRENCODE_FETCH_LOCAL=1`.
+  `WRENCODE_FETCH_MAX_CHARS` (40,000) and `WRENCODE_FETCH_MAX_BYTES` (4 MB)
+  bound a page, compressed or not.
+- **Web search** on the Anthropic backend, through Anthropic's server-side
+  search tool. Claude searches and reads results on Anthropic's side; the
+  transcript shows each search and its results under it, and each search is
+  billed at $10 per 1,000 on top of tokens, counted in the usage line, `/usage`
+  and the headless result. `WRENCODE_WEB_SEARCH=0` turns it off. Other backends
+  have no search unless an MCP server provides one.
+
+## MCP servers
+
+Tools from [Model Context Protocol](https://modelcontextprotocol.io) servers
+join the tool list. Declare them in `.wrencode/mcp.json` in the project (Claude
+Code's `.mcp.json` is read too, same format) or `~/.wrencode/mcp.json`:
+
+```json
+{"mcpServers": {
+  "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+             "env": {"GITHUB_TOKEN": "..."}},
+  "docs":   {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
+}}
+```
+
+A `command` entry runs as a subprocess spoken to over stdio; a `url` entry is
+Streamable HTTP. Each server's tools are offered to the model as
+`mcp__<server>__<tool>`; permission rules such as `mcp(github:*)` apply to
+every call, and a call asks for approval unless the server marks the tool
+read-only. `/mcp` lists the servers, their tools and any connection error;
+`/mcp reload` re-reads the files and reconnects.
+
+A server's command is looked up on your PATH, it gets your environment without
+the backend API keys and `WRENCODE_*` settings (its own `env` can pass
+anything), and an HTTP server's headers are sent only to the URL configured,
+never across a redirect. A project's servers run on your machine, so, like its
+permission rules, they are shown in full once at startup and start only after
+you accept them; a change to the file asks again, and their `env` cannot set
+loader variables such as `LD_PRELOAD`, `NODE_OPTIONS` or `PYTHONPATH`.
+`WRENCODE_MCP_TIMEOUT` (default 120s) bounds a tool call and
+`WRENCODE_MCP_CONNECT_TIMEOUT` (default 20s) a connection.
+
 ## Context management
 
 Long sessions are compacted automatically. Before each model call WrenCode
@@ -188,6 +431,54 @@ fails with a context-length error, WrenCode compacts and retries once.
 
 Set `WRENCODE_CONTEXT_TOKENS` to your model's window, especially for local
 models with small ones. `/compact` summarizes on demand.
+
+## Security
+
+wrencode reads untrusted files and runs commands on your machine, so the goal is
+narrower than "can't be attacked": nothing changes outside the sandbox without you
+seeing and approving the real action, and opening an untrusted repository is safe.
+
+- **Approvals show what will run.** Every write, edit, shell command, fetch and MCP
+  call asks first. Control characters, escape sequences and Unicode direction
+  overrides in a command, a file, a URL or a model reply are displayed as `^[`,
+  `^M`, `\u202e` and so on, never interpreted, so nothing can redraw the screen or
+  hide part of a command. Writes under a hidden path (`.git/hooks`,
+  `.github/workflows`, dotfiles) are flagged, after resolving the path. `--yes`
+  turns the prompts off; use it only in a sandbox you can throw away. Permission
+  rules narrow that: deny rules hold even under `--yes` and for read-only MCP
+  tools, a bash rule must cover every command of a command line, and a project's
+  allow rules apply only after you accept them, so a repository cannot grant
+  itself anything.
+- **The web stays at arm's length.** `fetch` reaches public addresses only, follows
+  redirects on the same host only, and shows the full URL for approval. MCP servers
+  do not get the backend keys, a project's cannot preload code through the
+  environment, and an HTTP server's credentials never follow a redirect.
+- **File tools stay in the workspace.** Paths are resolved (symlinks followed) and
+  must land inside the workspace root unless `WRENCODE_UNRESTRICTED_PATHS=1`;
+  `glob` drops matches that lead outside. `grep` passes the pattern and path as
+  arguments, never as flags.
+- **A project's `.env` can't reconfigure the agent.** It may set `*_API_KEY` and
+  `ANTHROPIC_WORKSPACE_ID` only. The backend, any server URL, auto-approve, and the
+  config, history and workspace locations come from your shell or the `.env` beside
+  `wrencode.py`; the names a project `.env` set, and the ones it tried to, are
+  reported at startup.
+- **`AGENTS.md` / `CLAUDE.md` are prompt input.** A repository's instructions go into
+  the system prompt by design, which means a repository can steer the agent. The
+  approval prompts are the control; the files loaded are listed at startup.
+- **Keys go only to their backend.** Fixed hosts for Anthropic, OpenAI, OpenRouter,
+  NanoGPT and Bedrock; the URL you configured for openai-compatible, Ollama and the
+  local proxy. Saved keys, the conversation history and model caches are owner-only
+  files (`0600`) under `~/.wrencode`; the embedded Postgres data and socket
+  directories are owner-only (`0700`). The Agent SDK backend runs with the API key
+  only, subscription credentials blanked.
+- **The `python` tool is sandboxed** in pydantic-monty: no network, shell or
+  environment, a read-only workspace, and time and memory limits.
+- **Releases are verifiable.** Each binary is published with a SHA-256 checksum that
+  `install.sh` checks. Hosted backends are reached over TLS with certificate
+  verification. wrencode has no runtime dependencies beyond the standard library.
+
+Please report security issues privately through the repository's GitHub security
+advisories rather than in a public issue.
 
 ## Installation
 
@@ -218,6 +509,8 @@ chmod +x install.sh
 
 Manual install (fallback): download the right binary from GitHub Releases, make it executable, and move it into your `PATH`.
 
+Windows: download `wrencode-windows-x64.exe` from GitHub Releases and put it on your `PATH`.
+
 macOS Apple Silicon:
 
 ```bash
@@ -244,7 +537,8 @@ sudo mv wrencode /usr/local/bin/wrencode
 
 ### Option 2: Run from source
 
-Single file, standard library only (except the backend you choose).
+Standard library only (except the backend you choose). `wrencode.py` runs with the
+`wrencode_*.py` modules next to it.
 
 ```bash
 git clone https://github.com/almostly/wrencode
@@ -288,6 +582,12 @@ For HuggingFace Transformers:
 pip install transformers torch
 ```
 
+For the `python` sandbox tool:
+
+```bash
+pip install pydantic-monty
+```
+
 ## Usage
 
 ```bash
@@ -324,6 +624,17 @@ BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 wrencode.py
 BACKEND=local LOCAL_PORT=8082 python3 wrencode.py
 ```
 
+## Developing
+
+```bash
+python3 -m unittest -q test_wrencode   # the test suite (stdlib unittest)
+uvx ruff check . && uvx ruff format .  # lint and format; the rule set is in pyproject.toml
+uvx ty check wrencode*.py              # type check
+```
+
+There are no `# noqa` markers: a rule the design contradicts is turned off in
+`pyproject.toml` with its reason, and a test keeps it that way.
+
 ## Releasing
 
 Versions and [`CHANGELOG.md`](CHANGELOG.md) are managed with
@@ -344,6 +655,7 @@ This publishes release assets:
 - `wrencode-linux-x64`
 - `wrencode-macos-x64`
 - `wrencode-macos-arm64`
+- `wrencode-windows-x64.exe`
 
 ## Slash Commands
 
@@ -352,11 +664,56 @@ This publishes release assets:
 |`/help`       |Show available commands                       |
 |`/model`      |Switch model, or `/model <id>` to set it directly|
 |`/backend`, `/configure`|Switch backend, model and API key   |
-|`/clear` or `/c`|Clear conversation history                  |
+|`/clear` or `/c`|Clear the conversation (a new session with Postgres history)|
+|`/sessions`   |List this project's conversations (Postgres history)|
+|`/resume [id]`|Continue an earlier session: a picker, or by id|
+|`/search <text>`|Find past sessions by their words, then `/resume` one|
+|`/sync`       |Copy this project's history to the mirror now (Postgres history)|
+|`/usage`      |Token usage and spend for this turn and the session, and the price in effect|
+|`/permissions`|Rules that allow or deny actions without asking: list, `allow`, `deny`, `forget`|
+|`/mcp`        |MCP servers and their tools; `/mcp reload` reconnects|
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 
 Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
+
+## In the terminal
+
+What a session looks like, and the keys that drive it.
+
+- **Who is speaking.** Your line keeps the `❯` prompt. The model's reply opens
+  with a cyan dot; a tool call opens with a green dot, and what it returned
+  hangs under it after `⎿`: one line when that says it all (`ok`, `3 lines
+  read`, an error), a short excerpt otherwise. Code the model quotes is drawn
+  in its own tint with a gutter.
+- **Approvals.** Before a write, edit or shell command runs, you see exactly
+  what it does: a unified diff of the file with a few lines of context, red
+  and green, headed by the file and line; then one question, `Apply to
+  app.py?  Enter yes · a always · s allow bash(npm test:*) · n no`. `a`
+  stops asking for the rest of the session, `s` saves a rule so this kind of
+  action never asks again, `n` asks what to do differently.
+- **Waiting.** The spinner says what is happening (`thinking`, `running
+  python`), how long it has been, and that Escape cancels the turn. On the
+  Anthropic and OpenAI-style backends the reply then streams in as the model
+  writes it, rendered line by line; Escape stops it mid-sentence. The usage
+  line still counts the whole request. `WRENCODE_STREAM=0` waits for whole
+  replies instead; headless runs and Bedrock always do.
+- **The prompt.** `←` `→` move, `Home`/`End` or `Ctrl-A`/`Ctrl-E` jump,
+  `Ctrl-W` deletes the word before the cursor, `Ctrl-U` to the start of the
+  line, `Ctrl-K` to the end, `↑`/`↓` walk the input history. A message can
+  span lines: end a line with `\` and press Enter, press `Alt-Enter`, or
+  paste text with line breaks (they are kept). `↑`/`↓` then move between the
+  lines, and Enter sends the whole message. While you type, a dim line
+  estimates the input cost of sending it.
+- **Pickers.** Models and sessions are picked with `↑`/`↓` and Enter; Escape
+  cancels, a number jumps. Without a terminal they fall back to a numbered
+  prompt.
+- **Errors.** A failed request is reported as a sentence and a next step
+  (`The API key was rejected. Run /configure to enter a new one.`), with the
+  raw message under it; `WRENCODE_DEBUG=1` prints it in full.
+- **Light terminals.** The prose and code tints are chosen for a dark
+  background. Set `WRENCODE_THEME=light` on a light one (terminals that
+  export `COLORFGBG` are detected).
 
 ## Environment Variables
 
@@ -366,16 +723,30 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`MODEL`                      |backend-dependent      |Model path or ID                  |
 |`WRENCODE_CONFIG_DIR`        |`~/.wrencode`          |Dir for `config.json` (saved backend/key)|
 |`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
-|`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file path |
+|`WRENCODE_HISTORY_FILE`      |`<config dir>/history.json`|Conversation history file, without the Postgres store|
+|`WRENCODE_DATABASE_URL`      |-                      |Postgres URL for history; unset, embedded PGlite is used|
+|`WRENCODE_MIRROR_URL`        |-                      |A second Postgres that receives a copy of every saved session|
+|`WRENCODE_PGLITE_START_TIMEOUT`|`60`                 |Seconds to wait for the embedded PGlite to start|
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
 |`WRENCODE_MAX_SUBAGENT_DEPTH`|`2`                    |Max nested subagent recursion depth (`task` tool)|
 |`WRENCODE_MAX_PARALLEL_SUBAGENTS`|`4`                |Subagents run at once from one reply; `1` runs them in order|
+|`WRENCODE_SANDBOX_TIMEOUT`   |`30`                   |Seconds a `python` tool snippet may run|
+|`WRENCODE_SANDBOX_MEMORY_MB` |`256`                  |Memory a `python` tool snippet may use|
 |`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
+|`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
+|`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
+|`WRENCODE_STREAM`            |`1`                    |Stream replies as they are written (Anthropic and OpenAI-style backends)|
+|`WRENCODE_MCP_TIMEOUT`       |`120`                  |Seconds an MCP tool call may take|
+|`WRENCODE_WEB_SEARCH`        |`1`                    |Offer Anthropic's web search to Claude (anthropic backend)|
+|`WRENCODE_FETCH_MAX_CHARS`   |`40000`                |Characters of a fetched page returned per call|
+|`WRENCODE_FETCH_LOCAL`       |unset                  |`1` lets `fetch` reach loopback, private and link-local addresses|
+|`WRENCODE_MCP_CONNECT_TIMEOUT`|`20`                  |Seconds to connect to an MCP server|
+|`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|
-|`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction|
+|`WRENCODE_CONTEXT_TOKENS`    |`128000`               |Model context window, for auto-compaction and `synthesize`|
 |`WRENCODE_COMPACT_AT`        |`0.75`                 |Compact at this fraction of the window (`0` disables)|
 |`MAX_READ_BYTES`             |`4MB`                  |Max file size to read             |
 |`MAX_READ_LINES`             |`800`                  |Max lines returned per read       |
@@ -396,11 +767,47 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 
 ## History
 
-Conversation history is persisted to `~/.wrencode/history.json` by default. It is restored automatically on next launch.
+By default the conversation is saved to `~/.wrencode/history.json` and restored on
+the next launch (`WRENCODE_HISTORY_FILE` moves it; `/c` clears it).
 
-To override the history file location, set `WRENCODE_HISTORY_FILE` to a custom path.
+With the `history` extra, conversations live in Postgres instead, as sessions per
+project: wrencode resumes the project's latest session on launch, `/clear` starts a
+new one and keeps the old, `/sessions` lists them, `/resume` picks one to continue (or `/resume <id>`) and
+`/search <text>` looks inside all of them (Postgres full-text search).
 
-To clear history: use `/c` in the session, or delete `~/.wrencode/history.json` (or your override path).
+```bash
+pip install 'wrencode[history]'   # psycopg; Node.js is needed for the embedded engine
+```
+
+Two engines, both real Postgres:
+
+- **Embedded PGlite** (the default): Postgres compiled to WebAssembly, run by Node.js
+  with a persistent data directory under `~/.wrencode/pglite`. The first launch runs
+  `npm install` there for the pinned `@electric-sql/pglite` packages; after that it
+  starts in about a second, serves a Unix socket in an owner-only directory, and
+  stops when wrencode exits. It is a single-user database: one wrencode at a time
+  holds it, and a second one started meanwhile says so and uses `history.json`
+  for that run.
+- **A Postgres server**: set `WRENCODE_DATABASE_URL=postgres://user:pass@host/db`
+  and the same schema is created there.
+
+Each session stores its message list exactly as the backend format needs it
+(JSONB), replaced whole on every save, so switching backends mid-history behaves as
+it always has. Headless runs (`-p`) never read or write history.
+
+### Mirroring to another Postgres
+
+PGlite has a real write-ahead log but, as a single-user engine, no replication
+protocol: nothing can subscribe to it. wrencode replicates at the application level
+instead, which is exact because it owns every write and saves each session whole.
+Set `WRENCODE_MIRROR_URL=postgres://user:pass@host/db` and every saved session is
+copied there, matched by a stable session uid, from a background thread so a slow or
+unreachable mirror never holds up the loop. Only the latest snapshot per session is
+kept pending; an outage is reported once, retried with backoff, and `/sync` queues
+the whole project's history again and waits for it. The mirror has the same schema,
+so it can serve as `WRENCODE_DATABASE_URL` for another machine. Like the other
+settings that steer wrencode, the mirror URL is read from your shell, never from a
+project's `.env`.
 
 ## License
 
