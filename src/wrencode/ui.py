@@ -15,7 +15,7 @@ import select
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -186,13 +186,50 @@ def ansi_palette(theme: str) -> Palette:
     )
 
 
+def supports_truecolor(env: Mapping[str, str] | None = None) -> bool:
+    """Whether the terminal takes 24-bit colors: COLORTERM says so, or it is a
+    terminal known to (iTerm2, WezTerm, Ghostty, kitty, VS Code's), or
+    WRENCODE_TRUECOLOR=1 says it does. Terminal.app and a tmux without
+    truecolor configured do not, and get the nearest of 256 colors instead."""
+    env = os.environ if env is None else env
+    if env.get("WRENCODE_TRUECOLOR", "").lower() in ("1", "true", "yes"):
+        return True
+    if env.get("WRENCODE_TRUECOLOR", "").lower() in ("0", "false", "no"):
+        return False
+    if env.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
+        return True
+    return env.get("TERM_PROGRAM", "") in ("iTerm.app", "WezTerm", "ghostty", "vscode")
+
+
+TRUECOLOR = supports_truecolor()
+
+
+def nearest_256(r: int, g: int, b: int) -> int:
+    """The index of the closest color in the xterm 256-color table."""
+    steps = (0, 95, 135, 175, 215, 255)
+
+    def near(v: int) -> int:
+        return min(range(6), key=lambda i: abs(steps[i] - v))
+
+    cr, cg, cb = near(r), near(g), near(b)
+    cube = 16 + 36 * cr + 6 * cg + cb
+    cube_dist = (steps[cr] - r) ** 2 + (steps[cg] - g) ** 2 + (steps[cb] - b) ** 2
+    grey_level = max(0, min(23, round((((r + g + b) / 3) - 8) / 10)))
+    grey = 8 + 10 * grey_level
+    grey_dist = (grey - r) ** 2 + (grey - g) ** 2 + (grey - b) ** 2
+    return 232 + grey_level if grey_dist < cube_dist else cube
+
+
 def truecolor(hex_color: str) -> str:
-    """An SGR for a "#rrggbb" or "#rrggbbaa" color (the alpha is ignored)."""
+    """An SGR for a "#rrggbb" or "#rrggbbaa" color (the alpha is ignored):
+    24-bit where the terminal takes it, else the nearest of 256 colors."""
     h = hex_color.strip().lstrip("#")
     if len(h) not in (6, 8) or any(c not in "0123456789abcdefABCDEF" for c in h):
         raise ValueError(f"not a color: {hex_color!r}")
     r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
-    return f"\033[38;2;{r};{g};{b}m"
+    if TRUECOLOR:
+        return f"\033[38;2;{r};{g};{b}m"
+    return f"\033[38;5;{nearest_256(r, g, b)}m"
 
 
 def palette_from_zed(style: dict[str, Any]) -> Palette:

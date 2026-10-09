@@ -1,3 +1,10 @@
+## Unreleased
+
+### Fix
+
+- web search on the Anthropic backend sends the search tool version the model accepts: the current one on Opus and Sonnet 4.6 and later and Fable, the basic one on Haiku, which refused the current one with a 400
+- colors are 24-bit only where the terminal takes them (`COLORTERM`, or iTerm2, WezTerm, Ghostty, VS Code's terminal; `WRENCODE_TRUECOLOR=1|0` overrides) and the nearest of 256 elsewhere, so Terminal.app and a plain tmux show the palette instead of dropping it
+
 ## 0.3.2 (2026-10-09)
 
 ### Feat

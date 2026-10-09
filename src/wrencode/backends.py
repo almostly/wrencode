@@ -337,6 +337,27 @@ WEB_SEARCH = os.environ.get("WRENCODE_WEB_SEARCH", "1").lower() not in (
     "no",
 )
 WEB_SEARCH_TOOL: dict[str, Any] = {"type": "web_search_20260209", "name": "web_search"}
+# The models that take the current search tool (with dynamic filtering); the
+# others, Haiku among them, refuse it and take the basic one.
+_WEB_SEARCH_CURRENT = (
+    "opus-5",
+    "opus-4-8",
+    "opus-4-7",
+    "opus-4-6",
+    "sonnet-5",
+    "sonnet-4-6",
+    "fable-5",
+)
+
+
+def web_search_tool(model: str) -> dict[str, Any]:
+    """The server-side web search tool definition `model` accepts."""
+    m = model.lower().replace(".", "-")
+    if any(tag in m for tag in _WEB_SEARCH_CURRENT):
+        return dict(WEB_SEARCH_TOOL)
+    return {"type": "web_search_20250305", "name": "web_search"}
+
+
 WEB_SEARCH_USD = 0.01  # $10 per 1,000 searches
 
 
@@ -1884,7 +1905,7 @@ def get_response(
             defs[-1] = {**defs[-1], "cache_control": {"type": "ephemeral"}}
         if WEB_SEARCH and BACKEND == "anthropic" and tools:
             defs = [
-                dict(WEB_SEARCH_TOOL),
+                web_search_tool(MODEL),
                 *defs,
             ]  # first, so the cache marker stays last
         payload = {

@@ -730,7 +730,9 @@ What a session looks like, and the keys that drive it.
   accent blue on the assistant's dot, the prompt and the banner. The background
   is read from `COLORFGBG` or asked of the terminal itself (most answer); when
   neither says, the first run asks you once and `/theme light|dark|auto`
-  changes the saved answer. `WRENCODE_THEME=light` or `dark` forces one, `ansi` draws with the terminal's
+  changes the saved answer. Colors are 24-bit where the terminal takes them (`COLORTERM`, or iTerm2,
+  WezTerm, Ghostty and VS Code's terminal) and the nearest of 256 elsewhere;
+  `WRENCODE_TRUECOLOR=1|0` overrides. `WRENCODE_THEME=light` or `dark` forces one, `ansi` draws with the terminal's
   own colors instead, and a [Zed](https://zed.dev) theme file
   (`~/.config/zed/themes/mine.json#Mine Light`) replaces the palette with its
   own.

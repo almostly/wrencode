@@ -198,6 +198,21 @@ class TestWeb(unittest.TestCase):
             "fetch https://a/b  offset=40",
         )
 
+    def test_web_search_tool_version_follows_the_model(self):
+        self.assertEqual(
+            backends.web_search_tool("claude-sonnet-5-5")["type"], "web_search_20260209"
+        )
+        self.assertEqual(
+            backends.web_search_tool("claude-opus-4-6")["type"], "web_search_20260209"
+        )
+        self.assertEqual(
+            backends.web_search_tool("claude-haiku-5-5")["type"], "web_search_20250305"
+        )
+        self.assertEqual(
+            backends.web_search_tool("claude-haiku-4-5-20251001")["type"],
+            "web_search_20250305",
+        )
+
     def test_web_search_tool_is_offered_on_anthropic_only(self):
         with (
             mock.patch.object(backends, "BACKEND", "anthropic"),
@@ -210,7 +225,7 @@ class TestWeb(unittest.TestCase):
             specs = [("read", "Read", {"type": "object", "properties": {}})]
             backends.get_response([{"role": "user", "content": "x"}], "s", None, specs)
             tools = post.call_args[0][1]["tools"]
-            self.assertEqual(tools[0], backends.WEB_SEARCH_TOOL)
+            self.assertEqual(tools[0], backends.web_search_tool(backends.MODEL))
             self.assertIn(
                 "cache_control", tools[-1]
             )  # the cache marker stays on the last of ours
