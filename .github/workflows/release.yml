@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "[0-9]*"
+  # Release from the Actions tab: builds the chosen commit (the branch or tag
+  # the run is started from), creates the tag named here on it, and publishes.
+  # For when a tag can't be pushed from where you are.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (the tag to create), e.g. 0.3.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -52,10 +61,13 @@ jobs:
       - name: Build single-file binary
         run: ${{ matrix.build_prefix }} pyinstaller --onefile --name wrencode --paths src src/wrencode/__main__.py
 
-      - name: Verify the binary bundles a CA trust store
+      - name: Verify the binary runs and reports the version being released
         run: |
           test -f "dist/wrencode${{ matrix.bin_ext }}"
           ./dist/wrencode${{ matrix.bin_ext }} --version
+          want="${{ inputs.version || github.ref_name }}"
+          ./dist/wrencode${{ matrix.bin_ext }} --version | grep -qx "wrencode $want" \
+            || { echo "the binary reports another version than $want"; exit 1; }
 
       - name: Rename artifact for platform
         run: mv "dist/wrencode${{ matrix.bin_ext }}" "dist/${{ matrix.artifact_name }}"
@@ -69,6 +81,10 @@ jobs:
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2
         with:
+          # On a tag push this is the tag; from the Actions tab the tag is
+          # created here, on the commit the run was started from.
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/${{ matrix.artifact_name }}
             dist/${{ matrix.artifact_name }}.sha256

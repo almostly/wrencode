@@ -654,7 +654,12 @@ git push origin main --tags
 
 Preview the next changelog entry with `uvx --from commitizen cz changelog --dry-run`.
 
-Binaries are built automatically by GitHub Actions when a version tag is pushed.
+Binaries are built automatically by GitHub Actions when a version tag is pushed,
+and the package is published to PyPI. Without a terminal to push a tag from, run
+the `build-and-release` workflow from the Actions tab on `main` with the version
+as its input: it builds that commit, checks the binaries report that version,
+creates the tag and the release. Then run `publish-pypi` with target `pypi`,
+since a tag created by a workflow does not trigger the others.
 
 This publishes release assets:
 - `wrencode-linux-x64`
