@@ -1,3 +1,9 @@
+## 0.3.2 (2026-10-09)
+
+### Fix
+
+- replies were barely readable on a light terminal that does not say so: the prose was a light grey chosen for a dark background. Replies now use the terminal's own text color unless the background is known (`COLORFGBG`, or `WRENCODE_THEME=light|dark`), in which case the tints apply as before
+
 ## 0.3.1 (2026-10-09)
 
 ### Feat

@@ -44,24 +44,36 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 BRIGHT_CYAN = "\033[96m"
 
 
-def _light_background() -> bool:
-    """Whether the terminal is light: WRENCODE_THEME=light|dark wins, then the
-    COLORFGBG hint some terminals export ("15;0" is white on black)."""
+def terminal_theme() -> str:
+    """ "light" or "dark" when the terminal's background is known (WRENCODE_THEME
+    wins, then the COLORFGBG hint some terminals export, "15;0" being white on
+    black), else "" for unknown."""
     theme = os.environ.get("WRENCODE_THEME", "").lower()
     if theme in ("light", "dark"):
-        return theme == "light"
+        return theme
     fgbg = os.environ.get("COLORFGBG", "")
     if ";" in fgbg:
         bg = fgbg.rsplit(";", 1)[-1]
-        return bg.isdigit() and (int(bg) in (7, 15) or int(bg) >= 231)
-    return False
+        if bg.isdigit():
+            return "light" if int(bg) in (7, 15) or int(bg) >= 231 else "dark"
+    return ""
 
 
-LIGHT = _light_background()
-# The assistant's prose: a shade off the user's text. Fenced code: a tint of its
-# own so code reads apart from prose. Both chosen for the background in use.
-AGENT_TEXT = "\033[38;5;236m" if LIGHT else "\033[38;5;252m"
-CODE_TEXT = "\033[38;5;94m" if LIGHT else "\033[38;5;223m"
+def text_colors(theme: str) -> tuple[str, str]:
+    """(prose, code) colors for the assistant's replies. On a known background
+    the prose is a shade off the user's text and code has a tint of its own; on
+    an unknown one both use the terminal's own text color, which is readable
+    everywhere, and code is told apart by its gutter and highlighting."""
+    if theme == "light":
+        return "\033[38;5;236m", "\033[38;5;94m"
+    if theme == "dark":
+        return "\033[38;5;252m", "\033[38;5;223m"
+    return "\033[39m", "\033[39m"
+
+
+THEME = terminal_theme()
+LIGHT = THEME == "light"
+AGENT_TEXT, CODE_TEXT = text_colors(THEME)
 AGENT_MARK = f"{BRIGHT_CYAN}●{RESET}"  # opens every assistant reply
 TOOL_MARK = f"{GREEN}●{RESET}"  # opens every tool call: same dot, its own color
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"

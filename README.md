@@ -723,9 +723,10 @@ What a session looks like, and the keys that drive it.
 - **Errors.** A failed request is reported as a sentence and a next step
   (`The API key was rejected. Run /configure to enter a new one.`), with the
   raw message under it; `WRENCODE_DEBUG=1` prints it in full.
-- **Light terminals.** The prose and code tints are chosen for a dark
-  background. Set `WRENCODE_THEME=light` on a light one (terminals that
-  export `COLORFGBG` are detected).
+- **Light and dark terminals.** Replies use the terminal's own text color, so
+  they read on any background. On a terminal that says which background it has
+  (`COLORFGBG`), or with `WRENCODE_THEME=light` or `dark` set, the prose gets a
+  shade off your text and code a tint of its own.
 
 ## Environment Variables
 
@@ -748,7 +749,7 @@ What a session looks like, and the keys that drive it.
 |`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
 |`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
-|`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
+|`WRENCODE_THEME`             |auto                   |`light` or `dark` turns on the prose and code tints for that background (auto reads `COLORFGBG`; unknown means no tint)|
 |`WRENCODE_STREAM`            |`1`                    |Stream replies as they are written (Anthropic and OpenAI-style backends)|
 |`WRENCODE_MCP_TIMEOUT`       |`120`                  |Seconds an MCP tool call may take|
 |`WRENCODE_WEB_SEARCH`        |`1`                    |Offer Anthropic's web search to Claude (anthropic backend)|

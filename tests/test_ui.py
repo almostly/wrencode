@@ -487,17 +487,22 @@ class TestIntuitiveUI(unittest.TestCase):
         self.assertTrue(lines[1].startswith("HTTP 401"))
         self.assertEqual(lines[2], "Error: something odd")
 
-    def test_light_background_detection(self):
+    def test_theme_detection_and_text_colors(self):
         with mock.patch.dict(
             os.environ, {"WRENCODE_THEME": "light", "COLORFGBG": "15;0"}
         ):
-            self.assertTrue(ui._light_background())
+            self.assertEqual(ui.terminal_theme(), "light")
         with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": "15;0"}):
-            self.assertFalse(ui._light_background())
+            self.assertEqual(ui.terminal_theme(), "dark")
         with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": "0;15"}):
-            self.assertTrue(ui._light_background())
+            self.assertEqual(ui.terminal_theme(), "light")
         with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": ""}):
-            self.assertFalse(ui._light_background())
+            self.assertEqual(ui.terminal_theme(), "")  # unknown: no guess
+        # Known backgrounds get tints; an unknown one keeps the terminal's own
+        # text color, which reads on both (a light grey on white did not).
+        self.assertEqual(ui.text_colors("light"), ("\033[38;5;236m", "\033[38;5;94m"))
+        self.assertEqual(ui.text_colors("dark"), ("\033[38;5;252m", "\033[38;5;223m"))
+        self.assertEqual(ui.text_colors(""), ("\033[39m", "\033[39m"))
 
     def test_status_line_says_model_price_session_and_history(self):
         store = mock.Mock(mirror=None)
