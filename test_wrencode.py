@@ -188,9 +188,9 @@ class TestMessageBlocks(unittest.TestCase):
             plain = ui.loader_display(
                 0, ui.loader_context(backends.BACKEND, backends.MODEL)
             )
-            self.assertIn("anthropic", strip_ansi(plain))
+            self.assertIn("thinking", strip_ansi(plain))
             self.assertIn("claude-sonnet", strip_ansi(plain))
-            self.assertIn("waiting", strip_ansi(plain))
+            self.assertIn("claude-sonnet", strip_ansi(plain))
 
     def test_loader_display_gradient(self):
         with mock.patch.object(ui, "colors_enabled", return_value=True):
@@ -277,7 +277,7 @@ class TestConfirm(unittest.TestCase):
         plain = strip_ansi(buf.getvalue())
         self.assertNotIn("PosixPath", plain)
         self.assertNotIn("⚠ write", plain)
-        self.assertIn("approve once", plain)
+        self.assertIn("Enter yes", plain)
 
     def test_enter_approves(self):
         with mock.patch("builtins.input", return_value=""):
@@ -2990,7 +2990,7 @@ class TestUsage(unittest.TestCase):
             report = backends.usage_report()
             title = backends.usage_title()
         # no MODEL here, so no price: the line and title carry no dollar amount
-        self.assertEqual(line, "↑ 1.9k  ↓ 386  ⚡ 76% cached  ▱▱▱▱▱▱▱▱▱▱ 2%")
+        self.assertEqual(line, "↑ 1.9k  ↓ 386  ▱▱▱▱▱▱▱▱▱▱ 2%")
         self.assertEqual(
             report[0].split(), ["input", "cached", "written", "output", "calls", "cost"]
         )
@@ -3354,6 +3354,216 @@ class TestPricing(unittest.TestCase):
         self.assertIn("$2/$10 per MTok", strip_ansi(banner))
         self.assertTrue(shown.startswith("≈ $"), shown)
         self.assertTrue(shown.endswith(" input"))
+
+
+class TestApprovalAndResults(unittest.TestCase):
+    """What the person sees at an approval, under a tool call, and while waiting."""
+
+    def test_print_diff_is_a_colored_unified_diff_with_line_numbers(self):
+        before = "a\nb\nc\nd\ne\nf\n"
+        after = "a\nb\nc\nD\ne\nf\n"
+        with mock.patch("sys.stdout", io.StringIO()):
+            ui.print_diff("app.py", before, after)
+            out = sys.stdout.getvalue()
+        plain = strip_ansi(out)
+        self.assertIn("@@ app.py:2", plain)
+        self.assertIn(f"{ui.RED}-d{ui.RESET}", out)
+        self.assertIn(f"{ui.GREEN}+D{ui.RESET}", out)
+        self.assertNotIn("---", plain)
+        self.assertTrue(all(line.startswith("    ") for line in plain.splitlines()))
+
+    def test_print_diff_folds_a_long_change(self):
+        before = "\n".join(str(i) for i in range(100))
+        with mock.patch("sys.stdout", io.StringIO()):
+            ui.print_diff("x", before, "", limit=10)
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertIn("… +", out)
+        self.assertLessEqual(len(out.splitlines()), 11)
+
+    def test_edit_shows_the_diff_and_asks_one_question(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "app.py").write_text("x = 1\ny = 2\n")
+        with (
+            mock.patch.object(wrencode, "workspace_root", return_value=tmp),
+            mock.patch.object(ui, "_confirm_prompt", return_value="ok") as ask,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            result = wrencode.edit(
+                {"path": str(tmp / "app.py"), "old": "y = 2", "new": "y = 3"}
+            )
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertEqual(result, "ok")
+        self.assertEqual(ask.call_args[0][0], "Apply to app.py?")
+        self.assertIn("-y = 2", out)
+        self.assertIn("+y = 3", out)
+        self.assertIn("@@ app.py:1", out)
+
+    def test_confirm_prompt_is_one_line(self):
+        with (
+            mock.patch("builtins.input", return_value=""),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(ui._confirm_prompt("Run it?"), "ok")
+            out = strip_ansi(sys.stdout.getvalue())
+        self.assertEqual(
+            out.strip().splitlines(), ["Run it?  Enter yes · a always · n no"]
+        )
+
+    def _result(self, text, name=""):
+        with mock.patch("sys.stdout", io.StringIO()):
+            wrencode.print_tool_result(text, name)
+            return strip_ansi(sys.stdout.getvalue())
+
+    def test_tool_results_fold(self):
+        self.assertEqual(self._result("ok"), "  ⎿ ok\n")
+        self.assertEqual(self._result("  "), "  ⎿ (empty)\n")
+        self.assertEqual(self._result("1: a\n2: b\n3: c", "read"), "  ⎿ 3 lines read\n")
+        self.assertEqual(self._result("line\nline", "bash"), "  ⎿ 2 lines\n")
+        self.assertEqual(
+            self._result("error: nope\ndetail"), "  ⎿ error: nope\n    detail\n"
+        )
+        long = self._result("\n".join(f"m{i}" for i in range(20)), "grep")
+        self.assertTrue(long.startswith("  ⎿ m0\n    m1\n"))
+        self.assertIn("… +12 more lines", long)
+        self.assertEqual(len(long.splitlines()), 9)
+
+    def test_tool_action_opens_with_the_dot_and_edit_is_one_line(self):
+        with mock.patch("sys.stdout", io.StringIO()):
+            wrencode.print_tool_action("edit", {"path": "a.py", "old": "x", "new": "y"})
+            wrencode.print_tool_action(
+                "write", {"path": "b.py", "content": "1\n2\n3\n4\n5\n6\n7\n8"}
+            )
+            out = sys.stdout.getvalue()
+        plain = strip_ansi(out)
+        self.assertTrue(out.startswith(ui.TOOL_MARK + " edit a.py\n"))
+        self.assertNotIn("- x", plain)
+        self.assertIn("write b.py  (8 lines)", plain)
+        self.assertIn("  … +2 lines", plain)
+
+    def test_loader_shows_activity_elapsed_and_the_way_out(self):
+        ctx = ui.loader_context("anthropic", "claude-sonnet-5-5", "running python")
+        self.assertEqual(ctx, "running python · claude-sonnet-5-5")
+        with mock.patch.object(ui, "colors_enabled", return_value=False):
+            self.assertEqual(
+                ui.loader_display(0, ctx, 4),
+                "⠋ running python · claude-sonnet-5-5 · 4s · esc to cancel",
+            )
+            self.assertEqual(
+                ui.loader_display(1, ctx), "⠙ running python · claude-sonnet-5-5"
+            )
+
+
+class TestIntuitiveUI(unittest.TestCase):
+    """Startup line, key decoding, error hints, and the theme switch."""
+
+    def _key(self, raw: bytes) -> str:
+        r, w = os.pipe()
+        try:
+            os.write(w, raw)
+            os.close(w)
+            return ui._read_tty_key(r)
+        finally:
+            os.close(r)
+
+    def test_editing_keys_are_decoded(self):
+        self.assertEqual(self._key(b"\x1b[D"), "left")
+        self.assertEqual(self._key(b"\x1b[H"), "home")
+        self.assertEqual(self._key(b"\x1bOF"), "end")
+        self.assertEqual(self._key(b"\x1b[1~"), "home")
+        self.assertEqual(self._key(b"\x1b[3~"), "delete")
+        self.assertEqual(self._key(b"\x01"), "home")
+        self.assertEqual(self._key(b"\x05"), "end")
+        self.assertEqual(self._key(b"\x17"), "ctrl_w")
+        self.assertEqual(self._key(b"\x15"), "ctrl_u")
+        self.assertEqual(self._key(b"\x0b"), "ctrl_k")
+        self.assertEqual(self._key(b"\x1b"), "esc")
+        self.assertEqual(self._key(b"x"), "x")
+
+    def test_redraw_puts_the_cursor_back_mid_line(self):
+        with mock.patch.object(ui, "colors_enabled", return_value=False):
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line("hello", cursor=2)
+                mid = sys.stdout.getvalue()
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line("hello", hint="≈ $0.001 input", cursor=2)
+                hinted = sys.stdout.getvalue()
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line("hello")
+                end = sys.stdout.getvalue()
+        self.assertTrue(mid.endswith("hello\r\033[4C"), repr(mid))  # "❯ " + 2
+        self.assertTrue(hinted.endswith("\033[1A\r\033[4C"), repr(hinted))
+        self.assertTrue(end.endswith("hello"), repr(end))
+
+    def test_errors_get_a_sentence_and_a_next_step(self):
+        self.assertIn("/configure", ui.explain_error('HTTP 401: {"type":"error"}'))
+        self.assertIn("/model", ui.explain_error("HTTP 404: not_found_error"))
+        self.assertIn("rate limiting", ui.explain_error("HTTP 429: slow down"))
+        self.assertIn("/compact", ui.explain_error("prompt is too long: 210000 tokens"))
+        self.assertIn(
+            "network",
+            ui.explain_error("<urlopen error [Errno 111] Connection refused>"),
+        )
+        self.assertEqual(ui.explain_error("something odd"), "")
+        with (
+            mock.patch("sys.stdout", io.StringIO()),
+            mock.patch.dict(os.environ, {"WRENCODE_DEBUG": ""}),
+        ):
+            os.environ.pop("WRENCODE_DEBUG", None)
+            ui.print_error(
+                'HTTP 401: {"type":"error","error":{"message":"invalid x-api-key"}}'
+            )
+            ui.print_error("something odd")
+            out = strip_ansi(sys.stdout.getvalue())
+        lines = out.splitlines()
+        self.assertEqual(
+            lines[0],
+            "Error: The API key was rejected. Run /configure to enter a new one.",
+        )
+        self.assertTrue(lines[1].startswith("HTTP 401"))
+        self.assertEqual(lines[2], "Error: something odd")
+
+    def test_light_background_detection(self):
+        with mock.patch.dict(
+            os.environ, {"WRENCODE_THEME": "light", "COLORFGBG": "15;0"}
+        ):
+            self.assertTrue(ui._light_background())
+        with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": "15;0"}):
+            self.assertFalse(ui._light_background())
+        with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": "0;15"}):
+            self.assertTrue(ui._light_background())
+        with mock.patch.dict(os.environ, {"WRENCODE_THEME": "", "COLORFGBG": ""}):
+            self.assertFalse(ui._light_background())
+
+    def test_status_line_says_model_price_session_and_history(self):
+        store = mock.Mock(mirror=None)
+        with (
+            mock.patch.object(backends, "BACKEND", "anthropic"),
+            mock.patch.object(backends, "MODEL", "claude-sonnet-5-5"),
+            mock.patch.object(wrencode, "_STORE", store),
+            mock.patch.object(wrencode, "_SESSION_ID", 3),
+        ):
+            line = strip_ansi(
+                wrencode._status_line([{"role": "user", "content": "a"}] * 2)
+            )
+        self.assertEqual(
+            line,
+            "claude-sonnet-5-5 · $2/$10 per MTok · session #3, 2 chats · history in Postgres",
+        )
+        with (
+            mock.patch.object(backends, "BACKEND", "ollama"),
+            mock.patch.object(backends, "MODEL", "llama3"),
+            mock.patch.object(wrencode, "_STORE", None),
+        ):
+            self.assertEqual(strip_ansi(wrencode._status_line([])), "llama3")
+
+    def test_picker_falls_back_to_numbers_without_a_terminal(self):
+        with (
+            mock.patch("sys.stdin.isatty", return_value=False),
+            mock.patch("builtins.input", return_value="2"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(ui.pick_from_list("Pick", ["a", "b"]), 1)
 
 
 class TestSpeed(unittest.TestCase):

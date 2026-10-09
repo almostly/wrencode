@@ -40,35 +40,51 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
     "\033[31m",
 )
 BRIGHT_CYAN = "\033[96m"
-AGENT_TEXT = (
-    "\033[38;5;252m"  # the assistant's prose: near-white, a shade off the user's
-)
-AGENT_MARK = (
-    f"{BRIGHT_CYAN}●{RESET}"  # opens every assistant reply (tool lines use a green dot)
-)
-CODE_TEXT = "\033[38;5;223m"  # fenced code: warm, so code reads apart from prose
+
+
+def _light_background() -> bool:
+    """Whether the terminal is light: WRENCODE_THEME=light|dark wins, then the
+    COLORFGBG hint some terminals export ("15;0" is white on black)."""
+    theme = os.environ.get("WRENCODE_THEME", "").lower()
+    if theme in ("light", "dark"):
+        return theme == "light"
+    fgbg = os.environ.get("COLORFGBG", "")
+    if ";" in fgbg:
+        bg = fgbg.rsplit(";", 1)[-1]
+        return bg.isdigit() and (int(bg) in (7, 15) or int(bg) >= 231)
+    return False
+
+
+LIGHT = _light_background()
+# The assistant's prose: a shade off the user's text. Fenced code: a tint of its
+# own so code reads apart from prose. Both chosen for the background in use.
+AGENT_TEXT = "\033[38;5;236m" if LIGHT else "\033[38;5;252m"
+CODE_TEXT = "\033[38;5;94m" if LIGHT else "\033[38;5;223m"
+AGENT_MARK = f"{BRIGHT_CYAN}●{RESET}"  # opens every assistant reply
+TOOL_MARK = f"{GREEN}●{RESET}"  # opens every tool call: same dot, its own color
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _LOADER_MODEL_MAX = 32
 
 
-def loader_context(backend: str, model: str) -> str:
-    """The loader's label: the backend and a shortened model id."""
-    b = backend or "backend"
+def loader_context(backend: str, model: str, activity: str = "thinking") -> str:
+    """The loader's label: what is happening and which model is doing it."""
     if model and len(model) > _LOADER_MODEL_MAX:
         keep = _LOADER_MODEL_MAX - 1
         head = max(8, keep // 2)
         m = f"{model[:head]}…{model[-(keep - head) :]}"
     else:
-        m = model or "model"
-    return f"{b} · {m} · waiting…"
+        m = model or backend or "model"
+    return f"{activity} · {m}"
 
 
-def loader_display(step: int, context: str) -> str:
-    """Render one animated loader frame for the given step."""
+def loader_display(step: int, context: str, seconds: int = -1) -> str:
+    """Render one animated loader frame: the context, how long it has been, and
+    the way out (seconds < 0 leaves both off)."""
     sym = _COMPOSE_FRAMES[step % len(_COMPOSE_FRAMES)]
+    tail = f" · {seconds}s · esc to cancel" if seconds >= 0 else ""
     if not colors_enabled():
-        return f"{sym} {context}"
-    return f"{BRIGHT_CYAN}{sym}{RESET} {DIM}{context}{RESET}"
+        return f"{sym} {context}{tail}"
+    return f"{BRIGHT_CYAN}{sym}{RESET} {DIM}{context}{tail}{RESET}"
 
 
 def colors_enabled() -> bool:
@@ -102,6 +118,74 @@ def visible(text: str) -> str:
         lambda m: "^?" if m.group() == "\x7f" else f"^{chr(ord(m.group()) ^ 0x40)}",
         text,
     )
+
+
+# What a failure means and what to do about it, for the usual ones. The raw
+# message stays available under WRENCODE_DEBUG.
+_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        r"HTTP 401|invalid x-api-key|authentication_error",
+        "The API key was rejected. Run /configure to enter a new one.",
+    ),
+    (
+        r"HTTP 403",
+        "The key does not have access to this model or workspace. Check it in the provider's console, or run /configure.",
+    ),
+    (
+        r"HTTP 404|not_found_error",
+        "The model id was not found for this backend. Run /model to pick one.",
+    ),
+    (
+        r"HTTP 429|rate_limit",
+        "The provider is rate limiting this key. Wait a moment and send again.",
+    ),
+    (r"HTTP 529|overloaded", "The provider is overloaded. Try again shortly."),
+    (r"HTTP 5\d\d", "The provider had an internal error. Try again shortly."),
+    (
+        r"context_length|too many tokens|prompt is too long|maximum context",
+        "The conversation no longer fits the model's window. /compact summarizes it, /clear starts over.",
+    ),
+    (
+        r"credit|billing|insufficient_quota",
+        "The account is out of credit. Top it up in the provider's console.",
+    ),
+    (
+        r"Connection refused|Name or service not known|nodename nor servname|Temporary failure in name resolution",
+        "Could not reach the provider: check the network, proxy, or the local server's address.",
+    ),
+    (
+        r"timed out|TimeoutError",
+        "The request timed out. Try again; WRENCODE_HTTP_TIMEOUT raises the limit.",
+    ),
+    (
+        r"CERTIFICATE_VERIFY_FAILED|SSL",
+        "TLS verification failed, usually a proxy in the way: point SSL_CERT_FILE at its certificate bundle.",
+    ),
+)
+
+
+def explain_error(message: str) -> str:
+    """One sentence on what went wrong and the next step, or '' for an unknown error."""
+    for pattern, hint in _ERROR_HINTS:
+        if re.search(pattern, message, re.IGNORECASE):
+            return hint
+    return ""
+
+
+def print_error(message: str) -> None:
+    """Report a failure as a sentence and a next step; the raw text follows
+    when it adds something, or under WRENCODE_DEBUG in full."""
+    message = visible(message)
+    hint = explain_error(message)
+    if not hint:
+        print(f"{RED}Error: {message}{RESET}")
+        return
+    print(f"{RED}Error: {hint}{RESET}")
+    if os.environ.get("WRENCODE_DEBUG"):
+        print(f"{DIM}{message}{RESET}")
+    else:
+        head = message.split("\n", 1)[0]
+        print(f"{DIM}{head[:160]}{'…' if len(head) > 160 else ''}{RESET}")
 
 
 def print_system(text: str, *, end: str = "\n") -> None:
@@ -181,9 +265,14 @@ def _read_input_char(fd: int) -> str:
 
 
 def _redraw_input_line(
-    text: str, matches: list[str] | None = None, sel: int = 0, hint: str = ""
+    text: str,
+    matches: list[str] | None = None,
+    sel: int = 0,
+    hint: str = "",
+    cursor: int | None = None,
 ) -> None:
-    """Redraw the prompt line plus a completion menu or a hint below it, cursor kept on the line.
+    """Redraw the prompt line plus a completion menu or a hint below it, the
+    cursor put back at `cursor` (the end of the text by default).
 
     `hint` is one dim line of context for what's typed (the estimated cost of
     sending it); it is shown when there is no menu.
@@ -202,9 +291,11 @@ def _redraw_input_line(
     if hint and not matches:
         out += f"\n  {DIM}{hint}{RESET}" if colors_enabled() else f"\n  {hint}"
         below = 1
+    col = 2 + (len(text) if cursor is None else cursor)  # "❯ " is two cells
     if below:
-        col = 2 + len(text)  # "❯ " is two cells
         out += f"\033[{below}A\r" + (f"\033[{col}C" if col else "")
+    elif cursor is not None and cursor < len(text):
+        out += "\r" + (f"\033[{col}C" if col else "")
     sys.stdout.write(out)
     sys.stdout.flush()
 
@@ -218,29 +309,45 @@ def _read_tty_key(fd: int) -> str:
         if not select.select([fd], [], [], 0.02)[0]:
             return "esc"
         seq = os.read(fd, 1)
-        if seq != b"[":
+        if seq not in (b"[", b"O"):
             return "esc"
         if not select.select([fd], [], [], 0.02)[0]:
             return "esc"
         code = os.read(fd, 1)
-        if code == b"A":
-            return "up"
-        if code == b"B":
-            return "down"
-        if code == b"C":
-            return "right"
-        if code == b"D":
-            return "left"
-        return "esc"
+        while code.isdigit() or code == b";":  # ESC [ 1 ~, ESC [ 3 ~, ESC [ 1 ; 5 C
+            if not select.select([fd], [], [], 0.02)[0]:
+                return "esc"
+            code += os.read(fd, 1)
+        return _CSI_KEYS.get(code, "esc")
     if ch in "\r\n":
         return "enter"
     if ch in ("\x7f", "\x08"):
         return "backspace"
-    if ch == "\x03":
-        return "ctrl_c"
-    if ch == "\x04":
-        return "ctrl_d"
-    return ch
+    return _CTRL_KEYS.get(ch, ch)
+
+
+_CSI_KEYS = {
+    b"A": "up",
+    b"B": "down",
+    b"C": "right",
+    b"D": "left",
+    b"H": "home",
+    b"F": "end",
+    b"1~": "home",
+    b"4~": "end",
+    b"7~": "home",
+    b"8~": "end",
+    b"3~": "delete",
+}
+_CTRL_KEYS = {
+    "\x03": "ctrl_c",
+    "\x04": "ctrl_d",
+    "\x01": "home",
+    "\x05": "end",
+    "\x17": "ctrl_w",
+    "\x15": "ctrl_u",
+    "\x0b": "ctrl_k",
+}
 
 
 def _read_tty_line(
@@ -264,6 +371,7 @@ def _read_tty_line(
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     buf: list[str] = []
+    cur = 0  # the cursor: where the next character goes
     hist_idx = len(_INPUT_HISTORY)
     sel = 0
 
@@ -278,12 +386,21 @@ def _read_tty_line(
 
     def _redraw() -> None:
         if complete:
-            _redraw_input_line("".join(buf), _matches(), sel, _hint())
+            _redraw_input_line("".join(buf), _matches(), sel, _hint(), cur)
         elif redraw is not None:
             redraw("".join(buf))
         else:
-            sys.stdout.write("\r\033[K" + prompt + "".join(buf))
+            text = "".join(buf)
+            back = len(text) - cur
+            sys.stdout.write(
+                "\r\033[K" + prompt + text + (f"\033[{back}D" if back else "")
+            )
             sys.stdout.flush()
+
+    def _set(text: str) -> None:
+        nonlocal buf, cur
+        buf = list(text)
+        cur = len(buf)
 
     try:
         tty.setcbreak(fd)
@@ -307,7 +424,7 @@ def _read_tty_line(
                 sys.stdout.flush()
                 return text
             if matches and key in {"\t", "right"}:
-                buf = list(matches[min(sel, len(matches) - 1)])
+                _set(matches[min(sel, len(matches) - 1)])
                 sel = 0
                 _redraw()
                 continue
@@ -317,10 +434,44 @@ def _read_tty_line(
                 _redraw()
                 continue
             if key == "backspace":
-                if buf:
-                    buf.pop()
+                if cur:
+                    del buf[cur - 1]
+                    cur -= 1
                     sel = 0
                     _redraw()
+                continue
+            if key == "delete":
+                if cur < len(buf):
+                    del buf[cur]
+                    _redraw()
+                continue
+            if key in {"left", "right", "home", "end"}:
+                cur = {
+                    "left": max(cur - 1, 0),
+                    "right": min(cur + 1, len(buf)),
+                    "home": 0,
+                    "end": len(buf),
+                }[key]
+                _redraw()
+                continue
+            if key == "ctrl_w":  # delete the word before the cursor
+                start = cur
+                while start and buf[start - 1] == " ":
+                    start -= 1
+                while start and buf[start - 1] != " ":
+                    start -= 1
+                del buf[start:cur]
+                cur = start
+                _redraw()
+                continue
+            if key == "ctrl_u":  # delete to the start of the line
+                del buf[:cur]
+                cur = 0
+                _redraw()
+                continue
+            if key == "ctrl_k":  # delete to the end of the line
+                del buf[cur:]
+                _redraw()
                 continue
             if key == "ctrl_c":
                 sys.stdout.write("\n")
@@ -335,23 +486,24 @@ def _read_tty_line(
             if key == "up" and history and _INPUT_HISTORY:
                 if hist_idx > 0:
                     hist_idx -= 1
-                    buf = list(_INPUT_HISTORY[hist_idx])
+                    _set(_INPUT_HISTORY[hist_idx])
                     _redraw()
                 continue
             if key == "down" and history:
                 if hist_idx < len(_INPUT_HISTORY):
                     hist_idx += 1
-                    buf = (
-                        list(_INPUT_HISTORY[hist_idx])
+                    _set(
+                        _INPUT_HISTORY[hist_idx]
                         if hist_idx < len(_INPUT_HISTORY)
-                        else []
+                        else ""
                     )
                     _redraw()
                 continue
-            if key in ("up", "down", "left", "right", "esc"):
+            if key in ("up", "down", "esc"):
                 continue
             if len(key) == 1 and (key.isprintable() or key == "\t"):
-                buf.append(key)
+                buf.insert(cur, key)
+                cur += 1
                 sel = 0
                 _redraw()
     finally:
@@ -494,12 +646,14 @@ def check_cancelled() -> None:
         raise UserCancelled()
 
 
-def confirm(action: str = "") -> str:
+def confirm(action: str = "", question: str = "") -> str:
     """Prompt for approval. Returns 'ok' or a cancellation message for the agent.
 
-    Enter/y approves once; ``a`` approves all remaining actions this session;
-    ``n`` declines and asks what to do differently. Auto-approve via
-    WRENCODE_AUTO_APPROVE / --yes enables headless use and subagents.
+    `question` is the one line asked ("Apply to app.py?"); `action` names the
+    action in auto-approve and headless notices. Enter/y approves once; ``a``
+    approves all remaining actions this session; ``n`` declines and asks what
+    to do differently. Auto-approve via WRENCODE_AUTO_APPROVE / --yes enables
+    headless use and subagents.
     """
     if (
         os.environ.get("WRENCODE_AUTO_APPROVE", "").lower() in ("1", "true", "yes")
@@ -515,8 +669,8 @@ def confirm(action: str = "") -> str:
             "approved. Do what you can without it and say what is left to do."
         )
     if _agent_tag():
-        return _confirm_from_subagent(action)
-    return _confirm_prompt()
+        return _confirm_from_subagent(action, question)
+    return _confirm_prompt(question)
 
 
 # One approval prompt at a time across parallel subagents.
@@ -525,7 +679,7 @@ _APPROVAL_LOCK = threading.Lock()
 PARALLEL_ESC: _EscWatch | None = None
 
 
-def _confirm_from_subagent(action: str) -> str:
+def _confirm_from_subagent(action: str, question: str = "") -> str:
     """Ask for approval on behalf of a parallel subagent.
 
     Prompts take turns, the Escape listener lets go of stdin, and the other
@@ -542,7 +696,7 @@ def _confirm_from_subagent(action: str) -> str:
         try:
             detail = getattr(_AGENT_LOCAL, "last_action", "") or action
             print(f"{YELLOW}[{_agent_tag()}] needs approval:{RESET} {detail}")
-            return _confirm_prompt()
+            return _confirm_prompt(question)
         finally:
             if esc is not None:
                 esc.start()
@@ -550,12 +704,16 @@ def _confirm_from_subagent(action: str) -> str:
                 out.release()
 
 
-def _confirm_prompt() -> str:
-    """The interactive approve / allow-all / decline prompt."""
+def _confirm_prompt(question: str = "") -> str:
+    """The interactive approve / allow-all / decline prompt: one line, then ❯."""
     global SESSION_AUTO_APPROVE
-    print(f"{DIM}Enter/y   approve once{RESET}")
-    print(f"{DIM}a         allow all for this session{RESET}")
-    print(f"{DIM}n         decline{RESET}")
+    ask = question or "Allow this?"
+    keys = "Enter yes · a always · n no"
+    print(
+        f"{BOLD}{ask}{RESET}  {DIM}{keys}{RESET}"
+        if colors_enabled()
+        else f"{ask}  {keys}"
+    )
     while True:
         try:
             choice = input(f"{BLUE}❯{RESET} ").strip().lower()
@@ -612,6 +770,33 @@ def _highlight_code(code: str, base: str = "") -> str:
         return m.group()
 
     return _CODE_TOKEN.sub(color, code)
+
+
+def print_diff(label: str, before: str, after: str, limit: int = 40) -> None:
+    """Show what a change does to a file: a unified diff with two lines of context,
+    removed lines red, added lines green, each hunk headed by `label:line`."""
+    import difflib
+
+    out: list[str] = []
+    for line in difflib.unified_diff(
+        before.splitlines(), after.splitlines(), lineterm="", n=2
+    ):
+        if line.startswith(("---", "+++")):
+            continue
+        shown = visible(line)
+        if line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)", line)
+            out.append(f"{DIM}@@ {label}:{m.group(1) if m else '?'}{RESET}")
+        elif line.startswith("+"):
+            out.append(f"{GREEN}{shown}{RESET}")
+        elif line.startswith("-"):
+            out.append(f"{RED}{shown}{RESET}")
+        else:
+            out.append(f"{DIM}{shown}{RESET}")
+    for line in out[:limit]:
+        print(f"    {line}")
+    if len(out) > limit:
+        print(f"    {DIM}… +{len(out) - limit} more lines{RESET}")
 
 
 def render_markdown(text: str) -> str:
@@ -727,6 +912,77 @@ class _EscWatch:
         self._thread = None
 
 
+def _clip(text: str, width: int) -> str:
+    """Cut `text` to `width` visible cells, keeping its color codes and ending in …."""
+    out, seen = [], 0
+    for part in re.split(r"(\x1b\[[0-9;]*m)", text):
+        if part.startswith("\x1b"):
+            out.append(part)
+            continue
+        room = width - seen
+        if len(part) > room:
+            out.append(part[: max(room - 1, 0)] + "…")
+            seen = width
+            break
+        out.append(part)
+        seen += len(part)
+    return "".join(out)
+
+
+def _pick_with_arrows(title: str, labels: list[str], initial: int) -> int | None:
+    """The arrow-key menu behind pick_from_list: ↑↓ move, Enter picks, Esc or q
+    cancels, a digit jumps to that entry."""
+    import shutil
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sel = initial
+    typed = ""
+    width = (
+        shutil.get_terminal_size().columns - 3
+    )  # a wrapped row would break the redraw
+    rows = [_clip(label, width) for label in labels]
+    if title:
+        print(f"{BOLD}{title}{RESET}  {DIM}↑↓ Enter · Esc cancels{RESET}")
+
+    def draw(first: bool) -> None:
+        out = "" if first else f"\033[{len(rows)}A"
+        for i, label in enumerate(rows):
+            out += "\r\033[K"
+            if i == sel:
+                out += f"{BRIGHT_CYAN}❯{RESET} {BOLD}{label}{RESET}\n"
+            else:
+                out += f"  {label}\n"
+        sys.stdout.write(out)
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        draw(True)
+        while True:
+            key = _read_tty_key(fd)
+            if key in ("", "esc", "q", "ctrl_c", "ctrl_d"):
+                return None
+            if key == "enter":
+                return sel
+            if key in ("up", "down"):
+                sel = (sel + (-1 if key == "up" else 1)) % len(labels)
+                typed = ""
+            elif key.isdigit():
+                typed += key
+                if typed.isdigit() and 1 <= int(typed) <= len(labels):
+                    sel = int(typed) - 1
+                if len(typed) >= len(str(len(labels))):
+                    typed = ""
+            else:
+                continue
+            draw(False)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def pick_from_list(
     title: str,
     options: list[str],
@@ -734,12 +990,15 @@ def pick_from_list(
     labels: list[str] | None = None,
     initial_index: int = 0,
 ) -> int | None:
-    """Pick one option from a numbered list."""
+    """Pick one option: arrow keys and Enter on a terminal (Esc cancels, a
+    number jumps), a numbered prompt otherwise."""
     if not options:
         print(f"{YELLOW}No options available.{RESET}")
         return None
     labels = labels if labels is not None else options
     initial_index = max(0, min(initial_index, len(options) - 1))
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _pick_with_arrows(title, labels, initial_index)
     print()
     if title:
         print_system(title)

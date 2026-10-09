@@ -266,14 +266,12 @@ degrades to a structured summary.
 After each turn wrencode prints one dim line with what the backend reported:
 
 ```
-↑ 1.6k  ↓ 108 ×2  ⚡ 97% cached  42 tok/s ↗  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · total $0.21
+↑ 1.6k  ↓ 108  42 tok/s ↗  ▰▱▱▱▱▱▱▱▱▱ 1%  $0.0042 · total $0.21
 ```
 
-Up is the turn's input tokens, down its output, `×2` the number of model calls,
-`⚡` the share of input served from the prompt cache at the reduced rate, then the
-speed: output tokens per second over the turn's requests, with an arrow against
-the previous turn (`↗` at least a tenth faster, `↘` a tenth slower, `→` about the
-same). The rate is measured over the whole request, so the network and the wait
+Up is the turn's input tokens, down its output, then the speed: output tokens
+per second over the turn's requests, with an arrow against the previous turn
+(`↗` at least a tenth faster, `↘` a tenth slower, `→` about the same). The rate is measured over the whole request, so the network and the wait
 for the first token are in it; a drop usually means the provider is busy. The
 meter is the context fill: the size of the latest request against the model's
 window, which is what the next turn starts from and what auto-compaction watches.
@@ -567,6 +565,35 @@ This publishes release assets:
 
 Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 
+## In the terminal
+
+What a session looks like, and the keys that drive it.
+
+- **Who is speaking.** Your line keeps the `❯` prompt. The model's reply opens
+  with a cyan dot; a tool call opens with a green dot, and what it returned
+  hangs under it after `⎿`: one line when that says it all (`ok`, `3 lines
+  read`, an error), a short excerpt otherwise. Code the model quotes is drawn
+  in its own tint with a gutter.
+- **Approvals.** Before a write, edit or shell command runs, you see exactly
+  what it does: a unified diff of the file with a few lines of context, red
+  and green, headed by the file and line; then one question, `Apply to
+  app.py?  Enter yes · a always · n no`. `n` asks what to do differently.
+- **Waiting.** The spinner says what is happening (`thinking`, `running
+  python`), how long it has been, and that Escape cancels the turn.
+- **The prompt.** `←` `→` move, `Home`/`End` or `Ctrl-A`/`Ctrl-E` jump,
+  `Ctrl-W` deletes the word before the cursor, `Ctrl-U` to the start of the
+  line, `Ctrl-K` to the end, `↑`/`↓` walk the input history. While you type,
+  a dim line estimates the input cost of sending the message.
+- **Pickers.** Models and sessions are picked with `↑`/`↓` and Enter; Escape
+  cancels, a number jumps. Without a terminal they fall back to a numbered
+  prompt.
+- **Errors.** A failed request is reported as a sentence and a next step
+  (`The API key was rejected. Run /configure to enter a new one.`), with the
+  raw message under it; `WRENCODE_DEBUG=1` prints it in full.
+- **Light terminals.** The prose and code tints are chosen for a dark
+  background. Set `WRENCODE_THEME=light` on a light one (terminals that
+  export `COLORFGBG` are detected).
+
 ## Environment Variables
 
 |Variable                     |Default                |Description                       |
@@ -588,6 +615,7 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`MAX_TOKENS`                 |`8192`, `16000` for Claude|Max tokens per response        |
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
 |`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
+|`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
 |`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|

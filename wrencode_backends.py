@@ -863,15 +863,13 @@ def usage_line(warn_at: float = 0.0) -> str:
     """
     u = USAGE
     turn_in = u.turn_uncached + u.turn_cache_read + u.turn_cache_write
-    calls = f" ×{u.turn_calls}" if u.turn_calls > 1 else ""
-    hit = f"  ⚡ {100 * u.turn_cache_read // turn_in}% cached" if turn_in else ""
     fill = context_fill()
     cells = min(10, round(fill * 10))
     bar = "▰" * cells + "▱" * (10 - cells)
     if warn_at and fill >= warn_at and ui.colors_enabled():
         bar = f"{YELLOW}{bar}{RESET}{DIM}"
     return (
-        f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{calls}{hit}{_pace()}  "
+        f"↑ {_count(turn_in)}  ↓ {_count(u.turn_out)}{_pace()}  "
         f"{bar} {100 * fill:.0f}%{_spend()}"
     )
 
@@ -1830,8 +1828,7 @@ def load_model() -> tuple[Any, Any] | None:
             print(
                 f"{YELLOW}⚠ Couldn't reach Ollama at {base} — is `ollama serve` running?{RESET}"
             )
-        ui.print_system(f"{BACKEND} ({MODEL})")
-        return None
+        return None  # the status line under the banner names the model
     if BACKEND == "openai-compatible":
         base = _openai_compatible_base()
         served, why = _list_openai_compatible_models()
@@ -1866,5 +1863,4 @@ def load_model() -> tuple[Any, Any] | None:
             f"{DIM}Set {key_env}, or run `wrencode` in a terminal to enter a key.{RESET}"
         )
         raise SystemExit(1)
-    ui.print_system(f"{BACKEND} ({MODEL})")
-    return None
+    return None  # the status line under the banner names the model

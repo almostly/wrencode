@@ -114,7 +114,7 @@ import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
 import wrencode_ui as ui
-from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
+from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
@@ -261,7 +261,10 @@ def write(args: dict[str, Any]) -> str:
     if "content" not in args:
         return "error: 'content' is required (model response may have been truncated; raise MAX_TOKENS)"
     content = args["content"]
-    approval = ui.confirm("write")
+    rel = _display_path(path)
+    if path.is_file():
+        ui.print_diff(rel, path.read_text(encoding="utf-8", errors="replace"), content)
+    approval = ui.confirm("write", f"Write {rel}?")
     if approval != "ok":
         return approval
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +313,9 @@ def edit(args: dict[str, Any]) -> str:
             json.loads(updated)
         except json.JSONDecodeError as exc:
             return f"error: edit would make invalid JSON: {exc}"
-    approval = ui.confirm("edit")
+    rel = _display_path(path)
+    ui.print_diff(rel, text, updated)
+    approval = ui.confirm("edit", f"Apply to {rel}?")
     if approval != "ok":
         return approval
     path.write_text(updated, encoding="utf-8")
@@ -528,7 +533,7 @@ def get_response_cancellable(
 def bash(args: dict[str, Any]) -> str:
     """Run a shell command with a timeout, streaming output to the terminal."""
     cmd = _require_str(args, "cmd")
-    approval = ui.confirm("run")
+    approval = ui.confirm("run", "Run it?")
     if approval != "ok":
         return approval
     proc = subprocess.Popen(
@@ -877,15 +882,15 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     if name == "write":
         path = args.get("path", "?")
         content = str(args.get("content", ""))
-        lines = content.count("\n") + (1 if content else 0)
-        preview = content[:160].replace("\n", "\\n")
-        suffix = "..." if len(content) > 160 else ""
-        return f"write {path}{_hidden_path_note(path)}  ({lines} lines)\n  {preview}{suffix}"
+        lines = content.split("\n") if content else []
+        head = "\n".join(f"  {ln[:120]}" for ln in lines[:6])
+        more = f"\n  … +{len(lines) - 6} lines" if len(lines) > 6 else ""
+        return (
+            f"write {path}{_hidden_path_note(path)}  ({len(lines)} lines)\n{head}{more}"
+        )
     if name == "edit":
         path = args.get("path", "?")
-        old = str(args.get("old", ""))[:80].replace("\n", "\\n")
-        new = str(args.get("new", ""))[:80].replace("\n", "\\n")
-        return f"edit {path}{_hidden_path_note(path)}\n  - {old}\n  + {new}"
+        return f"edit {path}{_hidden_path_note(path)}"  # the diff follows at approval
     if name == "glob":
         return f"glob {args.get('pat', args.get('pattern', '?'))}"
     if name == "grep":
@@ -901,8 +906,16 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
 
+def _display_path(path: pathlib.Path) -> str:
+    """A path as the person knows it: relative to the project when inside it."""
+    try:
+        return str(path.resolve().relative_to(workspace_root().resolve()))
+    except ValueError:
+        return str(path)
+
+
 def print_tool_action(name: str, args: dict[str, Any]) -> None:
-    """Print a tool call as plain text — no background boxes.
+    """Print a tool call: a green dot, the action, its details hanging under it.
 
     Control characters are shown, not interpreted, so what the approval prompt
     displays is exactly what would run.
@@ -910,28 +923,49 @@ def print_tool_action(name: str, args: dict[str, Any]) -> None:
     body = ui.visible(format_tool_action(name, args))
     ui._AGENT_LOCAL.last_action = body
     first, _, rest = body.partition("\n")
-    print(f"{GREEN}⏺{RESET}{DIM} {first}{RESET}")
+    print(f"{ui.TOOL_MARK} {first}")
     for line in rest.split("\n"):
         if line.strip():
             print(f"{DIM}  {line}{RESET}")
 
 
-def print_tool_result(result: str) -> None:
-    """Print tool output with enough context to see what happened."""
-    lines = ui.visible(result).split("\n")
-    if ui._agent_tag():  # parallel agents: one line each, or the screen floods
-        more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
-        print(f"{DIM}⎿ {lines[0][:160] or '(empty)'}{more}{RESET}")
+# How many lines of a tool's output to show before folding the rest.
+RESULT_LINES = 8
+
+
+def print_tool_result(result: str, name: str = "") -> None:
+    """Print what a tool returned, under its call: one line when that says it
+    all (ok, a count, an error), a short excerpt otherwise.
+
+    Reads are summarized to their size, since the model asked for them, not
+    the person; bash output already streamed, so it only gets its size too.
+    """
+    text = ui.visible(result)
+    lines = text.split("\n")
+    gutter = f"{DIM}  ⎿{RESET}"
+    if not text.strip():
+        print(f"{gutter} {DIM}(empty){RESET}")
         return
-    print(f"{DIM}⎿ result{RESET}")
-    if not result:
-        print(f"{DIM}│ (empty){RESET}")
+    if text.startswith("error:"):
+        print(f"{gutter} {YELLOW}{lines[0][:200]}{RESET}")
+        for line in lines[1:4]:
+            print(f"{DIM}    {line[:200]}{RESET}")
         return
-    show = lines[:12]
-    for line in show:
-        print(f"{DIM}│ {line}{RESET}")
-    if len(lines) > 12:
-        print(f"{DIM}│ ... +{len(lines) - 12} more lines{RESET}")
+    if ui._agent_tag() or name in {"read", "bash"}:  # one line: the size
+        if len(lines) == 1 and len(text) <= 120:
+            print(f"{gutter} {DIM}{text}{RESET}")
+        else:
+            unit = "lines read" if name == "read" else "lines"
+            print(f"{gutter} {DIM}{len(lines)} {unit}{RESET}")
+        return
+    if len(lines) == 1 and len(text) <= 120:
+        print(f"{gutter} {DIM}{text}{RESET}")
+        return
+    print(f"{gutter} {DIM}{lines[0][:200]}{RESET}")
+    for line in lines[1:RESULT_LINES]:
+        print(f"{DIM}    {line[:200]}{RESET}")
+    if len(lines) > RESULT_LINES:
+        print(f"{DIM}    … +{len(lines) - RESULT_LINES} more lines{RESET}")
 
 
 def run_tool(name: str, args: dict[str, Any]) -> str:
@@ -951,20 +985,22 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
 
 
 @contextlib.contextmanager
-def thinking_spinner() -> Any:
-    """Loader on the line below the user's input (style from /loader)."""
+def thinking_spinner(activity: str = "thinking") -> Any:
+    """Loader on the line below the user's input: what is happening, for how
+    long, and that Escape cancels."""
     if not sys.stdout.isatty() or ui._agent_tag():  # parallel agents share the screen
         yield
         return
 
     stop = threading.Event()
     step = 0
-    context = ui.loader_context(backends.BACKEND, backends.MODEL)
+    context = ui.loader_context(backends.BACKEND, backends.MODEL, activity)
+    started = time.monotonic()
 
     def animate() -> None:
         nonlocal step
         while not stop.is_set():
-            bar = ui.loader_display(step, context)
+            bar = ui.loader_display(step, context, int(time.monotonic() - started))
             step += 1
             sys.stdout.write(f"\r{bar}")
             sys.stdout.flush()
@@ -1563,7 +1599,11 @@ def run_agent_turn(
                     result = parallel[i]
                 else:
                     print_tool_action(tc.name, tc.input)
-                    result = run_tool(tc.name, tc.input)
+                    if tc.name == "python":  # the sandbox can take a while
+                        with thinking_spinner("running python"):
+                            result = run_tool(tc.name, tc.input)
+                    else:
+                        result = run_tool(tc.name, tc.input)
                 last_tool_error, repeated_tool_error_count, stop = _track_error(
                     result, last_tool_error, repeated_tool_error_count
                 )
@@ -1581,7 +1621,7 @@ def run_agent_turn(
                         stop = True
                     elif failed_calls[key] >= REPEATED_CALL_HINT:
                         result += REPEATED_CALL_NOTE.format(n=failed_calls[key])
-                print_tool_result(result)
+                print_tool_result(result, tc.name)
                 results.append((tc, result))
                 if stop:
                     break
@@ -1917,7 +1957,7 @@ def run_headless(
             error = "configuration error (see stderr)"
         except Exception as err:  # reported in the result
             error = str(err)
-            print(f"{RED}Error: {ui.visible(error)}{RESET}")
+            ui.print_error(error)
         finally:
             if sdk is not None:
                 sdk.close()
@@ -1964,6 +2004,30 @@ def run_headless(
     return 1 if is_error else 0
 
 
+def _status_line(messages: list[dict[str, Any]]) -> str:
+    """The one line under the banner: the model and its price, the session and
+    how much of it came back, and where history lives."""
+    price = backends.price_for()
+    parts = [f"{BOLD}{backends.MODEL}{RESET}"]
+    if price is not None:
+        parts.append(price.label())
+    if backends.BACKEND == backends.AGENT_SDK_BACKEND:
+        if agent_sdk._load_agent_sdk_session_id(workspace_root()):
+            parts.append("resuming the Claude Agent SDK session (/clear starts fresh)")
+    else:
+        chats = sum(1 for m in messages if m.get("role") == "user")
+        if _STORE is not None:
+            parts.append(f"session #{_SESSION_ID}, {chats} chats")
+            parts.append(
+                f"history in Postgres, mirrored to {_STORE.mirror.label}"
+                if _STORE.mirror is not None
+                else "history in Postgres"
+            )
+        elif chats:
+            parts.append(f"{chats} chats restored from history.json")
+    return f"{DIM} · {RESET}".join(parts)
+
+
 def _snippet(text: str, width: int = 110) -> str:
     """A search hit on one line: its first non-empty line, cut to `width`."""
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
@@ -1971,14 +2035,18 @@ def _snippet(text: str, width: int = 110) -> str:
     return first[:width].rstrip() + more
 
 
-def _session_line(r: dict[str, Any]) -> str:
-    """One session as /sessions and /search list it; the current one is marked and bold."""
+def _session_line(r: dict[str, Any], mark: bool = True) -> str:
+    """One session as /sessions and /search list it; the current one is bold and,
+    with `mark`, pointed at."""
     current = r["id"] == _SESSION_ID
-    mark = f"{BRIGHT_CYAN}›{RESET}" if current else " "
     when = r["updated_at"].strftime("%Y-%m-%d %H:%M")
     title = ui.visible(r["title"]) or "(empty)"
     line = f"#{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
-    return f"{mark} {BOLD}{line}{RESET}" if current else f"{mark} {line}"
+    if current:
+        line = f"{BOLD}{line}{RESET}"
+    if not mark:
+        return line
+    return f"{BRIGHT_CYAN}›{RESET} {line}" if current else f"  {line}"
 
 
 def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
@@ -2024,7 +2092,7 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
             idx = ui.pick_from_list(
                 "Resume a session",
                 [str(r["id"]) for r in rows],
-                labels=[_session_line(r) for r in rows],
+                labels=[_session_line(r, mark=False) for r in rows],
             )
             if idx is None:
                 return
@@ -2187,16 +2255,9 @@ def main() -> None:
 
     sys.stdout.write("\033]0;wrencode\007")  # set terminal tab/window title
     print(ui.render_banner(ui.colors_enabled()))
-    price = backends.price_for()
-    priced = f" · {price.label()}" if price is not None else ""
-    print(
-        f"{BOLD}wrencode{RESET} 🐦 | {DIM}{backends.BACKEND}:{backends.MODEL}{priced}{RESET}"
-    )
     mlx_state = backends.load_model()
     _MLX_STATE = mlx_state  # expose to the task() subagent tool
     system_prompt = build_system_prompt()
-    for path in find_agents_files():
-        print(f"{DIM}Loaded {path}{RESET}")
     global _STORE, _SESSION_ID
     _STORE = history.open_store()
     if _STORE is not None:
@@ -2204,25 +2265,16 @@ def main() -> None:
         _SESSION_ID = _STORE.latest_session(ws) or _STORE.new_session(
             ws, backends.BACKEND, backends.MODEL
         )
-    elif history.UNAVAILABLE_REASON:
+    messages = load_history()
+    print(_status_line(messages))
+    for path in find_agents_files():
+        print(f"{DIM}Loaded {_display_path(pathlib.Path(path))}{RESET}")
+    if _STORE is None and history.UNAVAILABLE_REASON:
         print(
             f"{YELLOW}Postgres history unavailable ({ui.visible(history.UNAVAILABLE_REASON)}); "
             f"using history.json{RESET}"
         )
-    messages = load_history()
-    if backends.BACKEND == backends.AGENT_SDK_BACKEND:
-        if agent_sdk._load_agent_sdk_session_id(workspace_root()):
-            print(
-                f"{DIM}Resuming the Claude Agent SDK session (/clear starts fresh){RESET}"
-            )
-    elif messages:
-        chats = sum(1 for m in messages if m.get("role") == "user")
-        where = f"session #{_SESSION_ID} with " if _STORE is not None else ""
-        print(f"{DIM}Restored {where}{chats} chats{RESET}")
-    if _STORE is not None and _STORE.mirror is not None:
-        print(
-            f"{DIM}History mirrored to {_STORE.mirror.label} (/sync copies everything now){RESET}"
-        )
+    print(f"{DIM}type / for commands · esc cancels a turn · /q quits{RESET}")
 
     def typing_hint(text: str) -> str:
         """The estimated input cost of sending what's typed, under the prompt."""
@@ -2266,7 +2318,7 @@ def main() -> None:
             break
         except Exception as err:  # shown to the user; the session goes on
             msg = str(err)
-            print(f"{RED}Error: {ui.visible(msg)}{RESET}")
+            ui.print_error(msg)
             if backends.BACKEND == "ollama" and (
                 "not found" in msg.lower() or "404" in msg
             ):
