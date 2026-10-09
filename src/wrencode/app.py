@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
 """WrenCode — a minimal agentic coding assistant inspired by Harold Wren.
 
-A lightweight alternative to Claude Code. This file is the agent loop: the tools,
-the system prompt, the turn loop with its subagents and compaction, headless mode
-and main(). The wrencode_*.py modules beside it are what it calls: the model
-backends, backend/model configuration, the terminal UI, the Claude Agent SDK
-backend and the synthesize subcommand.
+A lightweight alternative to Claude Code. This module is the agent loop: the
+tools, the system prompt, the turn loop with its subagents and compaction,
+headless mode and main(). The modules beside it in the package are what it
+calls: the model backends, backend/model configuration, the terminal UI,
+permission rules, the MCP client, web access, history, the sandbox, the Claude
+Agent SDK backend and the synthesize subcommand.
 
 Supports multiple inference backends: local Apple Silicon via MLX,
 HuggingFace Transformers, Anthropic, OpenAI, OpenRouter, NanoGPT, and local proxy.
@@ -68,7 +68,8 @@ except ImportError:
 # What a project's own .env may set: credentials for the backends, nothing else.
 # Anything that steers the agent (BACKEND, WRENCODE_AUTO_APPROVE, a *_BASE_URL,
 # WRENCODE_CONFIG_DIR, WRENCODE_WORKSPACE, ...) comes only from the real environment
-# or the .env beside this script, so cloning a repository can't reconfigure wrencode.
+# or the .env at the root of a source checkout, so cloning a repository can't
+# reconfigure wrencode.
 DOTENV_PROJECT_KEYS = re.compile(r"^[A-Z0-9_]*_API_KEY$|^ANTHROPIC_WORKSPACE_ID$")
 _DOTENV_IGNORED: list[
     str
@@ -105,28 +106,38 @@ def load_dotenv(path: str, *, trusted: bool) -> list[str]:
     return skipped
 
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_SCRIPT_DIR, ".env"), trusted=True)
-if os.getcwd() != _SCRIPT_DIR:
-    _DOTENV_IGNORED = load_dotenv(os.path.join(os.getcwd(), ".env"), trusted=False)
+# A source checkout (src/wrencode/app.py under a pyproject.toml) may keep a
+# trusted .env at its root; an installed package or the frozen binary has none.
+_SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_TRUSTED_ENV = (
+    _SOURCE_ROOT / ".env" if (_SOURCE_ROOT / "pyproject.toml").is_file() else None
+)
+if _TRUSTED_ENV is not None:
+    load_dotenv(str(_TRUSTED_ENV), trusted=True)
+_PROJECT_ENV = pathlib.Path(os.getcwd()).resolve() / ".env"
+if _PROJECT_ENV != _TRUSTED_ENV:
+    _DOTENV_IGNORED = load_dotenv(str(_PROJECT_ENV), trusted=False)
 
 # The other modules read environment defaults at import, so they come after .env.
-import wrencode_backends as backends
-import wrencode_configure as configure
-import wrencode_history as history
-import wrencode_mcp as mcp
-import wrencode_permissions as permissions
-import wrencode_sandbox as sandbox
-import wrencode_sdk as agent_sdk
-import wrencode_synthesize as synthesize
-import wrencode_ui as ui
-import wrencode_web as web
-from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
+from . import (
+    __version__,
+    backends,
+    configure,
+    history,
+    mcp,
+    permissions,
+    sandbox,
+    synthesize,
+    ui,
+    web,
+)
+from . import sdk as agent_sdk
+from .ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
 # Version, limits and per-run state
 # -----------------------------------------------------------------------------------------------
-WRENCODE_VERSION = "0.4.0"
+WRENCODE_VERSION = __version__
 # Project instruction files, in preference order per directory (see find_agents_files).
 AGENTS_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_AGENTS_MD_CHARS = 32_000
@@ -163,10 +174,13 @@ _GLOB_SKIP: set[str] = {
     s
     for s in os.environ.get(
         "GLOB_SKIP_DIRS",
-        ".git,node_modules,__pycache__,.venv,venv,dist,build,.mypy_cache,.pytest_cache,target",
+        ".git,node_modules,__pycache__,.venv,venv,dist,build,.mypy_cache,"
+        ".pytest_cache,.ruff_cache,.tox,.nox,target",
     ).split(",")
     if s
 }
+# Seconds a tool may take before the loader shows what is running.
+TOOL_SPINNER_DELAY = float(os.environ.get("WRENCODE_TOOL_SPINNER_DELAY", "0.5"))
 
 
 # -----------------------------------------------------------------------------------------------
@@ -482,10 +496,21 @@ def grep(args: dict[str, Any]) -> str:
         return "error: neither ripgrep (rg) nor grep is installed"
     tool = rg or grep_bin
     assert tool is not None  # guaranteed by the check above
+    # ripgrep skips hidden and ignored files itself; grep gets the skip list
+    # (.git, virtualenvs, caches) so a repository search stays fast without rg.
     cmd = (
         [tool, "-n", "--color", "never", "--no-heading", "-e", pat, "--", scope]
         if rg
-        else [tool, "-R", "-n", "-I", "--", pat, scope]
+        else [
+            tool,
+            "-R",
+            "-n",
+            "-I",
+            *(f"--exclude-dir={d}" for d in sorted(_GLOB_SKIP)),
+            "--",
+            pat,
+            scope,
+        ]
     )
     try:
         proc = subprocess.run(
@@ -1060,56 +1085,91 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
 
 
 class _Spinner:
-    """Handle on a running loader: stop() clears it, once, from any thread."""
+    """A loader on its own line: what is happening, for how long, and that Escape
+    cancels. It draws only once `delay` seconds have passed, so a quick tool
+    shows nothing; it leaves the line while a prompt reads input (pause/resume,
+    which nest); stop() clears it once, from any thread."""
 
-    def __init__(self, stop: threading.Event, thread: threading.Thread) -> None:
-        self._stop = stop
-        self._thread = thread
+    def __init__(self, context: str = "", delay: float = 0.0, out: Any = None) -> None:
+        self._context = context
+        self._delay = delay
+        self._out = out if out is not None else sys.stdout
+        self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._paused = 0
+        self._drawn = False
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _animate(self) -> None:
+        started = time.monotonic()
+        step = 0
+        while not self._stop.is_set():
+            elapsed = time.monotonic() - started
+            with self._lock:
+                if (
+                    not self._paused
+                    and elapsed >= self._delay
+                    and not self._stop.is_set()
+                ):
+                    bar = ui.loader_display(step, self._context, int(elapsed))
+                    step += 1
+                    self._out.write(f"\r{bar}")
+                    self._out.flush()
+                    self._drawn = True
+            time.sleep(0.07)
+
+    def _clear(self) -> None:  # under the lock
+        if self._drawn:
+            self._out.write("\r\033[2K")
+            self._out.flush()
+            self._drawn = False
+
+    def pause(self) -> None:
+        """Take the loader off the line, for a prompt."""
+        with self._lock:
+            self._paused += 1
+            self._clear()
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = max(self._paused - 1, 0)
 
     def stop(self) -> None:
         with self._lock:
             if self._stop.is_set():
                 return
             self._stop.set()
+        if self._thread.is_alive():
             self._thread.join(timeout=0.4)
-            sys.stdout.write("\r\033[2K")
-            sys.stdout.flush()
+        with self._lock:
+            self._clear()
 
 
-_NO_SPINNER = _Spinner(threading.Event(), threading.Thread())
+_NO_SPINNER = _Spinner()
 _NO_SPINNER._stop.set()
 
 
 @contextlib.contextmanager
-def thinking_spinner(activity: str = "thinking") -> Any:
+def thinking_spinner(activity: str = "thinking", delay: float = 0.0) -> Any:
     """Loader on the line below the user's input: what is happening, for how
     long, and that Escape cancels. Yields a handle whose stop() clears it early
-    (when the first streamed token arrives)."""
+    (when the first streamed token arrives). With `delay`, nothing is drawn
+    unless the activity outlasts it."""
     if not sys.stdout.isatty() or ui._agent_tag():  # parallel agents share the screen
         yield _NO_SPINNER
         return
-
-    stop = threading.Event()
-    step = 0
-    context = ui.loader_context(backends.BACKEND, backends.MODEL, activity)
-    started = time.monotonic()
-
-    def animate() -> None:
-        nonlocal step
-        while not stop.is_set():
-            bar = ui.loader_display(step, context, int(time.monotonic() - started))
-            step += 1
-            sys.stdout.write(f"\r{bar}")
-            sys.stdout.flush()
-            time.sleep(0.07)
-
-    thread = threading.Thread(target=animate, daemon=True)
-    thread.start()
-    handle = _Spinner(stop, thread)
+    handle = _Spinner(
+        ui.loader_context(backends.BACKEND, backends.MODEL, activity), delay
+    )
+    handle.start()
+    ui.set_loader(handle)  # prompts take it off the line while they read
     try:
         yield handle
     finally:
+        ui.set_loader(None)
         handle.stop()
 
 
@@ -1278,12 +1338,17 @@ def history_file_path() -> pathlib.Path:
 
 
 def load_history() -> list[dict[str, Any]]:
-    """Load the current session's messages from the store, else the JSON history file."""
+    """Load the current session's messages from the store, else the JSON history
+    file. A turn interrupted mid-tool-call last time is completed with
+    cancellation results, so the history can be sent again."""
+    messages: list[dict[str, Any]] = []
     if _STORE is not None and _SESSION_ID is not None:
-        return _STORE.load(_SESSION_ID)
-    with contextlib.suppress(Exception), open(history_file_path()) as f:
-        return list(json.load(f))
-    return []
+        messages = _STORE.load(_SESSION_ID)
+    else:
+        with contextlib.suppress(Exception), open(history_file_path()) as f:
+            messages = list(json.load(f))
+    backends.repair_history(messages)
+    return messages
 
 
 def save_history(messages: list[dict[str, Any]]) -> None:
@@ -1748,10 +1813,9 @@ def run_agent_turn(
                     result = parallel[i]
                 else:
                     print_tool_action(tc.name, tc.input)
-                    if tc.name == "python":  # the sandbox can take a while
-                        with thinking_spinner("running python"):
-                            result = run_tool(tc.name, tc.input)
-                    else:
+                    # A tool that outlasts a moment (a search, a command, a page)
+                    # shows the loader; a quick one draws nothing.
+                    with thinking_spinner(f"running {tc.name}", TOOL_SPINNER_DELAY):
                         result = run_tool(tc.name, tc.input)
                 last_tool_error, repeated_tool_error_count, stop = _track_error(
                     result, last_tool_error, repeated_tool_error_count
@@ -1785,6 +1849,8 @@ def run_agent_turn(
             if _STRUCTURED_RESULT and _respond_schema() is not None:
                 return "done"
     except (ui.UserCancelled, KeyboardInterrupt):
+        # Tool calls left without results would make every later request fail.
+        backends.repair_history(messages)
         if ui._agent_tag():
             print(f"{YELLOW}cancelled{RESET}")
             return "cancelled"

@@ -44,6 +44,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import __version__
+
 PROTOCOL_VERSION = "2025-06-18"
 PROJECT_FILES = (pathlib.Path(".wrencode") / "mcp.json", pathlib.Path(".mcp.json"))
 CONNECT_TIMEOUT = float(os.environ.get("WRENCODE_MCP_CONNECT_TIMEOUT", "20"))
@@ -358,7 +360,7 @@ class Server:
                 {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "wrencode", "version": "0.4"},
+                    "clientInfo": {"name": "wrencode", "version": __version__},
                 },
                 CONNECT_TIMEOUT,
             )

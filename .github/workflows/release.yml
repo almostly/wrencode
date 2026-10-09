@@ -50,7 +50,7 @@ jobs:
         run: ${{ matrix.build_prefix }} python -m pip install --upgrade pip pyinstaller certifi
 
       - name: Build single-file binary
-        run: ${{ matrix.build_prefix }} pyinstaller --onefile --name wrencode wrencode.py
+        run: ${{ matrix.build_prefix }} pyinstaller --onefile --name wrencode --paths src src/wrencode/__main__.py
 
       - name: Verify the binary bundles a CA trust store
         run: |

@@ -14,9 +14,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import wrencode_backends as backends
-import wrencode_ui as ui
-from wrencode_ui import DIM, GREEN, RED, RESET, YELLOW
+from . import backends, ui
+from .ui import DIM, GREEN, RED, RESET, YELLOW
 
 
 def _agent_sdk_sessions_file() -> pathlib.Path:

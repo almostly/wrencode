@@ -28,8 +28,7 @@ import urllib.parse
 from collections.abc import Generator
 from typing import Any
 
-import wrencode_backends as backends
-import wrencode_ui as ui
+from . import backends, ui
 
 # The Postgres client, or None when the [history] extra isn't installed.
 psycopg: Any = None

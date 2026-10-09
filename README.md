@@ -14,23 +14,26 @@ Where Claude Code is the batteries-included harness, WrenCode is the **"understa
 
 ## Code layout
 
-Read `wrencode.py` top to bottom to understand the agent; the files beside it are what it calls.
+The package is `src/wrencode/`. Read `app.py` top to bottom to understand the
+agent; the modules beside it are what it calls. The tests are in `tests/`, one
+file per module.
 
-|File                    |What's in it                                                      |
-|------------------------|------------------------------------------------------------------|
-|`wrencode.py`           |The harness: the seven tools, the system prompt, the turn loop, parallel subagents, context compaction, headless mode, `main()`|
-|`wrencode_backends.py`  |Talking to models: backend tables and state, HTTP with retries, request/response formats (Anthropic, OpenAI, Bedrock Converse, local), `get_response()`|
-|`wrencode_configure.py` |Picking a backend and model: the first-run chooser, `/configure` and `/model`, API-key prompts and verification, model lists, saved config|
-|`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
-|`wrencode_permissions.py`|Permission rules: allow and deny by tool and pattern, user and project files|
-|`wrencode_mcp.py`       |MCP client: stdio and HTTP servers, their tools as `mcp__server__tool`|
-|`wrencode_web.py`       |The `fetch` tool: a URL as readable text|
-|`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
-|`wrencode_sandbox.py`   |The `python` tool's sandbox, on pydantic-monty                    |
-|`wrencode_history.py`   |Conversation history in Postgres: a server or embedded PGlite     |
-|`wrencode_synthesize.py`|The `synthesize` subcommand                                       |
+|File              |What's in it                                                      |
+|------------------|------------------------------------------------------------------|
+|`app.py`          |The harness: the tools, the system prompt, the turn loop, parallel subagents, context compaction, headless mode, `main()`|
+|`backends.py`     |Talking to models: backend tables and state, HTTP with retries, streaming, request/response formats (Anthropic, OpenAI, Bedrock Converse, local), usage and prices, `get_response()`|
+|`configure.py`    |Picking a backend and model: the first-run chooser, `/configure` and `/model`, API-key prompts and verification, model lists, saved config|
+|`ui.py`           |The terminal: colors, the line editor with slash-command completion, approvals, the stream printer, Escape-to-cancel, tagged output from parallel subagents|
+|`permissions.py`  |Permission rules: allow and deny by tool and pattern, user and project files|
+|`mcp.py`          |MCP client: stdio and HTTP servers, their tools as `mcp__server__tool`|
+|`web.py`          |The `fetch` tool: a URL as readable text|
+|`sdk.py`          |The `claude-agent-sdk` backend                                    |
+|`sandbox.py`      |The `python` tool's sandbox, on pydantic-monty                    |
+|`history.py`      |Conversation history in Postgres: a server or embedded PGlite     |
+|`synthesize.py`   |The `synthesize` subcommand                                       |
+|`__main__.py`     |`python -m wrencode`, and what the release binary is built from   |
 
-Each module imports only the ones below it in this table's dependency order (`wrencode.py` → backends/configure/sdk/synthesize → ui), so the loop can be read without the rest.
+Each module imports only the ones below it in this table's dependency order (`app` → backends/configure/sdk/synthesize → ui → permissions), so the loop can be read without the rest.
 
 ## Backends
 
@@ -459,9 +462,9 @@ seeing and approving the real action, and opening an untrusted repository is saf
   arguments, never as flags.
 - **A project's `.env` can't reconfigure the agent.** It may set `*_API_KEY` and
   `ANTHROPIC_WORKSPACE_ID` only. The backend, any server URL, auto-approve, and the
-  config, history and workspace locations come from your shell or the `.env` beside
-  `wrencode.py`; the names a project `.env` set, and the ones it tried to, are
-  reported at startup.
+  config, history and workspace locations come from your shell or the `.env` at the
+  root of a source checkout; the names a project `.env` set, and the ones it tried
+  to, are reported at startup.
 - **`AGENTS.md` / `CLAUDE.md` are prompt input.** A repository's instructions go into
   the system prompt by design, which means a repository can steer the agent. The
   approval prompts are the control; the files loaded are listed at startup.
@@ -537,12 +540,14 @@ sudo mv wrencode /usr/local/bin/wrencode
 
 ### Option 2: Run from source
 
-Standard library only (except the backend you choose). `wrencode.py` runs with the
-`wrencode_*.py` modules next to it.
+Standard library only (except the backend you choose). An editable install puts
+the `wrencode` command on your PATH and pulls in nothing else; `python3 -m
+wrencode` with `PYTHONPATH=src` works without installing.
 
 ```bash
 git clone https://github.com/almostly/wrencode
 cd wrencode
+pip install -e .
 ```
 
 For MLX (Mac Silicon):
@@ -597,39 +602,39 @@ wrencode
 # Re-pick the backend at any time
 wrencode --configure
 
-# Or from source — also prompts on first run
-python3 wrencode.py
+# Or from a source checkout (after pip install -e .) — also prompts on first run
+python3 -m wrencode
 
 # Anthropic Claude (model list is fetched live from the API during /configure)
-BACKEND=anthropic python3 wrencode.py
+BACKEND=anthropic python3 -m wrencode
 # Multi-workspace Anthropic keys also need a workspace id:
-# ANTHROPIC_WORKSPACE_ID=wrkspc_... BACKEND=anthropic python3 wrencode.py
+# ANTHROPIC_WORKSPACE_ID=wrkspc_... BACKEND=anthropic python3 -m wrencode
 
 # OpenAI (model list fetched live from the API during /configure)
-BACKEND=openai MODEL=gpt-4o python3 wrencode.py
+BACKEND=openai MODEL=gpt-4o python3 -m wrencode
 
 # OpenRouter
-BACKEND=openrouter MODEL=anthropic/claude-3-haiku python3 wrencode.py
+BACKEND=openrouter MODEL=anthropic/claude-3-haiku python3 -m wrencode
 
 # NanoGPT
-BACKEND=nanogpt MODEL=z-ai/glm-5.3-flash-uncensored python3 wrencode.py
+BACKEND=nanogpt MODEL=z-ai/glm-5.3-flash-uncensored python3 -m wrencode
 
 # Ollama (needs `ollama serve` running and the model pulled)
-BACKEND=ollama MODEL=llama3.2 python3 wrencode.py
+BACKEND=ollama MODEL=llama3.2 python3 -m wrencode
 
 # HuggingFace model
-BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 wrencode.py
+BACKEND=transformers MODEL=deburky/gpt-oss-claude-code python3 -m wrencode
 
 # Local proxy
-BACKEND=local LOCAL_PORT=8082 python3 wrencode.py
+BACKEND=local LOCAL_PORT=8082 python3 -m wrencode
 ```
 
 ## Developing
 
 ```bash
-python3 -m unittest -q test_wrencode   # the test suite (stdlib unittest)
-uvx ruff check . && uvx ruff format .  # lint and format; the rule set is in pyproject.toml
-uvx ty check wrencode*.py              # type check
+python3 -m unittest discover -s tests -t .   # the test suite (stdlib unittest, no install needed)
+uvx ruff check . && uvx ruff format .        # lint and format; the rule set is in pyproject.toml
+uvx ty check src                             # type check
 ```
 
 There are no `# noqa` markers: a rule the design contradicts is turned off in
@@ -693,7 +698,9 @@ What a session looks like, and the keys that drive it.
   stops asking for the rest of the session, `s` saves a rule so this kind of
   action never asks again, `n` asks what to do differently.
 - **Waiting.** The spinner says what is happening (`thinking`, `running
-  python`), how long it has been, and that Escape cancels the turn. On the
+  grep`, `running bash`), how long it has been, and that Escape cancels the
+  turn; a tool that finishes within half a second shows nothing, and a prompt
+  takes the spinner off the line while it waits for you. On the
   Anthropic and OpenAI-style backends the reply then streams in as the model
   writes it, rendered line by line; Escape stops it mid-sentence. The usage
   line still counts the whole request. `WRENCODE_STREAM=0` waits for whole

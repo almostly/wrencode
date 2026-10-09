@@ -18,9 +18,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-import wrencode_backends as backends
-import wrencode_ui as ui
-from wrencode_ui import BLUE, DIM, RED, RESET, YELLOW
+from . import backends, ui
+from .ui import BLUE, DIM, RED, RESET, YELLOW
 
 CUSTOM_MODEL_OPTION = "— type a custom model id —"
 _MLX_UNCHANGED = object()

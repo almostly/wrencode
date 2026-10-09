@@ -12,7 +12,7 @@ Set it up once:
 
 Then pass prompts as arguments, or one per line in a file:
 
-    python examples/agent_sdk_swarm.py "Summarize README.md" "List the TODOs in wrencode.py"
+    python examples/agent_sdk_swarm.py "Summarize README.md" "List the TODOs in src/wrencode/app.py"
     python examples/agent_sdk_swarm.py --tasks tasks.txt --workers 4 --out results.json
     MODEL=claude-sonnet-5-5 WRENCODE_EFFORT=low python examples/agent_sdk_swarm.py ...
 
@@ -32,18 +32,18 @@ import subprocess
 import sys
 import time
 
-WRENCODE = pathlib.Path(__file__).resolve().parents[1] / "wrencode.py"
+SRC = pathlib.Path(__file__).resolve().parents[1] / "src"  # the wrencode package
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def run_task(prompt: str, args: argparse.Namespace) -> dict:
     """Run one prompt through ``wrencode -p`` and return its JSON result."""
-    cmd = [sys.executable, str(WRENCODE), "-p", prompt, "--output-format", "json"]
+    cmd = [sys.executable, "-m", "wrencode", "-p", prompt, "--output-format", "json"]
     if args.max_turns:
         cmd += ["--max-turns", str(args.max_turns)]
     if args.yes:
         cmd.append("--yes")
-    env = {**os.environ, "BACKEND": "claude-agent-sdk"}
+    env = {**os.environ, "BACKEND": "claude-agent-sdk", "PYTHONPATH": str(SRC)}
     started = time.monotonic()
     proc = subprocess.run(  # fixed argv, no shell
         cmd, cwd=args.cwd, env=env, capture_output=True, text=True, check=False
