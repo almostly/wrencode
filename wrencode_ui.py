@@ -264,21 +264,59 @@ def _read_input_char(fd: int) -> str:
     return first.decode("utf-8", errors="replace")
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_LAST_CURSOR_ROW = 0  # the input block's row the cursor was left on by the last draw
+
+
+def _cols() -> int:
+    import shutil
+
+    return max(shutil.get_terminal_size().columns, 20)
+
+
+def _rows_of(length: int, width: int) -> int:
+    """How many terminal rows `length` cells occupy (a full row stays one row)."""
+    return max(1, -(-length // width))
+
+
 def _redraw_input_line(
     text: str,
     matches: list[str] | None = None,
     sel: int = 0,
     hint: str = "",
     cursor: int | None = None,
+    prompt: str | None = None,
 ) -> None:
-    """Redraw the prompt line plus a completion menu or a hint below it, the
-    cursor put back at `cursor` (the end of the text by default).
+    """Redraw the input, which may span lines, plus a completion menu or a hint
+    below it, and put the cursor back at `cursor` (the end by default).
 
-    `hint` is one dim line of context for what's typed (the estimated cost of
-    sending it); it is shown when there is no menu.
+    The first line carries the prompt (the ❯ by default), continuation lines a
+    two-space margin. Rows are counted with wrapping so the cursor lands right
+    on long lines too; `_LAST_CURSOR_ROW` remembers where it was left so the
+    next draw can climb back to the top of the block before clearing it.
     """
-    line = format_input_line(text)
-    out = "\r\033[J" + line
+    global _LAST_CURSOR_ROW
+    width = _cols()
+    lines = text.split("\n")
+    first = format_input_line(lines[0]) if prompt is None else prompt + lines[0]
+    rendered = [first] + [f"  {ln}" for ln in lines[1:]]
+    cur = len(text) if cursor is None else cursor
+    # Which logical line the cursor is on, and its offset in it.
+    line_no, offset = 0, cur
+    for ln in lines:
+        if offset <= len(ln):
+            break
+        offset -= len(ln) + 1
+        line_no += 1
+    rows_before = sum(_rows_of(2 + len(ln), width) for ln in lines[:line_no])
+    cur_row, cur_col = divmod(2 + offset, width)
+    if cur_col == 0 and offset and (2 + offset) % width == 0:
+        cur_row, cur_col = cur_row - 1, width  # sits at the row's edge, pending wrap
+    cursor_row = rows_before + cur_row
+    total_rows = sum(_rows_of(2 + len(ln), width) for ln in lines)
+
+    out = (f"\033[{_LAST_CURSOR_ROW}A" if _LAST_CURSOR_ROW else "") + "\r\033[J"
+    out += "\n".join(rendered)
     below = len(matches or [])
     for i, cmd in enumerate(matches or []):
         desc = SLASH_COMMANDS.get(cmd, "")
@@ -291,17 +329,19 @@ def _redraw_input_line(
     if hint and not matches:
         out += f"\n  {DIM}{hint}{RESET}" if colors_enabled() else f"\n  {hint}"
         below = 1
-    col = 2 + (len(text) if cursor is None else cursor)  # "❯ " is two cells
-    if below:
-        out += f"\033[{below}A\r" + (f"\033[{col}C" if col else "")
-    elif cursor is not None and cursor < len(text):
-        out += "\r" + (f"\033[{col}C" if col else "")
+    up = (total_rows - 1 - cursor_row) + below
+    if up:
+        out += f"\033[{up}A"
+    out += "\r" + (f"\033[{cur_col}C" if cur_col else "")
+    _LAST_CURSOR_ROW = cursor_row
     sys.stdout.write(out)
     sys.stdout.flush()
 
 
 def _read_tty_key(fd: int) -> str:
-    """Read one key; arrow keys return up/down/left/right instead of escape junk."""
+    """Read one key: printable text, or a name for the editing keys (up, down,
+    left, right, home, end, delete, backspace, enter, alt_enter, esc, ctrl_*),
+    or 'paste:' followed by a bracketed paste's text."""
     ch = _read_input_char(fd)
     if not ch:
         return ""
@@ -309,6 +349,8 @@ def _read_tty_key(fd: int) -> str:
         if not select.select([fd], [], [], 0.02)[0]:
             return "esc"
         seq = os.read(fd, 1)
+        if seq in (b"\r", b"\n"):
+            return "alt_enter"
         if seq not in (b"[", b"O"):
             return "esc"
         if not select.select([fd], [], [], 0.02)[0]:
@@ -318,12 +360,30 @@ def _read_tty_key(fd: int) -> str:
             if not select.select([fd], [], [], 0.02)[0]:
                 return "esc"
             code += os.read(fd, 1)
+        if code == b"200~":  # bracketed paste: everything up to ESC [ 201 ~
+            return "paste:" + _read_paste(fd)
         return _CSI_KEYS.get(code, "esc")
     if ch in "\r\n":
         return "enter"
     if ch in ("\x7f", "\x08"):
         return "backspace"
     return _CTRL_KEYS.get(ch, ch)
+
+
+def _read_paste(fd: int) -> str:
+    buf = b""
+    end = b"\x1b[201~"
+    while not buf.endswith(end):
+        if not select.select([fd], [], [], 2.0)[0]:
+            break
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        buf += chunk
+    text = buf.removesuffix(end)
+    return (
+        text.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    )
 
 
 _CSI_KEYS = {
@@ -350,6 +410,149 @@ _CTRL_KEYS = {
 }
 
 
+class LineEditor:
+    """The input buffer and what each key does to it; no terminal of its own.
+
+    The text can span lines: a backslash before Enter, Alt+Enter, or a pasted
+    newline continues on the next line, plain Enter submits. ↑ and ↓ move
+    between lines, or through the input history from the first and last line.
+    `apply(key)` returns the submitted text, or None to keep editing; it raises
+    KeyboardInterrupt on Ctrl+C and EOFError on Ctrl+D with nothing typed.
+    """
+
+    def __init__(self, *, history: bool = False, complete: bool = False) -> None:
+        self.buf: list[str] = []
+        self.cur = 0
+        self.sel = 0
+        self.history = history
+        self.complete = complete
+        self.hist_idx = len(_INPUT_HISTORY)
+
+    @property
+    def text(self) -> str:
+        return "".join(self.buf)
+
+    def matches(self) -> list[str]:
+        return (
+            slash_matches(self.text) if self.complete and "\n" not in self.text else []
+        )
+
+    def set(self, text: str) -> None:
+        self.buf = list(text)
+        self.cur = len(self.buf)
+
+    def _insert(self, text: str) -> None:
+        self.buf[self.cur : self.cur] = list(text)
+        self.cur += len(text)
+        self.sel = 0
+
+    def _line_bounds(self) -> tuple[int, int]:
+        """Start and end offsets of the line the cursor is on."""
+        start = self.text.rfind("\n", 0, self.cur) + 1
+        end = self.text.find("\n", self.cur)
+        return start, (len(self.buf) if end < 0 else end)
+
+    def apply(self, key: str) -> str | None:
+        matches = self.matches()
+        if key == "enter":
+            if self.buf and self.cur == len(self.buf) and self.buf[-1] == "\\":
+                self.buf[-1] = "\n"  # a backslash before Enter continues the line
+                return None
+            text = self.text.strip()
+            if matches and not _is_slash_command(text):
+                text = matches[min(self.sel, len(matches) - 1)]
+            return text
+        if key == "alt_enter":
+            self._insert("\n")
+            return None
+        if key.startswith("paste:"):
+            self._insert(key[6:])
+            return None
+        if matches and key in {"\t", "right"}:
+            self.set(matches[min(self.sel, len(matches) - 1)])
+            self.sel = 0
+            return None
+        if matches and key in {"up", "down"}:
+            step = -1 if key == "up" else 1
+            self.sel = (min(self.sel, len(matches) - 1) + step) % len(matches)
+            return None
+        if key == "backspace":
+            if self.cur:
+                del self.buf[self.cur - 1]
+                self.cur -= 1
+                self.sel = 0
+            return None
+        if key == "delete":
+            if self.cur < len(self.buf):
+                del self.buf[self.cur]
+            return None
+        if key == "left":
+            self.cur = max(self.cur - 1, 0)
+            return None
+        if key == "right":
+            self.cur = min(self.cur + 1, len(self.buf))
+            return None
+        if key in {"home", "end"}:
+            start, end = self._line_bounds()
+            self.cur = start if key == "home" else end
+            return None
+        if key == "ctrl_w":  # delete the word before the cursor
+            start = self.cur
+            while start and self.buf[start - 1] == " ":
+                start -= 1
+            while start and self.buf[start - 1] not in " \n":
+                start -= 1
+            del self.buf[start : self.cur]
+            self.cur = start
+            return None
+        if key == "ctrl_u":  # delete to the start of the line
+            start, _ = self._line_bounds()
+            del self.buf[start : self.cur]
+            self.cur = start
+            return None
+        if key == "ctrl_k":  # delete to the end of the line
+            _, end = self._line_bounds()
+            del self.buf[self.cur : end]
+            return None
+        if key == "ctrl_c":
+            raise KeyboardInterrupt
+        if key == "ctrl_d":
+            if not self.buf:
+                raise EOFError
+            return None
+        if key in {"up", "down"}:
+            start, end = self._line_bounds()
+            if key == "up" and start > 0:  # a line above: move to it
+                col = self.cur - start
+                prev_start = self.text.rfind("\n", 0, start - 1) + 1
+                self.cur = min(prev_start + col, start - 1)
+                return None
+            if key == "down" and end < len(self.buf):
+                col = self.cur - start
+                next_end = self.text.find("\n", end + 1)
+                next_end = len(self.buf) if next_end < 0 else next_end
+                self.cur = min(end + 1 + col, next_end)
+                return None
+            if not self.history:
+                return None
+            if key == "up" and self.hist_idx > 0:
+                self.hist_idx -= 1
+                self.set(_INPUT_HISTORY[self.hist_idx])
+            elif key == "down" and self.hist_idx < len(_INPUT_HISTORY):
+                self.hist_idx += 1
+                self.set(
+                    _INPUT_HISTORY[self.hist_idx]
+                    if self.hist_idx < len(_INPUT_HISTORY)
+                    else ""
+                )
+            return None
+        if key == "esc":
+            return None
+        if len(key) == 1 and (key.isprintable() or key == "\t"):
+            self._insert(key)
+        return None
+
+
 def _read_tty_line(
     prompt: str,
     *,
@@ -358,53 +561,42 @@ def _read_tty_line(
     complete: bool = False,
     hint: Callable[[str], str] | None = None,
 ) -> str:
-    """Read one line in cbreak mode; swallows arrow keys unless history=True.
+    """Read input in cbreak mode with the LineEditor's keys; see LineEditor.
 
     With complete=True, typing a /prefix shows matching slash commands below
     the line: ↑↓ pick, Tab or → fills in, Enter runs the highlighted one.
     `hint(text)` returns a dim line to show under what's typed (empty for none);
-    it is asked again on every keystroke, so it should be cheap.
+    it is asked again on every keystroke, so it should be cheap. Pastes keep
+    their line breaks (bracketed paste is enabled while reading).
     """
+    global _LAST_CURSOR_ROW
     import termios
     import tty
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    buf: list[str] = []
-    cur = 0  # the cursor: where the next character goes
-    hist_idx = len(_INPUT_HISTORY)
-    sel = 0
-
-    def _matches() -> list[str]:
-        return slash_matches("".join(buf)) if complete else []
+    editor = LineEditor(history=history, complete=complete)
 
     def _hint() -> str:
-        text = "".join(buf)
+        text = editor.text
         if hint is None or not text or text.startswith("/"):
             return ""
         return hint(text)
 
     def _redraw() -> None:
-        if complete:
-            _redraw_input_line("".join(buf), _matches(), sel, _hint(), cur)
-        elif redraw is not None:
-            redraw("".join(buf))
-        else:
-            text = "".join(buf)
-            back = len(text) - cur
-            sys.stdout.write(
-                "\r\033[K" + prompt + text + (f"\033[{back}D" if back else "")
+        if redraw is not None:
+            redraw(editor.text)
+        elif complete:
+            _redraw_input_line(
+                editor.text, editor.matches(), editor.sel, _hint(), editor.cur
             )
-            sys.stdout.flush()
+        else:
+            _redraw_input_line(editor.text, cursor=editor.cur, prompt=prompt)
 
-    def _set(text: str) -> None:
-        nonlocal buf, cur
-        buf = list(text)
-        cur = len(buf)
-
+    _LAST_CURSOR_ROW = 0
     try:
         tty.setcbreak(fd)
-        sys.stdout.write(prompt)
+        sys.stdout.write("\033[?2004h")  # bracketed paste on
         sys.stdout.flush()
         _redraw()
         while True:
@@ -413,100 +605,26 @@ def _read_tty_line(
             key = _read_tty_key(fd)
             if not key:
                 raise EOFError
-            matches = _matches()
-            if key == "enter":
-                text = "".join(buf).strip()
-                if matches and not _is_slash_command(text):
-                    text = matches[min(sel, len(matches) - 1)]
-                if complete:  # clear the menu, leave the final line
-                    _redraw_input_line(text)
+            try:
+                submitted = editor.apply(key)
+            except (KeyboardInterrupt, EOFError):
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return text
-            if matches and key in {"\t", "right"}:
-                _set(matches[min(sel, len(matches) - 1)])
-                sel = 0
-                _redraw()
-                continue
-            if matches and key in {"up", "down"}:
-                step = -1 if key == "up" else 1
-                sel = (min(sel, len(matches) - 1) + step) % len(matches)
-                _redraw()
-                continue
-            if key == "backspace":
-                if cur:
-                    del buf[cur - 1]
-                    cur -= 1
-                    sel = 0
-                    _redraw()
-                continue
-            if key == "delete":
-                if cur < len(buf):
-                    del buf[cur]
-                    _redraw()
-                continue
-            if key in {"left", "right", "home", "end"}:
-                cur = {
-                    "left": max(cur - 1, 0),
-                    "right": min(cur + 1, len(buf)),
-                    "home": 0,
-                    "end": len(buf),
-                }[key]
-                _redraw()
-                continue
-            if key == "ctrl_w":  # delete the word before the cursor
-                start = cur
-                while start and buf[start - 1] == " ":
-                    start -= 1
-                while start and buf[start - 1] != " ":
-                    start -= 1
-                del buf[start:cur]
-                cur = start
-                _redraw()
-                continue
-            if key == "ctrl_u":  # delete to the start of the line
-                del buf[:cur]
-                cur = 0
-                _redraw()
-                continue
-            if key == "ctrl_k":  # delete to the end of the line
-                del buf[cur:]
-                _redraw()
-                continue
-            if key == "ctrl_c":
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                raise KeyboardInterrupt
-            if key == "ctrl_d":
-                if not buf:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    raise EOFError
-                continue
-            if key == "up" and history and _INPUT_HISTORY:
-                if hist_idx > 0:
-                    hist_idx -= 1
-                    _set(_INPUT_HISTORY[hist_idx])
-                    _redraw()
-                continue
-            if key == "down" and history:
-                if hist_idx < len(_INPUT_HISTORY):
-                    hist_idx += 1
-                    _set(
-                        _INPUT_HISTORY[hist_idx]
-                        if hist_idx < len(_INPUT_HISTORY)
-                        else ""
+                raise
+            if submitted is not None:
+                # Leave the final text on screen without the menu or hint.
+                if redraw is None:
+                    _redraw_input_line(
+                        submitted if complete else editor.text,
+                        prompt=None if complete else prompt,
                     )
-                    _redraw()
-                continue
-            if key in ("up", "down", "esc"):
-                continue
-            if len(key) == 1 and (key.isprintable() or key == "\t"):
-                buf.insert(cur, key)
-                cur += 1
-                sel = 0
-                _redraw()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return submitted
+            _redraw()
     finally:
+        sys.stdout.write("\033[?2004l")
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
@@ -921,9 +1039,6 @@ class StreamPrinter:
             sys.stdout.write("\n")
         sys.stdout.write("\n")
         sys.stdout.flush()
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def print_agent_message(text: str) -> None:

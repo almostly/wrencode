@@ -3493,7 +3493,7 @@ class TestIntuitiveUI(unittest.TestCase):
                 end = sys.stdout.getvalue()
         self.assertTrue(mid.endswith("hello\r\033[4C"), repr(mid))  # "❯ " + 2
         self.assertTrue(hinted.endswith("\033[1A\r\033[4C"), repr(hinted))
-        self.assertTrue(end.endswith("hello"), repr(end))
+        self.assertTrue(end.endswith("hello\r\033[7C"), repr(end))  # cursor at the end
 
     def test_errors_get_a_sentence_and_a_next_step(self):
         self.assertIn("/configure", ui.explain_error('HTTP 401: {"type":"error"}'))
@@ -3838,6 +3838,121 @@ class TestStreaming(unittest.TestCase):
             p.close()
             self.assertEqual(sys.stdout.getvalue(), "")
         self.assertFalse(p.started)
+
+
+class TestLineEditor(unittest.TestCase):
+    """The input buffer: single and multi-line editing without a terminal."""
+
+    def _run(self, keys, **kw):
+        ed = ui.LineEditor(**kw)
+        out = None
+        for k in keys:
+            out = ed.apply(k)
+        return ed, out
+
+    def test_typing_and_submit(self):
+        _ed, out = self._run([*list("hi"), "enter"])
+        self.assertEqual(out, "hi")
+
+    def test_backslash_enter_continues_and_enter_submits_everything(self):
+        _ed, out = self._run([*list("one\\"), "enter", *list("two"), "enter"])
+        self.assertEqual(out, "one\ntwo")
+
+    def test_alt_enter_and_paste_insert_newlines(self):
+        _ed, out = self._run(
+            [*list("a"), "alt_enter", *list("b"), "paste:x\ny", "enter"]
+        )
+        self.assertEqual(out, "a\nbx\ny")
+
+    def test_up_and_down_move_between_lines_before_touching_history(self):
+        ui._INPUT_HISTORY[:] = ["older"]
+        try:
+            ed, _ = self._run(["paste:first line\nsecond"], history=True)
+            self.assertEqual(ed.cur, len("first line\nsecond"))
+            ed.apply("up")
+            self.assertEqual(ed.cur, 6)  # same column on the first line
+            ed.apply("down")
+            self.assertEqual(ed.cur, len("first line\n") + 6)
+            ed.apply("home")
+            self.assertEqual(ed.cur, len("first line\n"))
+            ed.apply("end")
+            self.assertEqual(ed.cur, len("first line\nsecond"))
+            ed.apply("up")
+            ed.apply("up")  # from the first line: history
+            self.assertEqual(ed.text, "older")
+            ed.apply("down")
+            self.assertEqual(ed.text, "")
+        finally:
+            ui._INPUT_HISTORY.clear()
+
+    def test_word_and_line_deletes_stay_on_their_line(self):
+        ed, _ = self._run(["paste:keep this\ndrop that"])
+        ed.apply("ctrl_w")
+        self.assertEqual(ed.text, "keep this\ndrop ")
+        ed.apply("ctrl_u")
+        self.assertEqual(ed.text, "keep this\n")
+        ed.apply("up")
+        ed.apply("ctrl_k")
+        self.assertEqual(ed.text, "\n")
+
+    def test_slash_menu_only_on_a_single_line(self):
+        ed, _ = self._run(list("/mo"), complete=True)
+        self.assertEqual(ed.matches(), ["/model"])
+        self.assertEqual(ed.apply("enter"), "/model")
+        ed2, _ = self._run([*list("/mo"), "alt_enter"], complete=True)
+        self.assertEqual(ed2.matches(), [])
+
+    def test_control_keys_raise(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(["ctrl_c"])
+        with self.assertRaises(EOFError):
+            self._run(["ctrl_d"])
+        ed, out = self._run([*list("x"), "ctrl_d"])
+        self.assertEqual((ed.text, out), ("x", None))
+
+    def _key(self, raw: bytes) -> str:
+        r, w = os.pipe()
+        try:
+            os.write(w, raw)
+            os.close(w)
+            return ui._read_tty_key(r)
+        finally:
+            os.close(r)
+
+    def test_alt_enter_and_bracketed_paste_are_decoded(self):
+        self.assertEqual(self._key(b"\x1b\r"), "alt_enter")
+        self.assertEqual(
+            self._key(b"\x1b[200~line one\r\nline two\x1b[201~"),
+            "paste:line one\nline two",
+        )
+
+    def test_multi_line_draw_counts_wrapped_rows(self):
+        with (
+            mock.patch.object(ui, "colors_enabled", return_value=False),
+            mock.patch.object(ui, "_cols", return_value=20),
+        ):
+            ui._LAST_CURSOR_ROW = 0
+            with mock.patch("sys.stdout", io.StringIO()):
+                # first line wraps to two rows (2 + 25 cells); cursor at the start of line two
+                ui._redraw_input_line("a" * 25 + "\nbb", cursor=26)
+                out = sys.stdout.getvalue()
+            self.assertEqual(ui._LAST_CURSOR_ROW, 2)
+            self.assertTrue(
+                out.startswith("\r\x1b[J❯ " + "a" * 25 + "\n  bb"), repr(out[:20])
+            )
+            self.assertTrue(
+                out.endswith("\r\x1b[2C"), repr(out[-12:])
+            )  # cursor after the margin
+            with mock.patch("sys.stdout", io.StringIO()):
+                ui._redraw_input_line(
+                    "a" * 25 + "\nbb", cursor=3
+                )  # back up two rows first
+                out = sys.stdout.getvalue()
+            self.assertTrue(out.startswith("\x1b[2A\r\x1b[J"), repr(out[:12]))
+            self.assertTrue(
+                out.endswith("\x1b[2A\r\x1b[5C"), repr(out[-12:])
+            )  # row 0, col 2+3
+            self.assertEqual(ui._LAST_CURSOR_ROW, 0)
 
 
 class TestSpeed(unittest.TestCase):

@@ -586,8 +586,11 @@ What a session looks like, and the keys that drive it.
   replies instead; headless runs and Bedrock always do.
 - **The prompt.** `←` `→` move, `Home`/`End` or `Ctrl-A`/`Ctrl-E` jump,
   `Ctrl-W` deletes the word before the cursor, `Ctrl-U` to the start of the
-  line, `Ctrl-K` to the end, `↑`/`↓` walk the input history. While you type,
-  a dim line estimates the input cost of sending the message.
+  line, `Ctrl-K` to the end, `↑`/`↓` walk the input history. A message can
+  span lines: end a line with `\` and press Enter, press `Alt-Enter`, or
+  paste text with line breaks (they are kept). `↑`/`↓` then move between the
+  lines, and Enter sends the whole message. While you type, a dim line
+  estimates the input cost of sending it.
 - **Pickers.** Models and sessions are picked with `↑`/`↓` and Enter; Escape
   cancels, a number jumps. Without a terminal they fall back to a numbered
   prompt.
