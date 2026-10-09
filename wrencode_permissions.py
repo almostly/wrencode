@@ -10,6 +10,7 @@ where `*` matches anything and a trailing `:*` means "this prefix". Examples:
     edit(src/*)           any file under src/
     write(.env)           that file
     mcp(github:*)         any tool of the MCP server named github
+    fetch(docs.python.org/*)  any page on that host
 
 Deny rules win over allow rules, over "allow all for this session" and over
 --yes. Allow rules come from two files, user-wide `permissions.json` in the
@@ -29,7 +30,7 @@ import pathlib
 import re
 from dataclasses import dataclass
 
-TOOLS = ("bash", "edit", "write", "mcp")
+TOOLS = ("bash", "edit", "write", "mcp", "fetch")
 PROJECT_FILE = pathlib.Path(".wrencode") / "permissions.json"
 _RULE = re.compile(r"^(?P<tool>[a-z]+)\((?P<pattern>.*)\)$", re.DOTALL)
 
@@ -79,6 +80,8 @@ def suggest(tool: str, subject: str) -> str:
         return f"bash({' '.join(words[:2])}:*)"
     if tool == "mcp":  # server:tool -> that tool
         return f"mcp({subject.strip()})"
+    if tool == "fetch":  # host/path -> that host
+        return f"fetch({subject.split('/', 1)[0]}/*)"
     path = pathlib.PurePosixPath(subject.strip())
     if str(path.parent) == ".":  # a file at the root: just that file
         return f"{tool}({path})"

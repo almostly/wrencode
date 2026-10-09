@@ -329,6 +329,15 @@ HTTP_RETRIES = int(os.environ.get("WRENCODE_HTTP_RETRIES", "2"))
 # Stream replies token by token where the API can (Anthropic and OpenAI-format
 # backends); WRENCODE_STREAM=0 waits for whole replies instead.
 STREAM = os.environ.get("WRENCODE_STREAM", "1").lower() not in ("0", "false", "no")
+# Anthropic's server-side web search, offered to Claude on the anthropic backend;
+# WRENCODE_WEB_SEARCH=0 leaves it out. Each search is billed on top of tokens.
+WEB_SEARCH = os.environ.get("WRENCODE_WEB_SEARCH", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+WEB_SEARCH_TOOL: dict[str, Any] = {"type": "web_search_20260209", "name": "web_search"}
+WEB_SEARCH_USD = 0.01  # $10 per 1,000 searches
 
 
 # -----------------------------------------------------------------------------------------------
@@ -689,6 +698,7 @@ class Usage:
     turn_cost: float = 0.0
     turn_unpriced: int = 0
     turn_seconds: float = 0.0
+    turn_searches: int = 0
     session_uncached: int = 0
     session_cache_read: int = 0
     session_cache_write: int = 0
@@ -697,6 +707,7 @@ class Usage:
     session_cost: float = 0.0
     unpriced_calls: int = 0
     session_seconds: float = 0.0
+    session_searches: int = 0
     prev_rate: float = 0.0
     call_started: float = 0.0  # time.monotonic() when the current request began
     prompt: int = 0
@@ -707,7 +718,7 @@ class Usage:
         if self.turn_seconds:
             self.prev_rate = self.turn_rate()
         self.turn_uncached = self.turn_cache_read = self.turn_cache_write = 0
-        self.turn_out = self.turn_calls = self.turn_unpriced = 0
+        self.turn_out = self.turn_calls = self.turn_unpriced = self.turn_searches = 0
         self.turn_cost = self.turn_seconds = 0.0
 
     def begin_call(self) -> None:
@@ -740,7 +751,10 @@ class Usage:
         out: int,
         cost: float | None = None,
         seconds: float = 0.0,
+        searches: int = 0,
     ) -> None:
+        self.turn_searches += searches
+        self.session_searches += searches
         self.turn_uncached += uncached
         self.turn_cache_read += cache_read
         self.turn_cache_write += cache_write
@@ -780,6 +794,8 @@ class Usage:
             d["cost_usd"] = round(self.session_cost, 6)
         if self.session_seconds:
             d["output_tokens_per_second"] = round(self.session_rate(), 1)
+        if self.session_searches:
+            d["web_searches"] = self.session_searches
         return d
 
 
@@ -801,6 +817,12 @@ def _record_usage(data: dict[str, Any]) -> None:
         cache_read = int(u.get("cache_read_input_tokens") or 0)
         cache_write = int(u.get("cache_creation_input_tokens") or 0)
         out = int(u.get("output_tokens") or 0)
+        server = u.get("server_tool_use") or {}
+        searches = (
+            int(server.get("web_search_requests") or 0)
+            if isinstance(server, dict)
+            else 0
+        )
     else:  # OpenAI chat format: prompt_tokens includes the cached ones
         details = u.get("prompt_tokens_details") or {}
         cache_read = (
@@ -809,10 +831,13 @@ def _record_usage(data: dict[str, Any]) -> None:
         uncached = max(int(u.get("prompt_tokens") or 0) - cache_read, 0)
         cache_write = 0
         out = int(u.get("completion_tokens") or 0)
+    searches = locals().get("searches", 0)
     cost = call_cost(price_for(), uncached, cache_read, cache_write, out)
+    if cost is not None and searches:
+        cost += searches * WEB_SEARCH_USD
     seconds = time.monotonic() - USAGE.call_started if USAGE.call_started else 0.0
     USAGE.call_started = 0.0
-    USAGE.add(uncached, cache_read, cache_write, out, cost, seconds)
+    USAGE.add(uncached, cache_read, cache_write, out, cost, seconds, searches)
 
 
 def _count(n: int) -> str:
@@ -939,6 +964,11 @@ def usage_report() -> list[str]:
         f"input = uncached + cached (read) + written"
     )
     lines.append(price_note())
+    if u.session_searches:
+        lines.append(
+            f"web searches: {u.turn_searches} this turn, {u.session_searches} this session "
+            f"(${WEB_SEARCH_USD * 1000:.0f} per 1,000)"
+        )
     if u.turn_seconds or u.session_seconds:
         speed = f"speed: {_speed(u.session_rate())} this session"
         if u.turn_seconds:
@@ -1236,13 +1266,17 @@ def _http_stream(
 
 
 def _stream_anthropic(
-    events: Iterator[dict[str, Any]], on_text: Callable[[str], None]
+    events: Iterator[dict[str, Any]],
+    on_text: Callable[[str], None],
+    on_block: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Assemble a streamed Messages reply into the shape a plain request returns.
 
     Text deltas go to `on_text` as they arrive. Every block is kept whole, with
     tool inputs parsed from their JSON deltas and thinking blocks carrying their
-    signature, so the message can go back into history unchanged.
+    signature, so the message can go back into history unchanged. Server-side
+    tool blocks (a web search and its results) are passed to `on_block` as each
+    completes, so they can be shown in order.
     """
     message: dict[str, Any] = {"role": "assistant", "content": []}
     blocks: list[dict[str, Any]] = message["content"]
@@ -1254,7 +1288,7 @@ def _stream_anthropic(
             message["content"] = blocks
         elif kind == "content_block_start":
             block = dict(event.get("content_block") or {})
-            if block.get("type") == "tool_use":
+            if block.get("type") in ("tool_use", "server_tool_use"):
                 partial[int(event.get("index", len(blocks)))] = ""
             blocks.append(block)
         elif kind == "content_block_delta":
@@ -1287,6 +1321,12 @@ def _stream_anthropic(
                     blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
                 except ValueError:
                     blocks[index]["input"] = {}
+            if (
+                on_block is not None
+                and 0 <= index < len(blocks)
+                and str(blocks[index].get("type", "")) in SERVER_BLOCKS
+            ):
+                on_block(blocks[index])
         elif kind == "message_delta":
             message.update({k: v for k, v in (event.get("delta") or {}).items()})
             usage = event.get("usage") or {}
@@ -1300,6 +1340,25 @@ def _stream_anthropic(
         with contextlib.suppress(ValueError):
             blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
     return message
+
+
+# Blocks a server-side tool leaves in a reply: what Claude searched and what came back.
+SERVER_BLOCKS: frozenset[str] = frozenset({"server_tool_use", "web_search_tool_result"})
+
+
+def describe_server_block(block: dict[str, Any]) -> str:
+    """One line for a server-side tool block: the search, or how many results."""
+    kind = block.get("type")
+    if kind == "server_tool_use":
+        query = (block.get("input") or {}).get("query", "")
+        return f"{block.get('name', 'server tool')} {json.dumps(query, ensure_ascii=False)}"
+    content = block.get("content")
+    if isinstance(content, dict):  # an error
+        return f"search failed: {content.get('error_code', 'error')}"
+    results = [c for c in (content or []) if isinstance(c, dict) and c.get("url")]
+    titles = ", ".join(str(c.get("title") or c["url"])[:40] for c in results[:3])
+    more = f" (+{len(results) - 3})" if len(results) > 3 else ""
+    return f"{len(results)} results: {titles}{more}" if results else "no results"
 
 
 def _stream_openai(
@@ -1634,6 +1693,7 @@ def get_response(
     mlx_state: tuple[Any, Any] | None,
     tools: list[ToolSpec] | None = None,
     on_text: Callable[[str], None] | None = None,
+    on_block: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Generate a response from the configured backend given the message history.
 
@@ -1705,6 +1765,11 @@ def get_response(
         defs = _build_tool_schemas("anthropic", tools or [])
         if defs:
             defs[-1] = {**defs[-1], "cache_control": {"type": "ephemeral"}}
+        if WEB_SEARCH and BACKEND == "anthropic" and tools:
+            defs = [
+                dict(WEB_SEARCH_TOOL),
+                *defs,
+            ]  # first, so the cache marker stays last
         payload = {
             "model": MODEL,
             "system": [
@@ -1726,6 +1791,7 @@ def get_response(
                     API_BASE, {**payload, "stream": True}, _anthropic_headers()
                 ),
                 on_text,
+                on_block,
             )
         else:
             data = _http_post(API_BASE, payload, _anthropic_headers())

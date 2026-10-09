@@ -1073,6 +1073,15 @@ class StreamPrinter:
             sys.stdout.write(lead + rendered + "\n")
         sys.stdout.flush()
 
+    def note(self, line: str) -> None:
+        """Print a line of its own (a tool the server ran) between streamed text."""
+        if self._line:
+            self._finish_line(self._line)
+            self._line = ""
+            self._shown = 0
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
     def close(self) -> None:
         """End the reply: finish the last line and leave a blank one."""
         if not self.started:

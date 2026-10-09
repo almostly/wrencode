@@ -116,6 +116,7 @@ import wrencode_sandbox as sandbox
 import wrencode_sdk as agent_sdk
 import wrencode_synthesize as synthesize
 import wrencode_ui as ui
+import wrencode_web as web
 from wrencode_ui import BOLD, BRIGHT_CYAN, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 # -----------------------------------------------------------------------------------------------
@@ -498,11 +499,30 @@ def grep(args: dict[str, Any]) -> str:
     return body
 
 
+def _server_block_line(block: dict[str, Any]) -> str:
+    """How a server-side tool block is shown: a search as a tool line, its results under it."""
+    text = ui.visible(backends.describe_server_block(block))
+    if block.get("type") == "server_tool_use":
+        return f"{ui.TOOL_MARK} {text}"
+    return f"{DIM}  ⎿ {text}{RESET}"
+
+
+def _server_block_printer(
+    printer: ui.StreamPrinter, spinner: Any
+) -> Callable[[dict[str, Any]], None]:
+    def show(block: dict[str, Any]) -> None:
+        spinner.stop()
+        printer.note(_server_block_line(block))
+
+    return show
+
+
 def get_response_cancellable(
     messages: list[dict[str, Any]],
     system_prompt: str,
     mlx_state: tuple[Any, Any] | None,
     on_text: Callable[[str], None] | None = None,
+    on_block: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Run get_response in a worker thread so Escape can interrupt blocking calls."""
     if ui._agent_tag():  # a parallel subagent: the batch owner watches for Escape
@@ -518,7 +538,7 @@ def get_response_cancellable(
         try:
             result.append(
                 backends.get_response(
-                    messages, system_prompt, mlx_state, tool_specs(), on_text
+                    messages, system_prompt, mlx_state, tool_specs(), on_text, on_block
                 )
             )
         except BaseException as exc:  # propagate to caller
@@ -824,7 +844,27 @@ def python(args: dict[str, Any]) -> str:
     return sandbox.run(code, workspace=root, functions=functions)
 
 
-# An eighth tool when pydantic-monty is installed (pip install 'wrencode[sandbox]').
+def fetch(args: dict[str, Any]) -> str:
+    """Fetch a URL as text, after approval (the URL is sent to its server)."""
+    url = _require_str(args, "url")
+    offset = int(args.get("offset") or 0)
+    approval = ui.confirm("fetch", f"Fetch {web.subject(url)}?", web.subject(url))
+    if approval != "ok":
+        return approval
+    return web.fetch(url, offset)
+
+
+TOOLS["fetch"] = (
+    (
+        "Fetch a web page or URL and return its text: HTML reduced to headings, "
+        "text, lists and link targets; JSON and plain text as is. Long pages come "
+        "back in pieces: pass offset to continue"
+    ),
+    {"url": "string", "offset": "number?"},
+    fetch,
+)
+
+# A ninth tool when pydantic-monty is installed (pip install 'wrencode[sandbox]').
 if sandbox.available():
     TOOLS["python"] = (
         (
@@ -905,6 +945,11 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     if name == "task":
         prompt = str(args.get("prompt", "")).strip()
         return f"task {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
+    if name == "fetch":
+        offset = args.get("offset")
+        return f"fetch {args.get('url', '?')}" + (
+            f"  offset={offset}" if offset else ""
+        )
     if name == "python":
         code = str(args.get("code", "")).strip()
         lines = code.split("\n")
@@ -1500,6 +1545,7 @@ Available tools:
 - glob(pat): Find files matching pattern
 - grep(pat): Search for text in files
 - bash(cmd): Run a shell command
+- fetch(url, offset): Read a web page or URL as text; pass offset to continue a long page
 - task(prompt): Delegate a self-contained subtask to a fresh subagent; returns only its result. Several task calls in one reply run in parallel, so batch independent subtasks together
 {python_line}{mcp_lines}
 {respond_line}{tool_format}
@@ -1594,6 +1640,7 @@ def run_agent_turn(
                         system_prompt,
                         mlx_state,
                         printer.feed if printer else None,
+                        _server_block_printer(printer, spinner) if printer else None,
                     )
             except Exception as err:
                 if printer is not None:
@@ -1610,8 +1657,16 @@ def run_agent_turn(
             display_text, tool_calls, raw_data = _parse_response(response_text)
             if printer is not None and printer.started:
                 printer.close()  # already on screen as it streamed
-            elif display_text:
-                ui.print_agent_message(display_text)
+            else:
+                if raw_data is not None and printer is None:
+                    for block in raw_data.get("content") or []:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") in backends.SERVER_BLOCKS
+                        ):
+                            print(_server_block_line(block))
+                if display_text:
+                    ui.print_agent_message(display_text)
             if (
                 not tool_calls
                 and raw_data is not None
@@ -1648,6 +1703,12 @@ def run_agent_turn(
                     {"role": "user", "content": GARBLED_NUDGE.format(why=garbled)}
                 )
                 continue
+            if (
+                not tool_calls
+                and raw_data is not None
+                and raw_data.get("stop_reason") == "pause_turn"
+            ):
+                continue  # a server-side tool loop paused; sending again resumes it
             if not tool_calls:
                 if _respond_schema() is None or _STRUCTURED_RESULT:
                     return "done"

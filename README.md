@@ -24,6 +24,7 @@ Read `wrencode.py` top to bottom to understand the agent; the files beside it ar
 |`wrencode_ui.py`        |The terminal: colors, input with slash-command completion, approvals, Escape-to-cancel, tagged output from parallel subagents|
 |`wrencode_permissions.py`|Permission rules: allow and deny by tool and pattern, user and project files|
 |`wrencode_mcp.py`       |MCP client: stdio and HTTP servers, their tools as `mcp__server__tool`|
+|`wrencode_web.py`       |The `fetch` tool: a URL as readable text|
 |`wrencode_sdk.py`       |The `claude-agent-sdk` backend                                    |
 |`wrencode_sandbox.py`   |The `python` tool's sandbox, on pydantic-monty                    |
 |`wrencode_history.py`   |Conversation history in Postgres: a server or embedded PGlite     |
@@ -118,6 +119,7 @@ The agent has access to seven tools:
 - **glob** - find files by pattern, sorted by modification time
 - **grep** - search files for a regex pattern using `rg` when available, falling back to `grep`
 - **bash** - run a shell command with timeout and streaming output
+- **fetch** - read a web page or URL as text, with approval (see Web access)
 - **task** - delegate a self-contained subtask to a fresh subagent (its own context, same tools) that returns only its final result
 - **python** - run a snippet of Python in a sandbox, with `pydantic-monty` installed (see below)
 
@@ -350,6 +352,24 @@ the file changes, it asks again. Its deny rules apply regardless.
 own); `/permissions forget <rule>` removes it. Pressing `s` at a prompt saves the
 rule offered there: the command's first two words as a prefix, or the edited
 file's directory.
+
+## Web access
+
+Two ways to the web, like Claude Code's:
+
+- **`fetch(url)`**, a tool on every backend. It gets the page, follows
+  redirects, reduces HTML to its text with headings, lists, code and link
+  targets kept, passes JSON and plain text through, and summarizes anything
+  else. Long pages come back in pieces through `offset`. Fetching sends the URL
+  to its server, so it asks for approval like a command; rules such as
+  `fetch(docs.python.org/*)` apply. `WRENCODE_FETCH_MAX_CHARS` (40,000) and
+  `WRENCODE_FETCH_MAX_BYTES` (4 MB) bound a page.
+- **Web search** on the Anthropic backend, through Anthropic's server-side
+  search tool. Claude searches and reads results on Anthropic's side; the
+  transcript shows each search and its results under it, and each search is
+  billed at $10 per 1,000 on top of tokens, counted in the usage line, `/usage`
+  and the headless result. `WRENCODE_WEB_SEARCH=0` turns it off. Other backends
+  have no search unless an MCP server provides one.
 
 ## MCP servers
 
@@ -689,6 +709,8 @@ What a session looks like, and the keys that drive it.
 |`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
 |`WRENCODE_STREAM`            |`1`                    |Stream replies as they are written (Anthropic and OpenAI-style backends)|
 |`WRENCODE_MCP_TIMEOUT`       |`120`                  |Seconds an MCP tool call may take|
+|`WRENCODE_WEB_SEARCH`        |`1`                    |Offer Anthropic's web search to Claude (anthropic backend)|
+|`WRENCODE_FETCH_MAX_CHARS`   |`40000`                |Characters of a fetched page returned per call|
 |`WRENCODE_MCP_CONNECT_TIMEOUT`|`20`                  |Seconds to connect to an MCP server|
 |`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
