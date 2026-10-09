@@ -18,7 +18,9 @@ import pathlib
 import shutil
 import socket
 import subprocess
+import threading
 import time
+import urllib.parse
 from collections.abc import Generator
 from typing import Any
 
@@ -31,6 +33,8 @@ with contextlib.suppress(ImportError):
     import psycopg
 
 DATABASE_URL = os.environ.get("WRENCODE_DATABASE_URL", "")
+# A second Postgres that receives a copy of every saved session (see Mirror).
+MIRROR_URL = os.environ.get("WRENCODE_MIRROR_URL", "")
 # PGlite and its wire-protocol server, pinned; installed once into ~/.wrencode/pglite.
 PGLITE_PACKAGES = {
     "@electric-sql/pglite": "0.3.3",
@@ -43,6 +47,7 @@ UNAVAILABLE_REASON = ""
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id         BIGSERIAL PRIMARY KEY,
+    uid        TEXT NOT NULL UNIQUE DEFAULT gen_random_uuid()::text,
     workspace  TEXT NOT NULL,
     backend    TEXT NOT NULL,
     model      TEXT NOT NULL,
@@ -240,6 +245,7 @@ class Store:
     def __init__(self, dsn: str, server: EmbeddedPGlite | None = None) -> None:
         self.dsn = dsn
         self.server = server
+        self.mirror: Mirror | None = None
         self._connection: Any = None
 
     def _connect(self) -> Any:
@@ -304,7 +310,17 @@ class Store:
         return [dict(r[0]) for r in rows]
 
     def save(self, session_id: int, messages: list[dict[str, Any]]) -> None:
-        """Replace the session's messages with `messages` (the loop's whole list)."""
+        """Replace the session's messages with `messages` (the loop's whole list).
+
+        With a mirror, the committed snapshot is queued for it afterwards.
+        """
+        row = self._save(session_id, messages)
+        if self.mirror is not None and row is not None:
+            self.mirror.enqueue(row, messages)
+
+    def _save(
+        self, session_id: int, messages: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
         rows = [
             (
                 session_id,
@@ -333,6 +349,90 @@ class Store:
                 "UPDATE sessions SET updated_at = now(), title = COALESCE(title, NULLIF(%s, '')) WHERE id = %s",
                 (" ".join(title.split())[:80], session_id),
             )
+            return self._session_row(conn, session_id)
+
+    def _session_row(self, conn: Any, session_id: int) -> dict[str, Any] | None:
+        r = self._run(
+            conn,
+            "SELECT uid, workspace, backend, model, title, created_at, updated_at "
+            "FROM sessions WHERE id = %s",
+            (session_id,),
+        ).fetchone()
+        if r is None:
+            return None
+        keys = (
+            "uid",
+            "workspace",
+            "backend",
+            "model",
+            "title",
+            "created_at",
+            "updated_at",
+        )
+        return dict(zip(keys, r))
+
+    def upsert(self, row: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+        """Apply a session snapshot from another store, matched by its uid (the mirror side)."""
+        with self._conn() as conn:
+            sid = self._run(
+                conn,
+                """
+                INSERT INTO sessions (uid, workspace, backend, model, title, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (uid) DO UPDATE SET workspace = EXCLUDED.workspace,
+                    backend = EXCLUDED.backend, model = EXCLUDED.model,
+                    title = EXCLUDED.title, updated_at = EXCLUDED.updated_at
+                RETURNING id
+                """,
+                tuple(
+                    row[k]
+                    for k in (
+                        "uid",
+                        "workspace",
+                        "backend",
+                        "model",
+                        "title",
+                        "created_at",
+                        "updated_at",
+                    )
+                ),
+            ).fetchone()[0]
+            self._run(conn, "DELETE FROM messages WHERE session_id = %s", (sid,))
+            for i, m in enumerate(messages):
+                self._run(
+                    conn,
+                    "INSERT INTO messages (session_id, seq, role, message, text) "
+                    "VALUES (%s, %s, %s, %s::jsonb, %s)",
+                    (
+                        sid,
+                        i,
+                        str(m.get("role", "")),
+                        json.dumps(m),
+                        backends.flatten_content(m.get("content") or ""),
+                    ),
+                )
+
+    def sync(self, workspace: str, timeout: float = 30.0) -> tuple[int, int]:
+        """Queue every session of `workspace` for the mirror and wait for the queue to drain.
+
+        Returns (sessions queued, still pending when the wait ended).
+        """
+        if self.mirror is None:
+            return 0, 0
+        with self._conn() as conn:
+            ids = [
+                int(r[0])
+                for r in self._run(
+                    conn, "SELECT id FROM sessions WHERE workspace = %s", (workspace,)
+                ).fetchall()
+            ]
+        for sid in ids:
+            with self._conn() as conn:
+                row = self._session_row(conn, sid)
+            if row is not None:
+                self.mirror.enqueue(row, self.load(sid))
+        self.mirror.flush(timeout)
+        return len(ids), self.mirror.pending()
 
     def sessions(self, workspace: str, limit: int = 10) -> list[dict[str, Any]]:
         with self._conn() as conn:
@@ -375,12 +475,112 @@ class Store:
         return [{"session_id": int(r[0]), "role": r[1], "text": r[2]} for r in rows]
 
     def close(self) -> None:
+        if self.mirror is not None:
+            self.mirror.close()
         if self._connection is not None:
             with contextlib.suppress(Exception):
                 self._connection.close()
             self._connection = None
         if self.server is not None:
             self.server.stop()
+
+
+def redact(url: str) -> str:
+    """A connection URL shown without its credentials: host, port and database only."""
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "mirror"
+    if not u.hostname:
+        return "mirror"
+    port = f":{u.port}" if u.port else ""
+    return f"{u.hostname}{port}/{u.path.lstrip('/')}"
+
+
+class Mirror:
+    """A write-through copy of the history in a second Postgres.
+
+    Snapshots are applied by a worker thread, so a slow or unreachable mirror never
+    holds up the loop. Only the latest snapshot per session is kept pending; a
+    failure is reported once, retried with backoff, and /sync queues everything
+    again. The primary store is always the truth.
+    """
+
+    def __init__(self, remote: Store, label: str = "mirror") -> None:
+        self.remote = remote
+        self.label = label
+        self.failing = False
+        self._pending: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ready = False
+
+    def enqueue(self, row: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self._pending[row["uid"]] = (row, list(messages))
+            self._idle.clear()
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+        self._wake.set()
+
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def flush(self, timeout: float) -> bool:
+        """Wait until nothing is pending, or `timeout` seconds; True when drained."""
+        self._wake.set()
+        return self._idle.wait(timeout)
+
+    def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            with self._lock:
+                item = next(iter(self._pending.items()), None)
+            if item is None:
+                self._idle.set()
+                self._wake.wait()
+                self._wake.clear()
+                continue
+            uid, (row, messages) = item
+            try:
+                if not self._ready:
+                    self.remote.init_schema()
+                    self._ready = True
+                self.remote.upsert(row, messages)
+            except Exception as err:  # keep the snapshot, say so once, retry later
+                if not self.failing:
+                    self.failing = True
+                    print(
+                        f"{ui.YELLOW}History mirror {self.label} unreachable "
+                        f"({ui.visible(str(err).splitlines()[0][:120])}); retrying, "
+                        f"/sync copies everything once it is back{ui.RESET}"
+                    )
+                self._wake.wait(backoff)
+                self._wake.clear()
+                backoff = min(backoff * 2, 60.0)
+                continue
+            backoff = 1.0
+            if self.failing:
+                self.failing = False
+                print(f"{ui.DIM}History mirror {self.label} is back{ui.RESET}")
+            with self._lock:  # drop it unless a newer snapshot arrived meanwhile
+                if self._pending.get(uid, (None, None))[1] is messages:
+                    del self._pending[uid]
+
+    def close(self) -> None:
+        """Give pending snapshots a few seconds, then stop; /sync recovers the rest."""
+        if self._thread is not None:
+            self.flush(5.0)
+            self._stop.set()
+            self._wake.set()
+            self._thread.join(timeout=2.0)
+        self.remote.close()
 
 
 def open_store() -> Store | None:
@@ -406,4 +606,6 @@ def open_store() -> Store | None:
             server.stop()
         UNAVAILABLE_REASON = str(err)
         return None
+    if MIRROR_URL:  # connects lazily, from its worker, so an outage can't block startup
+        store.mirror = Mirror(Store(MIRROR_URL), label=redact(MIRROR_URL))
     return store

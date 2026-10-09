@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from email.message import Message
 from typing import Any, ClassVar
@@ -2641,16 +2642,103 @@ class TestHistoryStore(unittest.TestCase):
         self.assertIn("capacitor", hits[0]["text"])
         self.assertEqual(self.store.search(a, "nomatchxyz"), [])
 
+    def test_mirror_copies_sessions_to_a_second_postgres(self):
+        with tempfile.TemporaryDirectory() as d:
+            remote_server = history.EmbeddedPGlite(pathlib.Path(d) / "pglite")
+            remote = history.Store(remote_server.start(), remote_server)
+            mirror = history.Mirror(remote, label="second")
+            self.store.mirror = mirror
+            try:
+                ws = "/work/mirrored"
+                sid = self.store.new_session(ws, "openai", "gpt-x")
+                msgs = [{"role": "user", "content": "copy me"}]
+                self.store.save(sid, msgs)
+                self.assertTrue(mirror.flush(30))
+                rows = remote.sessions(ws)
+                self.assertEqual(
+                    [(r["title"], r["chats"]) for r in rows], [("copy me", 1)]
+                )
+                self.assertEqual(remote.load(rows[0]["id"]), msgs)
+                # a later save replaces the copy; /sync re-queues everything
+                self.store.save(sid, [*msgs, {"role": "assistant", "content": "done"}])
+                self.assertTrue(mirror.flush(30))
+                self.assertEqual(len(remote.load(rows[0]["id"])), 2)
+                queued, left = self.store.sync(ws)
+                self.assertEqual((queued, left), (1, 0))
+                self.assertEqual(
+                    len(remote.sessions(ws)), 1
+                )  # matched by uid, not duplicated
+            finally:
+                self.store.mirror = None
+                mirror.close()
+
     def test_data_survives_a_server_restart(self):
         ws = "/work/persist"
         sid = self.store.new_session(ws, "x", "y")
         self.store.save(sid, [{"role": "user", "content": "keep me"}])
-        self.server.stop()
+        self.store.close()  # the connection and the server
         server = history.EmbeddedPGlite(self.root)
         store = history.Store(server.start(), server)
         type(self).server, type(self).store = server, store  # for the other tests
         self.assertEqual(store.latest_session(ws), sid)
         self.assertEqual(store.load(sid)[0]["content"], "keep me")
+
+
+class TestMirrorQueue(unittest.TestCase):
+    """The mirror's worker: coalescing, retry after failure, and never blocking the caller."""
+
+    class FlakyRemote:
+        def __init__(self, failures):
+            self.failures = failures
+            self.applied = []
+            self.schema_inits = 0
+
+        def init_schema(self):
+            self.schema_inits += 1
+
+        def upsert(self, row, messages):
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("connection refused")
+            self.applied.append((row["uid"], list(messages)))
+
+        def close(self):
+            pass
+
+    def test_latest_snapshot_wins_and_failures_are_retried(self):
+        remote = self.FlakyRemote(failures=1)
+        mirror = history.Mirror(remote, label="fake")
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            mirror.enqueue({"uid": "u1"}, [{"role": "user", "content": "v1"}])
+            mirror.enqueue({"uid": "u1"}, [{"role": "user", "content": "v2"}])
+            self.assertTrue(mirror.flush(10))
+            mirror.close()
+        self.assertEqual(remote.applied, [("u1", [{"role": "user", "content": "v2"}])])
+        self.assertEqual(remote.schema_inits, 1)
+        self.assertIn("unreachable", out.getvalue())
+        self.assertIn("is back", out.getvalue())
+        self.assertFalse(mirror.failing)
+
+    def test_enqueue_never_blocks_on_a_dead_remote(self):
+        remote = self.FlakyRemote(failures=10**6)
+        mirror = history.Mirror(remote, label="dead")
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            t0 = time.monotonic()
+            for i in range(50):
+                mirror.enqueue({"uid": f"u{i}"}, [])
+            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertFalse(mirror.flush(0.3))
+            self.assertEqual(mirror.pending(), 50)
+            mirror._stop.set()
+            mirror._wake.set()
+        self.assertEqual(out.getvalue().count("unreachable"), 1)
+
+    def test_redact_hides_credentials(self):
+        self.assertEqual(
+            history.redact("postgres://alice:s3cret@db.example.com:5433/wren"),
+            "db.example.com:5433/wren",
+        )
+        self.assertEqual(history.redact("host=/tmp/x dbname=postgres"), "mirror")
 
 
 class TestHistoryWiring(unittest.TestCase):
@@ -2707,6 +2795,21 @@ class TestHistoryWiring(unittest.TestCase):
         wrencode.handle_slash_command("/search hi", [], None)
         self.assertIn("hi there", sys.stdout.getvalue())
         self.store.search.assert_called_with(mock.ANY, "hi")
+
+    def test_sync_reports_the_mirror(self):
+        self.store.mirror = None
+        wrencode.handle_slash_command("/sync", [], None)
+        self.assertIn("No mirror configured", sys.stdout.getvalue())
+        self.store.mirror = mock.Mock(label="db.example.com/wren")
+        self.store.sync.return_value = (3, 0)
+        wrencode.handle_slash_command("/sync", [{"role": "user", "content": "x"}], None)
+        self.assertIn(
+            "Mirrored 3 sessions to db.example.com/wren", sys.stdout.getvalue()
+        )
+        self.store.save.assert_called()  # the current conversation is saved first
+        self.store.sync.return_value = (3, 2)
+        wrencode.handle_slash_command("/sync", [], None)
+        self.assertIn("2 still pending", sys.stdout.getvalue())
 
     def test_without_the_store_the_commands_explain(self):
         with mock.patch.object(wrencode, "_STORE", None):

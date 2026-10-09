@@ -1732,7 +1732,7 @@ def handle_slash_command(
             save_history(messages)
             ui.print_system("Cleared")
         return "handled", configure._MLX_UNCHANGED
-    if cmd in {"/sessions", "/resume", "/search"} or cmd.startswith(
+    if cmd in {"/sessions", "/resume", "/search", "/sync"} or cmd.startswith(
         ("/resume ", "/search ")
     ):
         _history_command(cmd, messages)
@@ -1924,7 +1924,7 @@ def run_headless(
 
 
 def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
-    """/sessions, /resume <id> and /search <text>, over the Postgres history store."""
+    """/sessions, /resume <id>, /search <text> and /sync, over the Postgres history store."""
     global _SESSION_ID
     if _STORE is None:
         ui.print_system(
@@ -1945,6 +1945,22 @@ def _history_command(cmd: str, messages: list[dict[str, Any]]) -> None:
                 f"{mark} #{r['id']:<5} {when}  {r['chats']:>3} chats  {title}"
             )
         ui.print_system("/resume <id> continues one; /search <text> looks inside them.")
+    elif word == "/sync":
+        if _STORE.mirror is None:
+            ui.print_system(
+                "No mirror configured. Set WRENCODE_MIRROR_URL to a second Postgres to "
+                "keep a copy of the history there."
+            )
+            return
+        save_history(messages)
+        queued, left = _STORE.sync(ws)
+        if left:
+            ui.print_system(
+                f"Queued {queued} sessions for {_STORE.mirror.label}; {left} still "
+                f"pending (the mirror is slow or unreachable; they retry in the background)"
+            )
+        else:
+            ui.print_system(f"Mirrored {queued} sessions to {_STORE.mirror.label}")
     elif word == "/resume":
         if not arg.isdigit():
             ui.print_system("Usage: /resume <id>  (ids from /sessions)")
@@ -2004,7 +2020,7 @@ def print_help() -> None:
     print("synthesize diff|log ...  diff = divergences only; log = decision timeline")
     print("synthesize --out FILE    write the result to FILE; --all skips the picker\n")
     print(
-        "Slash commands: /backend /model /c /compact /sessions /resume /search /q  (see /help)"
+        "Slash commands: /backend /model /c /compact /sessions /resume /search /sync /q"
     )
     print(
         "Environment overrides: BACKEND, MODEL, and the backend's API key "
@@ -2121,6 +2137,10 @@ def main() -> None:
         chats = sum(1 for m in messages if m.get("role") == "user")
         where = f"session #{_SESSION_ID} with " if _STORE is not None else ""
         print(f"{DIM}Restored {where}{chats} chats{RESET}")
+    if _STORE is not None and _STORE.mirror is not None:
+        print(
+            f"{DIM}History mirrored to {_STORE.mirror.label} (/sync copies everything now){RESET}"
+        )
 
     while True:
         try:

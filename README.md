@@ -500,6 +500,7 @@ This publishes release assets:
 |`/sessions`   |List this project's conversations (Postgres history)|
 |`/resume <id>`|Continue an earlier conversation             |
 |`/search <text>`|Search past conversations                  |
+|`/sync`       |Copy this project's history to the mirror now (Postgres history)|
 |`/compact`    |Summarize history to reduce context          |
 |`/quit`, `/q` or `/exit`|Quit                                |
 
@@ -515,6 +516,7 @@ Type `/` to see matching commands: ↑↓ pick, Tab completes, Enter runs.
 |`WRENCODE_WORKSPACE`         |cwd                    |Root directory for file operations|
 |`WRENCODE_HISTORY_FILE`      |`~/.wrencode/history.json`|Conversation history file, without the Postgres store|
 |`WRENCODE_DATABASE_URL`      |-                      |Postgres URL for history; unset, embedded PGlite is used|
+|`WRENCODE_MIRROR_URL`        |-                      |A second Postgres that receives a copy of every saved session|
 |`WRENCODE_PGLITE_START_TIMEOUT`|`60`                 |Seconds to wait for the embedded PGlite to start|
 |`WRENCODE_UNRESTRICTED_PATHS`|`0`                    |Allow paths outside workspace     |
 |`WRENCODE_AUTO_APPROVE`      |`0`                    |Skip y/N confirmation for writes/commands (headless; also `--yes`)|
@@ -574,6 +576,20 @@ Two engines, both real Postgres:
 Each session stores its message list exactly as the backend format needs it
 (JSONB), replaced whole on every save, so switching backends mid-history behaves as
 it always has. Headless runs (`-p`) never read or write history.
+
+### Mirroring to another Postgres
+
+PGlite has a real write-ahead log but, as a single-user engine, no replication
+protocol: nothing can subscribe to it. wrencode replicates at the application level
+instead, which is exact because it owns every write and saves each session whole.
+Set `WRENCODE_MIRROR_URL=postgres://user:pass@host/db` and every saved session is
+copied there, matched by a stable session uid, from a background thread so a slow or
+unreachable mirror never holds up the loop. Only the latest snapshot per session is
+kept pending; an outage is reported once, retried with backoff, and `/sync` queues
+the whole project's history again and waits for it. The mirror has the same schema,
+so it can serve as `WRENCODE_DATABASE_URL` for another machine. Like the other
+settings that steer wrencode, the mirror URL is read from your shell, never from a
+project's `.env`.
 
 ## License
 
