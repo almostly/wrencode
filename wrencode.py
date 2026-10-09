@@ -811,7 +811,7 @@ if sandbox.available():
     TOOLS["python"] = (
         (
             "Run a Python snippet in a sandbox: no network, shell or environment, a "
-            "standard-library subset (no os.walk or os.listdir), the workspace "
+            "standard-library subset: pathlib and re yes, os.path, os.walk and os.listdir no; the workspace "
             "read-only at /workspace (the working directory, so open('x.py') works). "
             "Functions available: glob(pat) -> list of workspace-relative paths, "
             "read(path) -> the file's text, grep(pat) -> list of 'path:line:text'. "
@@ -1373,7 +1373,7 @@ Examples:
     if "python" in TOOLS:
         python_line = (
             "- python(code): Run a Python snippet in a sandbox: no network, shell or "
-            "environment, a standard-library subset (no os.walk or os.listdir), the "
+            "environment, a standard-library subset (pathlib and re yes; os.path, os.walk and os.listdir no), the "
             "workspace read-only at /workspace (the working directory). Functions: "
             "glob(pat) -> list of workspace-relative paths, read(path) -> the file's "
             "text, grep(pat) -> list of 'path:line:text'. Each call is a fresh "
