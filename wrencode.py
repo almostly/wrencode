@@ -500,6 +500,7 @@ def get_response_cancellable(
     messages: list[dict[str, Any]],
     system_prompt: str,
     mlx_state: tuple[Any, Any] | None,
+    on_text: Callable[[str], None] | None = None,
 ) -> str:
     """Run get_response in a worker thread so Escape can interrupt blocking calls."""
     if ui._agent_tag():  # a parallel subagent: the batch owner watches for Escape
@@ -514,7 +515,9 @@ def get_response_cancellable(
     def worker() -> None:
         try:
             result.append(
-                backends.get_response(messages, system_prompt, mlx_state, tool_specs())
+                backends.get_response(
+                    messages, system_prompt, mlx_state, tool_specs(), on_text
+                )
             )
         except BaseException as exc:  # propagate to caller
             error.append(exc)
@@ -984,12 +987,35 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
         return f"error: {e}"
 
 
+class _Spinner:
+    """Handle on a running loader: stop() clears it, once, from any thread."""
+
+    def __init__(self, stop: threading.Event, thread: threading.Thread) -> None:
+        self._stop = stop
+        self._thread = thread
+        self._lock = threading.Lock()
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._stop.set()
+            self._thread.join(timeout=0.4)
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+
+
+_NO_SPINNER = _Spinner(threading.Event(), threading.Thread())
+_NO_SPINNER._stop.set()
+
+
 @contextlib.contextmanager
 def thinking_spinner(activity: str = "thinking") -> Any:
     """Loader on the line below the user's input: what is happening, for how
-    long, and that Escape cancels."""
+    long, and that Escape cancels. Yields a handle whose stop() clears it early
+    (when the first streamed token arrives)."""
     if not sys.stdout.isatty() or ui._agent_tag():  # parallel agents share the screen
-        yield
+        yield _NO_SPINNER
         return
 
     stop = threading.Event()
@@ -1008,13 +1034,11 @@ def thinking_spinner(activity: str = "thinking") -> Any:
 
     thread = threading.Thread(target=animate, daemon=True)
     thread.start()
+    handle = _Spinner(stop, thread)
     try:
-        yield
+        yield handle
     finally:
-        stop.set()
-        thread.join(timeout=0.4)
-        sys.stdout.write("\r\033[2K")
-        sys.stdout.flush()
+        handle.stop()
 
 
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
@@ -1126,6 +1150,18 @@ def tool_specs() -> list[backends.ToolSpec]:
     if (respond_schema := _respond_schema()) is not None:
         specs.append((RESPOND_TOOL, RESPOND_DESCRIPTION, respond_schema))
     return specs
+
+
+def _streams_here() -> bool:
+    """Whether this turn's reply can be shown as it arrives: an interactive
+    terminal, not a parallel subagent, and a backend that streams."""
+    return (
+        backends.STREAM
+        and sys.stdout.isatty()
+        and sys.stdin.isatty()
+        and not ui._agent_tag()
+        and backends.BACKEND in backends.STREAMING_BACKENDS
+    )
 
 
 def _parse_response(
@@ -1527,12 +1563,20 @@ def run_agent_turn(
                 backends.CONTEXT_TOKENS * COMPACT_AT
             ):
                 auto_compact(messages, mlx_state)
+            printer: ui.StreamPrinter | None = None
             try:
-                with thinking_spinner():
+                with thinking_spinner() as spinner:
+                    if _streams_here():
+                        printer = ui.StreamPrinter(on_first=spinner.stop)
                     response_text = get_response_cancellable(
-                        messages, system_prompt, mlx_state
+                        messages,
+                        system_prompt,
+                        mlx_state,
+                        printer.feed if printer else None,
                     )
             except Exception as err:
+                if printer is not None:
+                    printer.close()
                 # The window guess was too big: compact once and retry the round.
                 if retried_overflow or not _CONTEXT_ERROR.search(str(err)):
                     raise
@@ -1543,7 +1587,9 @@ def run_agent_turn(
                 continue
             retried_overflow = False
             display_text, tool_calls, raw_data = _parse_response(response_text)
-            if display_text:
+            if printer is not None and printer.started:
+                printer.close()  # already on screen as it streamed
+            elif display_text:
                 ui.print_agent_message(display_text)
             if (
                 not tool_calls

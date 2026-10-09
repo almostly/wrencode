@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -184,6 +185,12 @@ NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset(
 OPENAI_FORMAT_BACKENDS: frozenset[str] = frozenset(
     {"openai", "nanogpt", "openai-compatible"}
 )
+# Backends whose replies can be streamed over server-sent events: the Anthropic
+# Messages API and OpenAI-style chat completions. Bedrock's Converse stream is
+# a binary event stream and the local proxy is left whole.
+STREAMING_BACKENDS: frozenset[str] = frozenset(
+    {"anthropic", "openai", "nanogpt", "openai-compatible", "openrouter", "ollama"}
+)
 # Hosted backends reached over HTTP (vs. in-process local-ml weights). Bedrock
 # is kind "aws" so it isn't in API_BACKENDS, but it's still a network call, and
 # openai-compatible servers are often hosted (Hugging Face) or remote.
@@ -319,6 +326,9 @@ HTTP_TIMEOUT = float(os.environ.get("WRENCODE_HTTP_TIMEOUT", "600"))
 # transcript `synthesize` sends. Set it for local models with small windows.
 CONTEXT_TOKENS = int(os.environ.get("WRENCODE_CONTEXT_TOKENS", "128000"))
 HTTP_RETRIES = int(os.environ.get("WRENCODE_HTTP_RETRIES", "2"))
+# Stream replies token by token where the API can (Anthropic and OpenAI-format
+# backends); WRENCODE_STREAM=0 waits for whole replies instead.
+STREAM = os.environ.get("WRENCODE_STREAM", "1").lower() not in ("0", "false", "no")
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1171,6 +1181,177 @@ def _http_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> An
     return _http_post_raw(url, json.dumps(payload).encode(), headers)
 
 
+def _http_stream(
+    url: str, payload: dict[str, Any], headers: dict[str, str]
+) -> Iterator[dict[str, Any]]:
+    """POST a JSON payload and yield the JSON objects of its server-sent events.
+
+    The request is retried like _http_post_raw until the first byte arrives;
+    after that an error ends the stream. Lines other than `data:` (event
+    names, comments, keep-alives) and the `[DONE]` marker are skipped.
+    """
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers=headers
+    )
+    for attempt in range(HTTP_RETRIES + 1):
+        wait = 2 ** (attempt + 1)
+        try:
+            resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            body = ui.visible(e.read().decode(errors="replace"))
+            if e.code in {429, 500, 502, 503, 504} and attempt < HTTP_RETRIES:
+                print(
+                    f"{YELLOW}HTTP {e.code}, retrying in {wait}s{RESET}",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"HTTP {e.code}: {body}") from e
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            if attempt == HTTP_RETRIES:
+                raise
+            reason = getattr(e, "reason", None) or e
+            print(
+                f"{YELLOW}Network error ({reason}), retrying in {wait}s{RESET}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+        with resp:
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    yield event
+        return
+    raise AssertionError("unreachable")
+
+
+def _stream_anthropic(
+    events: Iterator[dict[str, Any]], on_text: Callable[[str], None]
+) -> dict[str, Any]:
+    """Assemble a streamed Messages reply into the shape a plain request returns.
+
+    Text deltas go to `on_text` as they arrive. Every block is kept whole, with
+    tool inputs parsed from their JSON deltas and thinking blocks carrying their
+    signature, so the message can go back into history unchanged.
+    """
+    message: dict[str, Any] = {"role": "assistant", "content": []}
+    blocks: list[dict[str, Any]] = message["content"]
+    partial: dict[int, str] = {}
+    for event in events:
+        kind = event.get("type")
+        if kind == "message_start":
+            message.update(event.get("message") or {})
+            message["content"] = blocks
+        elif kind == "content_block_start":
+            block = dict(event.get("content_block") or {})
+            if block.get("type") == "tool_use":
+                partial[int(event.get("index", len(blocks)))] = ""
+            blocks.append(block)
+        elif kind == "content_block_delta":
+            index = int(event.get("index", len(blocks) - 1))
+            while index >= len(blocks):
+                blocks.append({"type": "text", "text": ""})
+            block = blocks[index]
+            delta = event.get("delta") or {}
+            dtype = delta.get("type")
+            if dtype == "text_delta":
+                text = str(delta.get("text", ""))
+                block["text"] = block.get("text", "") + text
+                if text:
+                    on_text(text)
+            elif dtype == "input_json_delta":
+                partial[index] = partial.get(index, "") + str(
+                    delta.get("partial_json", "")
+                )
+            elif dtype == "thinking_delta":
+                block["thinking"] = block.get("thinking", "") + str(
+                    delta.get("thinking", "")
+                )
+            elif dtype == "signature_delta":
+                block["signature"] = str(delta.get("signature", ""))
+        elif kind == "content_block_stop":
+            index = int(event.get("index", -1))
+            if index in partial:
+                raw = partial.pop(index)
+                try:
+                    blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
+                except ValueError:
+                    blocks[index]["input"] = {}
+        elif kind == "message_delta":
+            message.update({k: v for k, v in (event.get("delta") or {}).items()})
+            usage = event.get("usage") or {}
+            message["usage"] = {**message.get("usage", {}), **usage}
+        elif kind == "error":
+            err = event.get("error") or {}
+            raise RuntimeError(
+                f"stream error: {err.get('type', '')}: {err.get('message', '')}"
+            )
+    for index, raw in partial.items():  # a stream cut before the block closed
+        with contextlib.suppress(ValueError):
+            blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
+    return message
+
+
+def _stream_openai(
+    events: Iterator[dict[str, Any]], on_text: Callable[[str], None]
+) -> dict[str, Any]:
+    """Assemble streamed chat-completion chunks into one choice with its usage."""
+    text = ""
+    calls: dict[int, dict[str, Any]] = {}
+    finish = None
+    usage: dict[str, Any] = {}
+    for chunk in events:
+        if chunk.get("error"):
+            err = chunk["error"]
+            raise RuntimeError(
+                f"stream error: {err.get('message', err) if isinstance(err, dict) else err}"
+            )
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                text += piece
+                on_text(piece)
+            for tc in delta.get("tool_calls") or []:
+                i = int(tc.get("index", 0))
+                call = calls.setdefault(
+                    i,
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if tc.get("id"):
+                    call["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    call["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    call["function"]["arguments"] += fn["arguments"]
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+    message: dict[str, Any] = {"role": "assistant", "content": text or None}
+    if calls:
+        message["tool_calls"] = [calls[i] for i in sorted(calls)]
+    return {
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": usage,
+    }
+
+
 # -----------------------------------------------------------------------------------------------
 # AWS Bedrock: credentials + SigV4 request signing (stdlib only — no boto3)
 # -----------------------------------------------------------------------------------------------
@@ -1437,16 +1618,30 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # -----------------------------------------------------------------------------------------------
 # Inference
 # -----------------------------------------------------------------------------------------------
+def _openai_request(
+    payload: dict[str, Any], on_text: Callable[[str], None] | None
+) -> dict[str, Any]:
+    """A chat-completion request, streamed when a text callback is given."""
+    if on_text is None or not STREAM:
+        return _http_post(API_BASE, payload, _openai_headers())
+    streamed = {**payload, "stream": True, "stream_options": {"include_usage": True}}
+    return _stream_openai(_http_stream(API_BASE, streamed, _openai_headers()), on_text)
+
+
 def get_response(
     messages: list[dict[str, Any]],
     system_prompt: str,
     mlx_state: tuple[Any, Any] | None,
     tools: list[ToolSpec] | None = None,
+    on_text: Callable[[str], None] | None = None,
 ) -> str:
     """Generate a response from the configured backend given the message history.
 
     `tools` are offered to backends with native tool calling; the XML-in-text
     backends get their tool instructions from the system prompt instead.
+    With `on_text`, hosted Anthropic and OpenAI-format backends stream: each
+    piece of reply text is passed to it as it arrives, and the reply is still
+    returned whole afterwards, in the same shape as an unstreamed one.
     """
     flat = [
         {"role": m["role"], "content": flatten_content(m["content"])} for m in messages
@@ -1455,8 +1650,7 @@ def get_response(
 
     # OpenAI - native function calling
     if BACKEND in OPENAI_FORMAT_BACKENDS:
-        data = _http_post(
-            API_BASE,
+        data = _openai_request(
             {
                 "model": MODEL,
                 "messages": [
@@ -1468,24 +1662,23 @@ def get_response(
                 "tools": _build_tool_schemas("openai", tools or []),
                 "tool_choice": "auto",
             },
-            _openai_headers(),
+            on_text,
         )
         return json.dumps(data)  # return raw for agent loop to parse natively
 
     # OpenRouter / Ollama - OpenAI-compatible chat completions (no native tools)
     if BACKEND in {"openrouter", "ollama"}:
-        data = _http_post(
-            API_BASE,
+        data = _openai_request(
             {
                 "model": MODEL,
                 "messages": [{"role": "system", "content": system_prompt}, *flat],
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.3,
             },
-            _openai_headers(),
+            on_text,
         )
         _record_usage(data)
-        return str(data["choices"][0]["message"]["content"])
+        return str(data["choices"][0]["message"]["content"] or "")
 
     # AWS Bedrock — model-agnostic Converse API (Claude, Llama, Nova, GPT-OSS…).
     if BACKEND == "bedrock":
@@ -1512,25 +1705,30 @@ def get_response(
         defs = _build_tool_schemas("anthropic", tools or [])
         if defs:
             defs[-1] = {**defs[-1], "cache_control": {"type": "ephemeral"}}
-        data = _http_post(
-            API_BASE,
-            {
-                "model": MODEL,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                "messages": messages,
-                "max_tokens": CLAUDE_MAX_TOKENS,
-                "tools": defs,
-                "cache_control": {"type": "ephemeral"},
-                **_claude_output_config(),
-            },
-            _anthropic_headers(),
-        )
+        payload = {
+            "model": MODEL,
+            "system": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": messages,
+            "max_tokens": CLAUDE_MAX_TOKENS,
+            "tools": defs,
+            "cache_control": {"type": "ephemeral"},
+            **_claude_output_config(),
+        }
+        if on_text is not None and STREAM:
+            data = _stream_anthropic(
+                _http_stream(
+                    API_BASE, {**payload, "stream": True}, _anthropic_headers()
+                ),
+                on_text,
+            )
+        else:
+            data = _http_post(API_BASE, payload, _anthropic_headers())
         return json.dumps(data)  # return raw for agent loop to parse natively
 
     # Local proxy - Anthropic messages API; tool calls returned as XML <tool_call> tags in text

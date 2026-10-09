@@ -579,7 +579,11 @@ What a session looks like, and the keys that drive it.
   and green, headed by the file and line; then one question, `Apply to
   app.py?  Enter yes · a always · n no`. `n` asks what to do differently.
 - **Waiting.** The spinner says what is happening (`thinking`, `running
-  python`), how long it has been, and that Escape cancels the turn.
+  python`), how long it has been, and that Escape cancels the turn. On the
+  Anthropic and OpenAI-style backends the reply then streams in as the model
+  writes it, rendered line by line; Escape stops it mid-sentence. The usage
+  line still counts the whole request. `WRENCODE_STREAM=0` waits for whole
+  replies instead; headless runs and Bedrock always do.
 - **The prompt.** `←` `→` move, `Home`/`End` or `Ctrl-A`/`Ctrl-E` jump,
   `Ctrl-W` deletes the word before the cursor, `Ctrl-U` to the start of the
   line, `Ctrl-K` to the end, `↑`/`↓` walk the input history. While you type,
@@ -616,6 +620,7 @@ What a session looks like, and the keys that drive it.
 |`WRENCODE_EFFORT`            |-                      |Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`|
 |`WRENCODE_SHOW_USAGE`        |`1`                    |Print the usage line after each turn and the cost estimate while typing|
 |`WRENCODE_THEME`             |auto                   |`light` or `dark`: picks the prose and code tints (auto reads `COLORFGBG`)|
+|`WRENCODE_STREAM`            |`1`                    |Stream replies as they are written (Anthropic and OpenAI-style backends)|
 |`WRENCODE_PRICE`             |-                      |Price of the current model, USD per million tokens: `input,output[,cache_read[,cache_write]]`|
 |`WRENCODE_HTTP_TIMEOUT`      |`600`                  |Seconds to wait for a model response|
 |`WRENCODE_HTTP_RETRIES`      |`2`                    |Retries on HTTP 429/5xx and network errors, with backoff|

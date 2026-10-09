@@ -823,6 +823,109 @@ def render_markdown(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)  # one blank line around a block, not two
 
 
+class StreamPrinter:
+    """Print a reply as it streams, rendered line by line.
+
+    The first piece opens the reply with the dot, like print_agent_message.
+    Text is shown as it arrives; once a line is complete it is rendered
+    (inline code, bold, headings), redrawn in place when it fits on one row.
+    Fenced code is drawn with the gutter and tint as its lines complete.
+    `on_first` runs before the first character is printed (to stop a spinner).
+    """
+
+    def __init__(self, on_first: Callable[[], None] | None = None) -> None:
+        self.on_first = on_first
+        self.started = False
+        self._line = ""  # the line in progress, raw
+        self._shown = 0  # how much of it is already on screen
+        self._fence = False
+        self._first_line = True
+        self._cur_lead = "  "  # what the line in progress was opened with
+
+    def _lead(self) -> str:
+        self._cur_lead = f"{AGENT_MARK} " if self._first_line else "  "
+        self._first_line = False
+        return self._cur_lead
+
+    def feed(self, text: str) -> None:
+        if not text:
+            return
+        if not self.started:
+            self.started = True
+            if self.on_first is not None:
+                self.on_first()
+        self._line += visible(text)
+        while "\n" in self._line:
+            line, self._line = self._line.split("\n", 1)
+            self._finish_line(line)
+            self._shown = 0
+        self._show_partial()
+
+    def _show_partial(self) -> None:
+        if self._shown == 0 and (self._line or not self._fence):
+            if not self._line:
+                return
+            sys.stdout.write(
+                self._lead() + ("" if not self._fence else f"{DIM}│{RESET} ")
+            )
+        chunk = self._line[self._shown :]
+        if chunk:
+            color = CODE_TEXT if self._fence else AGENT_TEXT
+            sys.stdout.write(f"{color}{chunk}{RESET}")
+            self._shown = len(self._line)
+        sys.stdout.flush()
+
+    def _finish_line(self, line: str) -> None:
+        """Render a completed line, replacing what streamed if it fits one row."""
+        lead = self._lead() if self._shown == 0 else None
+        if line.startswith("```"):
+            self._fence = not self._fence
+            lang = line[3:].strip()
+            bar = (
+                f"{DIM}┌─ {lang}{RESET}"
+                if self._fence and lang
+                else (f"{DIM}┌─{RESET}" if self._fence else f"{DIM}└─{RESET}")
+            )
+            self._replace(lead, bar, line)
+            return
+        if self._fence:
+            body = f"{DIM}│{RESET} {CODE_TEXT}{_highlight_code(line, CODE_TEXT)}{RESET}"
+            self._replace(lead, body, line)
+            return
+        rendered = render_markdown(line).replace(RESET, f"{RESET}{AGENT_TEXT}")
+        self._replace(lead, f"{AGENT_TEXT}{rendered}{RESET}", line)
+
+    def _replace(self, lead: str | None, rendered: str, raw: str) -> None:
+        import shutil
+
+        if lead is None:  # part of the raw line is on screen already
+            width = shutil.get_terminal_size().columns
+            if len(raw) + 2 < width and _ANSI_RE.sub("", rendered) != raw:
+                sys.stdout.write("\r\033[K" + self._cur_lead + rendered + "\n")
+            else:
+                rest = raw[self._shown :]
+                color = CODE_TEXT if self._fence else AGENT_TEXT
+                sys.stdout.write(f"{color}{rest}{RESET}\n")
+        else:
+            sys.stdout.write(lead + rendered + "\n")
+        sys.stdout.flush()
+
+    def close(self) -> None:
+        """End the reply: finish the last line and leave a blank one."""
+        if not self.started:
+            return
+        if self._line:
+            self._finish_line(self._line)
+            self._line = ""
+        elif self._shown:
+            sys.stdout.write("\n")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def print_agent_message(text: str) -> None:
     """Print the agent's reply: a cyan dot opens it, the text hangs under it.
 
