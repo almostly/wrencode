@@ -69,7 +69,7 @@ if head -c 64 "$tmp" | grep -qi '<!doctype\|<html'; then
 fi
 
 # -----------------------------------------------------------------------------------------------
-# Verify the SHA-256 published with the release (releases before 0.4 have none)
+# Verify the SHA-256 published with the release (releases before 0.3.1 have none)
 # -----------------------------------------------------------------------------------------------
 if dl "$url.sha256" "$tmp.sha256" 2>/dev/null; then
   want="$(cut -d' ' -f1 "$tmp.sha256" | tr -d '[:space:]')"

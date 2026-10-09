@@ -28,12 +28,14 @@ import urllib.request
 from html.parser import HTMLParser
 from typing import Any
 
+from . import __version__
+
 MAX_BYTES = int(os.environ.get("WRENCODE_FETCH_MAX_BYTES", str(4 * 1024 * 1024)))
 MAX_CHARS = int(os.environ.get("WRENCODE_FETCH_MAX_CHARS", "40000"))
 TIMEOUT = float(os.environ.get("WRENCODE_FETCH_TIMEOUT", "30"))
 ALLOW_LOCAL = os.environ.get("WRENCODE_FETCH_LOCAL", "").lower() in ("1", "true", "yes")
 MAX_REDIRECTS = 5
-USER_AGENT = "wrencode/0.4 (+https://github.com/almostly/wrencode)"
+USER_AGENT = f"wrencode/{__version__} (+https://github.com/almostly/wrencode)"
 _SKIP = {"script", "style", "noscript", "template", "svg"}
 _BLOCK = {
     "p",
