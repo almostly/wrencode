@@ -13,7 +13,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from tests.support import BLUE, BOLD, CYAN, DIM, GREEN, RESET, YELLOW, strip_ansi
+from tests.support import BOLD, RESET, strip_ansi
 from wrencode import (
     app,
     backends,
@@ -38,7 +38,7 @@ class TestRenderMarkdown(unittest.TestCase):
 
     def test_inline_code(self):
         result = ui.render_markdown("`foo`")
-        self.assertIn(CYAN, result)
+        self.assertIn(ui.CYAN, result)
         self.assertIn("foo", result)
 
     def test_fenced_code_block_has_border(self):
@@ -51,8 +51,7 @@ class TestRenderMarkdown(unittest.TestCase):
 
     def test_fenced_code_block_content_highlighted(self):
         result = ui.render_markdown("```python\ndef f(): pass\n```")
-        # 'def' should be colorized (BLUE keyword)
-        self.assertIn(BLUE, result)
+        self.assertIn(ui.PALETTE.keyword, result)  # 'def' is a keyword
         self.assertIn("def", result)
 
     def test_bold_inside_fenced_block_is_not_expanded(self):
@@ -67,7 +66,7 @@ class TestRenderMarkdown(unittest.TestCase):
     def test_mixed_text(self):
         result = ui.render_markdown("Use **bold** and `code` together")
         self.assertIn(BOLD, result)
-        self.assertIn(CYAN, result)
+        self.assertIn(ui.CYAN, result)
 
     def test_no_markdown(self):
         result = ui.render_markdown("plain text")
@@ -100,11 +99,11 @@ class TestMessageBlocks(unittest.TestCase):
 
     def test_code_blocks_keep_their_tint_and_headings_are_bold(self):
         out = ui.render_markdown("## Plan\n```python\nx = 1  # one\n```")
-        self.assertIn(f"{ui.BOLD}Plan{ui.RESET}", out)
+        self.assertIn(f"{ui.PALETTE.heading}{ui.BOLD}Plan{ui.RESET}", out)
         self.assertIn(f"{ui.DIM}│{ui.RESET} {ui.CODE_TEXT}", out)
         # after a highlighted token the code color comes back, not the prose color
-        self.assertIn(f"{ui.YELLOW}1{ui.RESET}{ui.CODE_TEXT}", out)
-        self.assertIn(f"{ui.DIM}# one{ui.RESET}{ui.CODE_TEXT}", out)
+        self.assertIn(f"{ui.PALETTE.number}1{ui.RESET}{ui.CODE_TEXT}", out)
+        self.assertIn(f"{ui.PALETTE.comment}# one{ui.RESET}{ui.CODE_TEXT}", out)
         self.assertNotIn("\x1b[48;", out)  # no background color
         spaced = ui.render_markdown("before:\n\n```\nx\n```\n\nafter")
         self.assertNotIn("\n\n\n", spaced)
@@ -164,8 +163,8 @@ class TestMessageBlocks(unittest.TestCase):
     def test_loader_display_gradient(self):
         with mock.patch.object(ui, "colors_enabled", return_value=True):
             out = ui.loader_display(0, "anthropic · claude · waiting…")
-        self.assertIn("\033[96m", out)
-        self.assertIn("\033[2m", out)
+        self.assertIn(ui.PALETTE.accent, out)
+        self.assertIn(ui.DIM, out)
         self.assertIn("waiting", strip_ansi(out))
 
     def test_format_input_line_slash_is_bold_cyan(self):
@@ -291,28 +290,40 @@ class TestConfirm(unittest.TestCase):
 # Highlight Code
 # ---------------------------------------------------------------------------
 class TestHighlightCode(unittest.TestCase):
-    def test_keyword_is_blue(self):
+    """Code is colored the way Baseline colors it."""
+
+    def test_keyword(self):
         result = ui._highlight_code("def foo():")
-        self.assertIn(BLUE, result)
-        self.assertIn("def", result)
+        self.assertIn(f"{ui.PALETTE.keyword}def", result)
+        self.assertIn(f"{ui.PALETTE.name}foo", result)  # a defined name: the text color
 
-    def test_string_is_green(self):
+    def test_string(self):
         result = ui._highlight_code('x = "hello"')
-        self.assertIn(GREEN, result)
+        self.assertIn(f'{ui.PALETTE.string}"hello"', result)
 
-    def test_comment_is_dim(self):
+    def test_comment(self):
         result = ui._highlight_code("x = 1  # comment")
-        self.assertIn(DIM, result)
-        self.assertIn("comment", result)
+        self.assertIn(f"{ui.PALETTE.comment}# comment", result)
 
-    def test_number_is_yellow(self):
-        result = ui._highlight_code("return 42")
-        self.assertIn(YELLOW, result)
+    def test_numbers_constants_and_decorators(self):
+        self.assertIn(f"{ui.PALETTE.number}42", ui._highlight_code("return 42"))
+        self.assertIn(f"{ui.PALETTE.number}None", ui._highlight_code("x = None"))
+        self.assertIn(
+            f"{ui.PALETTE.number}@cache", ui._highlight_code("@cache\ndef f(): ...")
+        )
+
+    def test_calls_attributes_and_punctuation(self):
+        result = ui._highlight_code("os.path.join(a, b)", "<code>")
+        self.assertIn(f"{ui.PALETTE.call}path", result)  # an attribute
+        self.assertIn(f"{ui.PALETTE.call}join", result)  # a call
+        self.assertIn(f"{ui.PALETTE.name}(", result)  # punctuation: the text color
+        self.assertIn(f"{ui.RESET}<code>a", result)  # an identifier: the code color
 
     def test_multiple_tokens(self):
         result = ui._highlight_code('if x == "ok": return True')
-        self.assertIn(BLUE, result)  # 'if', 'return', 'True' → blue
-        self.assertIn(GREEN, result)  # "ok" → green
+        self.assertIn(f"{ui.PALETTE.keyword}if", result)
+        self.assertIn(f'{ui.PALETTE.string}"ok"', result)
+        self.assertIn(f"{ui.PALETTE.number}True", result)
 
     def test_no_tokens_unchanged(self):
         code = "x y z"
@@ -488,14 +499,30 @@ class TestIntuitiveUI(unittest.TestCase):
         self.assertTrue(lines[1].startswith("HTTP 401"))
         self.assertEqual(lines[2], "Error: something odd")
 
-    def test_themes_from_zed_files_and_the_built_in_baseline(self):
-        dark = ui.palette_from_zed(ui.BUILT_IN_THEMES["baseline-dark"])
+    def test_baseline_is_the_default_and_zed_files_load(self):
+        dark = ui.baseline_palette("dark")
         self.assertEqual(dark.text, "\x1b[38;2;171;178;191m")  # #abb2bf
+        self.assertEqual(dark.code, "\x1b[38;2;98;175;239m")  # #62afef: identifiers
         self.assertEqual(dark.keyword, "\x1b[38;2;225;109;118m")  # #e16d76
+        self.assertEqual(dark.string, "\x1b[38;2;209;154;102m")  # #d19a66
+        self.assertEqual(dark.call, dark.string)  # calls and attributes: orange
         self.assertEqual(dark.number, "\x1b[38;2;198;120;222m")  # #c678de
+        self.assertEqual(dark.comment, "\x1b[38;2;92;99;112m")  # #5c6370
+        self.assertEqual(dark.muted, dark.comment)
         self.assertEqual(dark.accent, "\x1b[38;2;82;139;255m")  # #528bff
-        self.assertEqual(dark.banner_face, dark.accent)
-        self.assertEqual(dark.code, dark.text)  # code reads by its highlighting
+        self.assertEqual(
+            (dark.banner_face, dark.name, dark.heading),
+            (dark.accent, dark.text, dark.blue),
+        )
+        light = ui.baseline_palette("light")
+        self.assertEqual(light.text, "\x1b[38;2;56;58;66m")  # #383a42
+        self.assertEqual(light.keyword, dark.keyword)  # the same syntax colors
+        self.assertEqual(ui.baseline_palette(""), dark)  # unknown background: dark
+        self.assertEqual(ui.resolve_palette("", ""), (dark, ""))
+        self.assertEqual(ui.resolve_palette("", "light"), (light, ""))
+        self.assertEqual(ui.resolve_palette("light", "dark"), (light, ""))  # forced
+        ansi, err = ui.resolve_palette("ansi", "")
+        self.assertEqual((ansi.text, ansi.red, err), ("\x1b[39m", ui._ANSI_RED, ""))
         tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         theme = tmp / "mine.json"
@@ -535,14 +562,6 @@ class TestIntuitiveUI(unittest.TestCase):
             ui.load_zed_theme(str(theme), "Nope")
         palette, err = ui.resolve_palette(f"{theme}#Mine Light", "")
         self.assertEqual((palette.text, err), (by_name.text, ""))
-        palette, err = ui.resolve_palette("baseline", "light")
-        self.assertEqual(palette.text, "\x1b[38;2;56;58;66m")  # the light variant
-        palette, err = ui.resolve_palette("baseline", "")
-        self.assertEqual(palette.text, dark.text)  # unknown background: dark
-        palette, err = ui.resolve_palette("", "")
-        self.assertEqual(
-            (palette.text, palette.red, err), ("\x1b[39m", ui._ANSI_RED, "")
-        )
         palette, err = ui.resolve_palette(str(tmp / "missing.json"), "")
         self.assertIn("could not read the theme", err)
         self.assertEqual(palette.red, ui._ANSI_RED)

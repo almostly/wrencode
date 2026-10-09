@@ -90,10 +90,13 @@ class Palette:
     cyan: str  # inline code, subagent lines
     keyword: str
     string: str
-    number: str
+    number: str  # numbers and constants (True, None)
     comment: str
     diff_add: str
     diff_del: str
+    call: str = ""  # a called function, an attribute ("" : the code color)
+    name: str = ""  # a defined function's name, punctuation ("" : the code color)
+    heading: str = ""  # a markdown heading ("" : bold text)
     banner_face: str = ""  # "" keeps the built-in blue gradient
     banner_shadow: str = ""
 
@@ -172,46 +175,52 @@ def palette_from_zed(style: dict[str, Any]) -> Palette:
     )
 
 
-# Baseline, a Zed theme by Denis Burakov, built in as `baseline`: the subset
-# of its style wrencode draws with.
-BUILT_IN_THEMES: dict[str, dict[str, Any]] = {
-    "baseline-dark": {
-        "text": "#abb2bf",
-        "text.muted": "#5c6370",
-        "text.accent": "#528bff",
-        "terminal.ansi.red": "#e16d76",
-        "terminal.ansi.green": "#72c45a",
-        "terminal.ansi.yellow": "#d19a66",
-        "terminal.ansi.blue": "#62afef",
-        "terminal.ansi.cyan": "#58b6c2",
-        "syntax": {
-            "keyword": {"color": "#e16d76"},
-            "string": {"color": "#d19a66"},
-            "number": {"color": "#c678de"},
-            "comment": {"color": "#5c6370"},
-            "diff.plus": {"color": "#72c45a"},
-            "diff.minus": {"color": "#e16d76"},
-        },
-    },
-    "baseline-light": {
-        "text": "#383a42",
-        "text.muted": "#b6b9c5",
-        "text.accent": "#528bff",
-        "terminal.ansi.red": "#e16d76",
-        "terminal.ansi.green": "#72c45a",
-        "terminal.ansi.yellow": "#d19a66",
-        "terminal.ansi.blue": "#62afef",
-        "terminal.ansi.cyan": "#58b6c2",
-        "syntax": {
-            "keyword": {"color": "#e16d76"},
-            "string": {"color": "#d19a66"},
-            "number": {"color": "#c678de"},
-            "comment": {"color": "#5c6370"},
-            "diff.plus": {"color": "#72c45a"},
-            "diff.minus": {"color": "#e16d76"},
-        },
-    },
+# Baseline, by Denis Burakov (github.com/xRiskLab/vscode-themes): wrencode's
+# look, dark or light by the terminal's background. Prose is the editor text,
+# code is drawn the way its editor theme draws Python: identifiers blue,
+# keywords red, strings and calls and attributes orange, numbers and constants
+# magenta, comments muted, a defined function's name and punctuation in the
+# text color. The accent is the cursor and badge blue.
+_BASELINE = {
+    "accent": "#528bff",
+    "red": "#e16d76",
+    "green": "#72c45a",
+    "yellow": "#d19a66",
+    "blue": "#62afef",
+    "cyan": "#58b6c2",
+    "magenta": "#c678de",
+    "comment": "#5c6370",
 }
+_BASELINE_TEXT = {"dark": "#abb2bf", "light": "#383a42"}
+
+
+def baseline_palette(background: str) -> Palette:
+    """The Baseline palette for a dark or light background ("" counts as dark)."""
+    c = {k: truecolor(v) for k, v in _BASELINE.items()}
+    text = truecolor(_BASELINE_TEXT["light" if background == "light" else "dark"])
+    muted = c["comment"]
+    return Palette(
+        text=text,
+        code=c["blue"],
+        muted=muted,
+        accent=c["accent"],
+        red=c["red"],
+        green=c["green"],
+        yellow=c["yellow"],
+        blue=c["blue"],
+        cyan=c["cyan"],
+        keyword=c["red"],
+        string=c["yellow"],
+        number=c["magenta"],
+        comment=muted,
+        diff_add=c["green"],
+        diff_del=c["red"],
+        call=c["yellow"],
+        name=text,
+        heading=c["blue"],
+        banner_face=c["accent"],
+        banner_shadow=muted,
+    )
 
 
 def load_zed_theme(path: str, name: str = "", background: str = "") -> Palette:
@@ -242,28 +251,25 @@ def load_zed_theme(path: str, name: str = "", background: str = "") -> Palette:
 
 
 def resolve_palette(spec: str, background: str) -> tuple[Palette, str]:
-    """The palette WRENCODE_THEME asks for, and an error to show when it
-    couldn't be used (the terminal's colors are used then). `spec` is "",
-    "ansi", "light" or "dark" (the terminal's colors, with tints for that
-    background), a built-in theme name, or a Zed theme file, with "#Name"
-    choosing one of its themes."""
+    """The palette in use, and an error to show when WRENCODE_THEME couldn't be
+    followed (Baseline is used then). `spec` is "" (Baseline, dark or light
+    by `background`), "light" or "dark" (Baseline, that variant), "ansi" (the
+    terminal's own colors), or a Zed theme file, with "#Name" choosing one
+    of its themes."""
     spec = spec.strip()
     low = spec.lower()
-    if low in ("", "ansi", "light", "dark"):
-        return ansi_palette(background if low in ("", "ansi") else low), ""
-    if low in BUILT_IN_THEMES:
-        return palette_from_zed(BUILT_IN_THEMES[low]), ""
-    if f"{low}-{background or 'dark'}" in BUILT_IN_THEMES:
-        return palette_from_zed(BUILT_IN_THEMES[f"{low}-{background or 'dark'}"]), ""
+    if low in ("", "light", "dark"):
+        return baseline_palette(low or background), ""
+    if low == "ansi":
+        return ansi_palette(background), ""
     path, _, name = spec.partition("#")
     if path.endswith(".json"):
         try:
             return load_zed_theme(path, name.strip(), background), ""
         except ValueError as err:
-            return ansi_palette(background), str(err)
-    known = ", ".join(["ansi", "light", "dark", *BUILT_IN_THEMES])
-    return ansi_palette(background), (
-        f"WRENCODE_THEME={spec!r} is not a theme; use one of {known}, or a Zed theme file"
+            return baseline_palette(background), str(err)
+    return baseline_palette(background), (
+        f"WRENCODE_THEME={spec!r} is not a theme; use light, dark, ansi, or a Zed theme file"
     )
 
 
@@ -1173,35 +1179,50 @@ def _confirm_prompt_lines(question: str, action: str, subject: str) -> str:
 
 
 # Lightweight, language-agnostic code coloring — no pygments, keeps the binary lean.
+_KEYWORDS = (
+    "def|class|return|import|from|if|elif|else|for|while|try|except|finally|with|"
+    "as|in|not|and|or|is|lambda|yield|async|await|pass|break|continue|raise|global|"
+    "nonlocal|assert|del|const|let|var|function|export|default|new|this|fn|match|"
+    "struct|enum|pub|use|mut|public|private|static|void|type|interface|impl|where|"
+    "switch|case|do|typeof|instanceof|throw|catch|extends|implements"
+)
 _CODE_TOKEN = re.compile(
     r"(?P<comment>#[^\n]*|//[^\n]*)"
-    r"|(?P<string>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`)"
-    r"|(?P<num>\b\d[\d_.]*\b)"
-    r"|(?P<kw>\b(?:def|class|return|import|from|if|elif|else|for|while|try|except|"
-    r"finally|with|as|in|not|and|or|is|lambda|yield|async|await|pass|break|continue|"
-    r"raise|global|nonlocal|assert|True|False|None|const|let|var|function|export|"
-    r"default|new|this|fn|match|struct|enum|pub|use|mut|public|private|static|void)\b)"
+    r"|(?P<string>\"\"\"[\s\S]*?\"\"\"|\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`)"
+    r"|(?P<deco>@[A-Za-z_][\w.]*)"
+    r"|(?P<num>\b(?:\d[\d_.]*|True|False|None|true|false|null|nil)\b)"
+    r"|(?P<defname>(?<=\bdef )[A-Za-z_]\w*)"
+    rf"|(?P<kw>\b(?:{_KEYWORDS})\b)"
+    r"|(?P<call>[A-Za-z_]\w*(?=\())"
+    r"|(?P<attr>(?<=\.)[A-Za-z_]\w*)"
+    r"|(?P<punct>[^\w\s]+)"
 )
 
 
 def _highlight_code(code: str, base: str = "") -> str:
-    """Apply light ANSI syntax coloring to a code block (best-effort, any language).
-
-    `base` is the color the rest of the code is drawn in; it is restored after
-    every token so the block keeps its tint.
-    """
+    """Color a code block the way Baseline colors code (best-effort, any
+    language): comments muted, strings and calls and attributes orange,
+    keywords red, numbers, constants and decorators magenta, a defined
+    function's name and punctuation in the text color, and everything else
+    (identifiers) in `base`, the code color, which is restored after every
+    token."""
 
     def color(m: re.Match[str]) -> str:
         g = m.lastgroup
-        if g == "comment":
-            return f"{PALETTE.comment}{m.group()}{RESET}{base}"
-        if g == "string":
-            return f"{PALETTE.string}{m.group()}{RESET}{base}"
-        if g == "num":
-            return f"{PALETTE.number}{m.group()}{RESET}{base}"
-        if g == "kw":
-            return f"{PALETTE.keyword}{m.group()}{RESET}{base}"
-        return m.group()
+        tint = {
+            "comment": PALETTE.comment,
+            "string": PALETTE.string,
+            "deco": PALETTE.number,
+            "num": PALETTE.number,
+            "kw": PALETTE.keyword,
+            "defname": PALETTE.name or base,
+            "call": PALETTE.call or base,
+            "attr": PALETTE.call or base,
+            "punct": PALETTE.name or base,
+        }.get(g or "", "")
+        if not tint:
+            return m.group()
+        return f"{tint}{m.group()}{RESET}{base}"
 
     return _CODE_TOKEN.sub(color, code)
 
@@ -1251,7 +1272,12 @@ def render_markdown(text: str) -> str:
     text = re.sub(r"```(\w*)\n?(.*?)```", stash, text, flags=re.DOTALL)
     text = re.sub(r"`([^`\n]+)`", f"{CYAN}\\1{RESET}", text)
     text = re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
-    text = re.sub(r"^#{1,6} +(.+)$", f"{BOLD}\\1{RESET}", text, flags=re.MULTILINE)
+    text = re.sub(
+        r"^#{1,6} +(.+)$",
+        f"{PALETTE.heading}{BOLD}\\1{RESET}",
+        text,
+        flags=re.MULTILINE,
+    )
     for i, b in enumerate(blocks):
         text = text.replace(f"\x00B{i}\x00", b)
     return re.sub(r"\n{3,}", "\n\n", text)  # one blank line around a block, not two
