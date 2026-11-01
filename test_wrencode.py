@@ -18,14 +18,16 @@ from unittest import mock
 
 import wrencode
 
-# ANSI escape codes that wrencode emits
+# ANSI escape codes that wrencode emits (the live theme palette)
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
-BLUE = "\033[34m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
+BLUE = wrencode.BLUE
+CYAN = wrencode.CYAN
+GREEN = wrencode.GREEN
+YELLOW = wrencode.YELLOW
+ORANGE = wrencode.ORANGE
+MAGENTA = wrencode.MAGENTA
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +70,8 @@ class TestRenderMarkdown(unittest.TestCase):
 
     def test_fenced_code_block_content_highlighted(self):
         result = wrencode.render_markdown("```python\ndef f(): pass\n```")
-        # 'def' should be colorized (BLUE keyword)
-        self.assertIn(BLUE, result)
+        # 'def' should be colorized (MAGENTA keyword, matching lunar)
+        self.assertIn(MAGENTA, result)
         self.assertIn("def", result)
 
     def test_bold_inside_fenced_block_is_not_expanded(self):
@@ -135,6 +137,38 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn("write", plain)
         self.assertNotIn("write write", plain)
 
+    def test_edit_diff_uses_palette(self):
+        import io
+
+        buf = io.StringIO()
+        with (
+            mock.patch("sys.stdout", buf),
+            mock.patch.object(wrencode, "colors_enabled", return_value=True),
+        ):
+            wrencode.print_tool_action(
+                "edit",
+                {"path": "m.py", "old": "x = 1", "new": "def f():\n    return 2"},
+            )
+        out = buf.getvalue()
+        # Added code keyword "def" is syntax-lit (BLUE), not flat grey.
+        self.assertIn(f"{wrencode.MAGENTA}def{wrencode.RESET}", out)
+        self.assertIn(wrencode.GREEN, out)  # + marker
+        self.assertIn(wrencode.RED, out)  # - marker
+        self.assertIn("return", strip_ansi(out))
+
+    def test_read_result_highlights_code(self):
+        import io
+
+        buf = io.StringIO()
+        with (
+            mock.patch("sys.stdout", buf),
+            mock.patch.object(wrencode, "colors_enabled", return_value=True),
+        ):
+            wrencode.print_tool_result("   1| def add(a, b):\n   2|     return a + b")
+        out = buf.getvalue()
+        self.assertIn(f"{wrencode.MAGENTA}def{wrencode.RESET}", out)
+        self.assertIn("add(a, b)", strip_ansi(out))
+
     def test_print_system_uses_banner_cyan(self):
         import io
 
@@ -145,7 +179,7 @@ class TestMessageBlocks(unittest.TestCase):
         ):
             wrencode.print_system("Cleared")
         out = buf.getvalue()
-        self.assertIn("\033[96m", out)
+        self.assertIn(wrencode.BRIGHT_CYAN, out)
         self.assertIn("\033[1m", out)
         self.assertIn("Cleared", strip_ansi(out))
 
@@ -162,7 +196,7 @@ class TestMessageBlocks(unittest.TestCase):
     def test_loader_display_gradient(self):
         with mock.patch.object(wrencode, "colors_enabled", return_value=True):
             out = wrencode.loader_display(0)
-        self.assertIn("\033[96m", out)
+        self.assertIn(wrencode.BRIGHT_CYAN, out)
         self.assertIn("\033[2m", out)
         self.assertIn("waiting", strip_ansi(out))
 
@@ -266,6 +300,19 @@ class TestConfirm(unittest.TestCase):
         ):
             result = wrencode.confirm("write")
         self.assertEqual(result, "cancelled: user declined — use edit instead")
+
+    def test_agent_sdk_clear_resets_session_auto_approve(self):
+        wrencode._SESSION_AUTO_APPROVE = True
+        session = mock.Mock()
+        with (
+            mock.patch.object(wrencode, "BACKEND", wrencode.AGENT_SDK_BACKEND),
+            mock.patch.object(wrencode, "agent_sdk_session", return_value=session),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            action, _ = wrencode.handle_slash_command("/clear", [], None)
+        self.assertEqual(action, "handled")
+        self.assertTrue(session.reset.called)
+        self.assertFalse(wrencode._SESSION_AUTO_APPROVE)
 
     def test_decline_without_feedback(self):
         with (
@@ -377,6 +424,16 @@ class TestChooseBackendInteractive(unittest.TestCase):
             os.environ.pop("BACKEND", None)
             wrencode.resolve_configuration()
         self.assertEqual(wrencode.API_KEY, "sk-fresh")
+
+    def test_choosing_env_key_drops_saved_key(self):
+        wrencode.save_config(
+            {"backend": "anthropic", "model": "claude-x", "api_key": "sk-old"}
+        )
+        os.environ["ANTHROPIC_API_KEY"] = "sk-from-env"
+        saved = self._configure_anthropic("")  # Enter: use the environment key
+        self.assertNotIn("api_key", saved)
+        self.assertNotIn("api_key_overrides_env", saved)
+        self.assertEqual(wrencode.API_KEY, "sk-from-env")
 
     def test_reconfigure_blank_keeps_env_key(self):
         os.environ["ANTHROPIC_API_KEY"] = "sk-from-env"
@@ -770,9 +827,9 @@ class TestModelPicker(unittest.TestCase):
 # Highlight Code
 # ---------------------------------------------------------------------------
 class TestHighlightCode(unittest.TestCase):
-    def test_keyword_is_blue(self):
+    def test_keyword_is_magenta(self):
         result = wrencode._highlight_code("def foo():")
-        self.assertIn(BLUE, result)
+        self.assertIn(MAGENTA, result)
         self.assertIn("def", result)
 
     def test_string_is_green(self):
@@ -784,14 +841,20 @@ class TestHighlightCode(unittest.TestCase):
         self.assertIn(DIM, result)
         self.assertIn("comment", result)
 
-    def test_number_is_yellow(self):
+    def test_number_is_orange(self):
         result = wrencode._highlight_code("return 42")
-        self.assertIn(YELLOW, result)
+        self.assertIn(ORANGE, result)
 
     def test_multiple_tokens(self):
         result = wrencode._highlight_code('if x == "ok": return True')
-        self.assertIn(BLUE, result)  # 'if', 'return', 'True' → blue
+        self.assertIn(MAGENTA, result)  # 'if', 'return' → keyword purple
         self.assertIn(GREEN, result)  # "ok" → green
+        self.assertIn(BLUE, result)  # 'True' → constant blue
+
+    def test_type_and_constant_are_blue(self):
+        result = wrencode._highlight_code("x: str = None")
+        self.assertIn(f"{BLUE}str{wrencode.RESET}", result)
+        self.assertIn(f"{BLUE}None{wrencode.RESET}", result)
 
     def test_no_tokens_unchanged(self):
         code = "x y z"
@@ -1500,9 +1563,25 @@ class TestAgentLoopSmoke(unittest.TestCase):
     def test_local_weights_run_subagents_in_order(self):
         calls = [wrencode.ToolCall(str(i), "task", {"prompt": "x"}) for i in range(2)]
         with mock.patch.object(wrencode, "BACKEND", "mlx"):
-            self.assertEqual(wrencode._run_parallel_tasks(calls), {})
+            self.assertEqual(wrencode._parallel_task_group(calls, 0), [])
         with mock.patch.object(wrencode, "MAX_PARALLEL_SUBAGENTS", 1):
-            self.assertEqual(wrencode._run_parallel_tasks(calls), {})
+            self.assertEqual(wrencode._parallel_task_group(calls, 0), [])
+
+    def test_tasks_after_other_tool_calls_run_in_listed_order(self):
+        calls = [
+            wrencode.ToolCall("0", "edit", {"path": "x"}),
+            wrencode.ToolCall("1", "task", {"prompt": "a"}),
+            wrencode.ToolCall("2", "task", {"prompt": "b"}),
+        ]
+        self.assertEqual(wrencode._parallel_task_group(calls, 0), [])
+        self.assertEqual(wrencode._parallel_task_group(calls, 1), [1, 2])
+        single = [
+            wrencode.ToolCall("0", "task", {"prompt": "a"}),
+            wrencode.ToolCall("1", "edit", {"path": "x"}),
+            wrencode.ToolCall("2", "task", {"prompt": "b"}),
+        ]
+        self.assertEqual(wrencode._parallel_task_group(single, 0), [])
+        self.assertEqual(wrencode._parallel_task_group(single, 2), [])
 
     def test_cancel_stops_the_batch(self):
         def mock_get_response(messages, system_prompt, mlx_state):
@@ -3580,6 +3659,54 @@ class TestGarbledToolCalls(unittest.TestCase):
             [(c["name"], c["input"]) for c in calls],
             [("read", {"path": "a.txt"}), ("glob", {"pat": "*.txt"})],
         )
+
+
+class TestThemes(unittest.TestCase):
+    def tearDown(self):
+        wrencode.apply_theme(wrencode.DEFAULT_THEME)
+
+    def test_apply_theme_switches_palette(self):
+        # lunar and lunar-dark share the blue accent but differ in green
+        # (Lunar Day's teal vs Lunar Night's lime).
+        wrencode.apply_theme("lunar")
+        light_green = wrencode.GREEN
+        wrencode.apply_theme("lunar-dark")
+        self.assertNotEqual(light_green, wrencode.GREEN)
+        self.assertTrue(wrencode.BRIGHT_CYAN.startswith("\033[38;2;"))
+
+    def test_classic_keeps_terminal_palette(self):
+        wrencode.apply_theme("classic")
+        self.assertEqual(wrencode.BRIGHT_CYAN, "\033[96m")
+        self.assertEqual(wrencode.GREEN, "\033[32m")
+
+    def test_banner_renders_with_truecolor_faces(self):
+        out = wrencode.render_banner(True)
+        self.assertIn("\033[38;2;", out)
+        self.assertIn("█", out)
+
+    def test_theme_command_switches_and_persists(self):
+        import shutil
+
+        orig_config = wrencode.CONFIG_FILE
+        tmp = tempfile.mkdtemp()
+        wrencode.CONFIG_FILE = pathlib.Path(tmp) / "config.json"
+        try:
+            with mock.patch("sys.stdout", io.StringIO()):
+                action, _ = wrencode.handle_slash_command("/theme lunar", [], None)
+            self.assertEqual(action, "handled")
+            self.assertEqual(wrencode.THEME, "lunar")
+            saved = json.loads(wrencode.CONFIG_FILE.read_text())
+            self.assertEqual(saved["theme"], "lunar")
+        finally:
+            wrencode.CONFIG_FILE = orig_config
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_theme_command_rejects_unknown(self):
+        with mock.patch("sys.stdout", io.StringIO()) as out:
+            action, _ = wrencode.handle_slash_command("/theme neon", [], None)
+        self.assertEqual(action, "handled")
+        self.assertEqual(wrencode.THEME, wrencode.DEFAULT_THEME)
+        self.assertIn("Unknown theme", strip_ansi(out.getvalue()))
 
 
 if __name__ == "__main__":

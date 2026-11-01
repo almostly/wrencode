@@ -123,7 +123,7 @@ BACKEND_SPECS: dict[str, dict[str, str]] = {
     },
     "openrouter": {
         "kind": "api",
-        "model": "anthropic/claude-3-haiku",
+        "model": "anthropic/claude-haiku-4.5",
         "key_env": "OPENROUTER_API_KEY",
         "api_base": "https://openrouter.ai/api/v1/chat/completions",
         "label": "OpenRouter — any model (API key)",
@@ -190,10 +190,9 @@ BACKEND_MODELS: dict[str, list[str]] = {
         "gpt-4o-mini",
     ],
     "openrouter": [
-        "anthropic/claude-3-haiku",
-        "anthropic/claude-3.5-sonnet",
+        "anthropic/claude-haiku-4.5",
+        "anthropic/claude-sonnet-4.5",
         "openai/gpt-4o-mini",
-        "google/gemini-flash-1.5",
         "meta-llama/llama-3.1-8b-instruct",
     ],
     "nanogpt": [
@@ -433,18 +432,98 @@ _GLOB_SKIP: set[str] = {
 }
 
 # -----------------------------------------------------------------------------------------------
-# Terminal colors
+# Terminal colors & themes
 # -----------------------------------------------------------------------------------------------
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
-BLUE, CYAN, GREEN, YELLOW, RED = (
-    "\033[34m",
-    "\033[36m",
-    "\033[32m",
-    "\033[33m",
-    "\033[31m",
-)
-BRIGHT_CYAN = "\033[96m"
-AGENT_TEXT = "\033[38;5;245m"  # muted grey for agent replies (Claude Code-style)
+
+
+def _rgb(hex_color: str) -> str:
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+# Named palettes applied to the module color globals, mirroring the Lunar
+# (Tokyo Night Moon) editor theme: blue is the identity color (prompt, system
+# lines, banner), purple is reserved for code keywords, green for strings,
+# orange for numbers. "lunar-dark" (Lunar Night) is the default; "lunar"
+# (Lunar Day) is the light variant, deepened for white-background legibility;
+# "classic" keeps the terminal's own 16-color palette. The choice is saved as
+# "theme" in config.json; WRENCODE_THEME overrides it.
+THEMES: dict[str, dict[str, Any]] = {
+    "lunar-dark": {
+        "blue": _rgb("82aaff"),  # accent twin: input prompts
+        "cyan": _rgb("86e1fc"),  # inline code, subagent markers
+        "green": _rgb("c3e88d"),  # strings, added lines, ⏺ markers
+        "yellow": _rgb("ffc777"),  # warnings
+        "orange": _rgb("ff966c"),  # numbers
+        "magenta": _rgb("c099ff"),  # code keywords (the only purple)
+        "red": _rgb("ff757f"),  # removed lines, errors
+        "accent": _rgb("82aaff"),  # blue: prompt, system lines, menu pick, help
+        "agent_text": _rgb("828bb8"),  # muted blue-grey for agent replies
+        # Moonlight gradient: cyan at the top shading down to blue — no purple.
+        "banner_faces": ("86e1fc", "7ecdf7", "76baf3", "6ea6ee", "6693ea", "5f7fe6"),
+        "banner_shadow": "2a2f4a",
+    },
+    "lunar": {  # Lunar Day — verbatim theme values (airy/pale on the light bg)
+        "blue": _rgb("82aaff"),
+        "cyan": _rgb("86e1fc"),
+        "green": _rgb("0bdaa9"),  # Lunar Day's teal green
+        "yellow": _rgb("ffc777"),
+        "orange": _rgb("ff966c"),
+        "magenta": _rgb("c099ff"),  # Lunar Day keyword purple
+        "red": _rgb("ff757f"),
+        "accent": _rgb("82aaff"),
+        "agent_text": _rgb("6b7390"),  # Lunar Day text.muted
+        "banner_faces": ("86e1fc", "85d3fb", "84c5fa", "83b7f9", "82aaff", "82aaff"),
+        "banner_shadow": "d6d9ea",
+    },
+    "classic": {
+        "blue": "\033[34m",
+        "cyan": "\033[36m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "orange": "\033[33m",
+        "magenta": "\033[35m",
+        "red": "\033[31m",
+        "accent": "\033[96m",
+        "agent_text": "\033[38;5;245m",
+        "banner_faces": (117, 111, 75, 69, 33, 27),
+        "banner_shadow": 25,
+    },
+}
+DEFAULT_THEME = "lunar-dark"
+THEME = DEFAULT_THEME
+
+# Color globals, filled in by apply_theme() below. Declared here so the module
+# scope has bindings for them (apply_theme assigns via `global`).
+BLUE: str = ""
+CYAN: str = ""
+GREEN: str = ""
+YELLOW: str = ""
+ORANGE: str = ""
+MAGENTA: str = ""
+RED: str = ""
+BRIGHT_CYAN: str = ""
+AGENT_TEXT: str = ""
+_BANNER_FACES: tuple[Any, ...] = ()
+_BANNER_SHADOW: Any = 0
+
+
+def apply_theme(name: str) -> None:
+    """Set the module color globals from a named theme."""
+    global THEME, BLUE, CYAN, GREEN, YELLOW, ORANGE, MAGENTA, RED
+    global BRIGHT_CYAN, AGENT_TEXT, _BANNER_FACES, _BANNER_SHADOW
+    t = THEMES[name]
+    THEME = name
+    BLUE, CYAN, GREEN = t["blue"], t["cyan"], t["green"]
+    YELLOW, ORANGE, MAGENTA, RED = t["yellow"], t["orange"], t["magenta"], t["red"]
+    BRIGHT_CYAN = t["accent"]
+    AGENT_TEXT = t["agent_text"]
+    _BANNER_FACES = t["banner_faces"]
+    _BANNER_SHADOW = t["banner_shadow"]
+
+
+apply_theme(DEFAULT_THEME)
 _COMPOSE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _LOADER_MODEL_MAX = 32
 
@@ -491,7 +570,7 @@ def print_system(text: str, *, end: str = "\n") -> None:
     s = f"{BOLD}{BRIGHT_CYAN}" if colors_enabled() else ""
     e = RESET if colors_enabled() else ""
     if sys.stdout.isatty():
-        sys.stdout.write("\r")
+        sys.stdout.write("\r\033[K")  # clear leftovers of an interrupted prompt
     sys.stdout.write(f"{s}{text}{e}{end}")
     sys.stdout.flush()
 
@@ -504,6 +583,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/backend": "switch backend and model",
     "/configure": "same as /backend",
     "/compact": "summarize history to free context",
+    "/theme": "switch color theme (or /theme <name>)",
     "/clear": "clear the conversation",
     "/help": "list commands",
     "/quit": "save history and exit",
@@ -522,6 +602,12 @@ def slash_matches(text: str) -> list[str]:
 
 def _is_slash_command(token: str) -> bool:
     return token in SLASH_COMMANDS or token in SLASH_ALIASES
+
+
+def _default_slash_sel(text: str, matches: list[str]) -> int:
+    """Initial menu highlight: an alias highlights its target (/c → /clear)."""
+    target = SLASH_ALIASES.get(text, "")
+    return matches.index(target) if target in matches else 0
 
 
 def format_input_line(text: str) -> str:
@@ -660,7 +746,7 @@ def _read_tty_line(
             matches = _matches()
             if key == "enter":
                 text = "".join(buf).strip()
-                if matches and not _is_slash_command(text):
+                if matches:  # the menu is honest: Enter runs the highlighted one
                     text = matches[min(sel, len(matches) - 1)]
                 if complete:  # clear the menu, leave the final line
                     _redraw_input_line(text)
@@ -680,7 +766,7 @@ def _read_tty_line(
             if key == "backspace":
                 if buf:
                     buf.pop()
-                    sel = 0
+                    sel = _default_slash_sel("".join(buf), _matches())
                     _redraw()
                 continue
             if key == "ctrl_c":
@@ -713,7 +799,7 @@ def _read_tty_line(
                 continue
             if len(key) == 1 and (key.isprintable() or key == "\t"):
                 buf.append(key)
-                sel = 0
+                sel = _default_slash_sel("".join(buf), _matches())
                 _redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -781,18 +867,21 @@ _BANNER_ROWS = (
     "╚███╔███╔╝██║  ██║███████╗██║ ╚████║╚██████╗╚██████╔╝██████╔╝███████╗",
     " ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
 )
-_BANNER_FACES = (117, 111, 75, 69, 33, 27)
-_BANNER_SHADOW = 25
+
+
+def _banner_color(spec: Any) -> str:
+    """A banner color spec is a truecolor hex string or a 256-color number."""
+    return _rgb(spec) if isinstance(spec, str) else f"\033[38;5;{spec}m"
 
 
 def render_banner(color: bool) -> str:
     """Return the startup banner, colored when color is True."""
     if not color:
         return "\n".join(_BANNER_ROWS)
-    shade = f"\033[38;5;{_BANNER_SHADOW}m"
+    shade = _banner_color(_BANNER_SHADOW)
     lines = []
     for row, face in zip(_BANNER_ROWS, _BANNER_FACES):
-        tint = f"\033[38;5;{face}m"
+        tint = _banner_color(face)
         runs = re.sub(
             r"█+|[^█ ]+", lambda m: (tint if m[0][0] == "█" else shade) + m[0], row
         )
@@ -1356,7 +1445,10 @@ def task(args: dict[str, Any]) -> str:
     finally:
         _AGENT_LOCAL.depth = depth
     texts = [flatten_content(m["content"]) for m in sub if m["role"] == "assistant"]
-    print(f"{CYAN}↳ subagent done{RESET}")
+    # An orphan winding down after its cancelled batch restored stdout must
+    # not print over the user's prompt.
+    if not _agent_tag() or isinstance(sys.stdout, _AgentStdout):
+        print(f"{CYAN}↳ subagent done{RESET}")
     return (texts[-1] if texts else "") or "(subagent produced no text output)"
 
 
@@ -1556,6 +1648,17 @@ def normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _diff_lines(old: str, new: str, limit: int = 8) -> list[str]:
+    """Real multi-line -/+ lines for an edit preview, capped per side."""
+    out: list[str] = []
+    for sign, text in (("-", old), ("+", new)):
+        lines = str(text).split("\n")
+        out += [f"{sign} {line}" for line in lines[:limit]]
+        if len(lines) > limit:
+            out.append(f"{sign} ... +{len(lines) - limit} more lines")
+    return out
+
+
 def format_tool_action(name: str, args: dict[str, Any]) -> str:
     """Human-readable summary of what a tool call will do."""
     args = normalize_tool_args(name, args)
@@ -1573,15 +1676,15 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     if name == "write":
         path = args.get("path", "?")
         content = str(args.get("content", ""))
-        lines = content.count("\n") + (1 if content else 0)
-        preview = content[:160].replace("\n", "\\n")
-        suffix = "..." if len(content) > 160 else ""
-        return f"write {path}  ({lines} lines)\n  {preview}{suffix}"
+        lines = content.split("\n")
+        shown = lines[:8]
+        if len(lines) > 8:
+            shown.append(f"... +{len(lines) - 8} more lines")
+        return f"write {path}  ({len(lines)} lines)\n" + "\n".join(shown)
     if name == "edit":
         path = args.get("path", "?")
-        old = str(args.get("old", ""))[:80].replace("\n", "\\n")
-        new = str(args.get("new", ""))[:80].replace("\n", "\\n")
-        return f"edit {path}\n  - {old}\n  + {new}"
+        diff = _diff_lines(str(args.get("old", "")), str(args.get("new", "")))
+        return f"edit {path}\n" + "\n".join(diff)
     if name == "glob":
         return f"glob {args.get('pat', args.get('pattern', '?'))}"
     if name == "grep":
@@ -1592,6 +1695,18 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
 
+def _color_diff_line(line: str) -> str:
+    """Color one edit-preview line: removed lines red, added lines green + code lit."""
+    sign, rest = (line[0], line[2:]) if line[:2] in ("- ", "+ ") else ("", line)
+    if rest.startswith("..."):  # meta like "... +N more lines"
+        return f"{DIM}{line}{RESET}"
+    if sign == "-":
+        return f"{RED}- {rest}{RESET}"
+    if sign == "+":
+        return f"{GREEN}+{RESET} {_highlight_code(rest)}"
+    return f"{DIM}{line}{RESET}"
+
+
 def print_tool_action(name: str, args: dict[str, Any]) -> None:
     """Print a tool call as plain text — no background boxes."""
     body = format_tool_action(name, args)
@@ -1599,8 +1714,25 @@ def print_tool_action(name: str, args: dict[str, Any]) -> None:
     first, _, rest = body.partition("\n")
     print(f"{GREEN}⏺{RESET}{DIM} {first}{RESET}")
     for line in rest.split("\n"):
-        if line.strip():
+        if not line.strip():
+            continue
+        if name == "edit":
+            print(f"  {_color_diff_line(line)}")
+        elif name == "write" and not line.startswith("..."):
+            print(f"  {_highlight_code(line)}")
+        else:
             print(f"{DIM}  {line}{RESET}")
+
+
+# A line of file-read output: "<spaces><n>| <code>". The gutter stays dim, the
+# code is syntax-lit so read output uses the palette like the rest of the UI.
+_READ_LINE = re.compile(r"(\s*\d+\|)(.*)")
+
+
+def _color_result_line(line: str) -> str:
+    if m := _READ_LINE.match(line):
+        return f"{DIM}{m.group(1)}{RESET}{_highlight_code(m.group(2))}"
+    return f"{DIM}{line}{RESET}"
 
 
 def print_tool_result(result: str) -> None:
@@ -1616,7 +1748,7 @@ def print_tool_result(result: str) -> None:
         return
     show = lines[:12]
     for line in show:
-        print(f"{DIM}│ {line}{RESET}")
+        print(f"{DIM}│{RESET} {_color_result_line(line)}")
     if len(lines) > 12:
         print(f"{DIM}│ ... +{len(lines) - 12} more lines{RESET}")
 
@@ -1676,15 +1808,20 @@ def flatten_content(content: Any) -> str:
     return "\n".join(parts)
 
 
-# Lightweight, language-agnostic code coloring — no pygments, keeps the binary lean.
+# Lightweight, language-agnostic code coloring — no pygments, keeps the binary
+# lean. Matches the Lunar theme's split: control keywords are purple, while
+# types and constants (None/True/False, str, tuple, ...) are blue.
 _CODE_TOKEN = re.compile(
     r"(?P<comment>#[^\n]*|//[^\n]*)"
     r"|(?P<string>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`)"
     r"|(?P<num>\b\d[\d_.]*\b)"
+    r"|(?P<type>\b(?:None|True|False|str|int|float|bool|bytes|bytearray|complex|"
+    r"list|dict|tuple|set|frozenset|object|type|Any|Optional|Union|Literal|"
+    r"Callable|null|true|false)\b)"
     r"|(?P<kw>\b(?:def|class|return|import|from|if|elif|else|for|while|try|except|"
     r"finally|with|as|in|not|and|or|is|lambda|yield|async|await|pass|break|continue|"
-    r"raise|global|nonlocal|assert|True|False|None|const|let|var|function|export|"
-    r"default|new|this|fn|match|struct|enum|pub|use|mut|public|private|static|void)\b)"
+    r"raise|global|nonlocal|assert|const|let|var|function|export|default|new|this|"
+    r"fn|match|struct|enum|pub|use|mut|public|private|static|void)\b)"
 )
 
 
@@ -1698,9 +1835,11 @@ def _highlight_code(code: str) -> str:
         if g == "string":
             return f"{GREEN}{m.group()}{RESET}"
         if g == "num":
-            return f"{YELLOW}{m.group()}{RESET}"
-        if g == "kw":
+            return f"{ORANGE}{m.group()}{RESET}"
+        if g == "type":
             return f"{BLUE}{m.group()}{RESET}"
+        if g == "kw":
+            return f"{MAGENTA}{m.group()}{RESET}"
         return m.group()
 
     return _CODE_TOKEN.sub(color, code)
@@ -1994,10 +2133,13 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
         "outputTokens", u.get("output_tokens", u.get("completion_tokens"))
     )
     if _is_truncated(data):
+        # The Claude backends send CLAUDE_MAX_TOKENS, not MAX_TOKENS; report
+        # the cap this request was actually sent with.
+        cap = CLAUDE_MAX_TOKENS if BACKEND in ANTHROPIC_FORMAT_BACKENDS else MAX_TOKENS
         print(
-            f"{YELLOW}Warning: response truncated at MAX_TOKENS={MAX_TOKENS} "
+            f"{YELLOW}Warning: response truncated at max_tokens={cap} "
             f"(output_tokens={out_tokens}). Tool calls may be incomplete — "
-            f"raise MAX_TOKENS and retry.{RESET}",
+            f"raise the MAX_TOKENS env var and retry.{RESET}",
             file=sys.stderr,
         )
 
@@ -2650,10 +2792,10 @@ def get_response(
 # History management
 # -----------------------------------------------------------------------------------------------
 def history_file_path() -> pathlib.Path:
-    """Return the history file path from env override or user-level default."""
+    """Return the history file path from env override or the config dir."""
     if p := os.environ.get("WRENCODE_HISTORY_FILE"):
         return pathlib.Path(p).expanduser()
-    return pathlib.Path.home() / ".wrencode" / "history.json"
+    return CONFIG_DIR / "history.json"
 
 
 def load_history() -> list[dict[str, Any]]:
@@ -3068,6 +3210,9 @@ def run_agent_turn(
                 iters -= 1
                 continue
             retried_overflow = False
+            # A worker blocked in an HTTP call only sees a cancel once the call
+            # returns: stop here, before printing or acting on the response.
+            check_cancelled()
             display_text, tool_calls, raw_data = _parse_response(response_text)
             if display_text:
                 print_agent_message(display_text)
@@ -3114,9 +3259,14 @@ def run_agent_turn(
                 continue
             results: list[tuple[ToolCall, str]] = []
             stop = False
-            parallel = _run_parallel_tasks(tool_calls)
+            parallel: dict[int, str] = {}
             for i, tc in enumerate(tool_calls):
                 check_cancelled()
+                if i not in parallel and (group := _parallel_task_group(tool_calls, i)):
+                    for g in group:
+                        print_tool_action("task", tool_calls[g].input)
+                    batch = [tool_calls[g] for g in group]
+                    parallel.update(zip(group, _run_tasks_concurrently(batch)))
                 if i in parallel:
                     result = parallel[i]
                 else:
@@ -3155,7 +3305,10 @@ def run_agent_turn(
                 return "done"
     except (UserCancelled, KeyboardInterrupt):
         if _agent_tag():
-            print(f"{YELLOW}cancelled{RESET}")
+            # Once the batch has restored stdout, an orphaned worker winding
+            # down must not print over the user's prompt.
+            if isinstance(sys.stdout, _AgentStdout):
+                print(f"{YELLOW}cancelled{RESET}")
             return "cancelled"
         print(f"\n{YELLOW}Cancelled — back to prompt.{RESET}\n")
         return "cancelled"
@@ -3177,7 +3330,7 @@ class _AgentStdout:
     def __init__(self, real: Any) -> None:
         self._real = real
         self._lock = threading.Lock()
-        self._partial: dict[int, str] = {}
+        self._partial: dict[int, tuple[str, str]] = {}  # ident -> (tag, text)
         self._owner: Optional[int] = None  # thread at an approval prompt
         self._held: list[str] = []
 
@@ -3188,8 +3341,8 @@ class _AgentStdout:
             if not tag or me == self._owner:
                 self._real.write(text)
                 return len(text)
-            *lines, rest = (self._partial.get(me, "") + text).split("\n")
-            self._partial[me] = rest
+            *lines, rest = (self._partial.get(me, ("", ""))[1] + text).split("\n")
+            self._partial[me] = (tag, rest)
             for line in lines:
                 tagged = f"{DIM}[{tag}]{RESET} {line.replace(chr(13), '')}\n"
                 if self._owner is None:
@@ -3215,6 +3368,17 @@ class _AgentStdout:
             self._held.clear()
             self._real.flush()
 
+    def close(self) -> None:
+        """Write each worker's unterminated last line so no output is lost."""
+        with self._lock:
+            for tag, rest in self._partial.values():
+                if rest:
+                    self._real.write(
+                        f"{DIM}[{tag}]{RESET} {rest.replace(chr(13), '')}\n"
+                    )
+            self._partial.clear()
+            self._real.flush()
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._real, name)
 
@@ -3224,23 +3388,26 @@ def _parallel_subagents_enabled() -> bool:
     return MAX_PARALLEL_SUBAGENTS > 1 and BACKEND not in LOCAL_ML_BACKENDS
 
 
-def _run_parallel_tasks(tool_calls: list[ToolCall]) -> dict[int, str]:
-    """Run a reply's task calls at once; return results by position in tool_calls.
+def _parallel_task_group(tool_calls: list[ToolCall], start: int) -> list[int]:
+    """Positions of the consecutive task calls starting at start, if they should
+    run as one parallel batch; [] means run the call at start normally.
 
-    Returns {} (run everything in order) for fewer than two task calls, when
-    parallelism is off, or at the depth limit, where task() reports the error.
+    Tool calls execute in the order the model listed them, so only an unbroken
+    run of task calls may run concurrently — a task may depend on an earlier
+    edit or shell call in the same reply.
     """
-    positions = [i for i, tc in enumerate(tool_calls) if tc.name == "task"]
+    group = []
+    for j in range(start, len(tool_calls)):
+        if tool_calls[j].name != "task":
+            break
+        group.append(j)
     if (
-        len(positions) < 2
+        len(group) < 2
         or not _parallel_subagents_enabled()
         or _subagent_depth() >= MAX_SUBAGENT_DEPTH
     ):
-        return {}
-    for i in positions:
-        print_tool_action("task", tool_calls[i].input)
-    calls = [tool_calls[i] for i in positions]
-    return dict(zip(positions, _run_tasks_concurrently(calls)))
+        return []
+    return group
 
 
 def _run_tasks_concurrently(calls: list[ToolCall]) -> list[str]:
@@ -3303,7 +3470,14 @@ def _run_tasks_concurrently(calls: list[ToolCall]) -> list[str]:
             _PARALLEL_ESC = None
         if out is not None:
             out.release()
+            out.close()
             sys.stdout = out._real
+        still_running = sum(t.is_alive() for t in threads)
+        if still_running:
+            print(
+                f"{YELLOW}↳ {still_running} subagents are finishing an API call; "
+                f"they stop at its end and their results are discarded.{RESET}"
+            )
     if cancel.is_set():
         raise UserCancelled()
     print(f"{CYAN}↳ {len(calls)} subagents done{RESET}")
@@ -3373,11 +3547,10 @@ def format_sdk_tool_action(name: str, inp: dict[str, Any]) -> str:
     if name == "Bash":
         return f"$ {str(inp.get('command', '')).strip()}"
     if name == "Edit":
-        return (
-            f"Edit {inp.get('file_path', '?')}\n"
-            f"- {_short(inp.get('old_string', ''))}\n"
-            f"+ {_short(inp.get('new_string', ''))}"
+        diff = _diff_lines(
+            str(inp.get("old_string", "")), str(inp.get("new_string", ""))
         )
+        return f"Edit {inp.get('file_path', '?')}\n" + "\n".join(diff)
     if name == "Write":
         content = str(inp.get("content", ""))
         lines = content.count("\n") + (1 if content else 0)
@@ -3734,10 +3907,12 @@ def handle_slash_command(
     Returns (action, mlx_state). mlx_state is _MLX_UNCHANGED unless the
     backend/model changed and the in-process model must be reloaded.
     """
+    global _SESSION_AUTO_APPROVE
     cmd = SLASH_ALIASES.get(cmd, cmd)
     if BACKEND == AGENT_SDK_BACKEND and cmd in {"/clear", "/compact"}:
         session = agent_sdk_session()
         if cmd == "/clear":
+            _SESSION_AUTO_APPROVE = False
             session.reset()
             print_system("Cleared")
         else:
@@ -3747,7 +3922,6 @@ def handle_slash_command(
         save_history(messages)
         return "quit", _MLX_UNCHANGED
     if cmd == "/clear":
-        global _SESSION_AUTO_APPROVE
         _SESSION_AUTO_APPROVE = False
         messages.clear()
         save_history(messages)
@@ -3768,15 +3942,45 @@ def handle_slash_command(
         else:
             print(f"{YELLOW}/compact not available for backend '{BACKEND}'{RESET}")
         return "handled", _MLX_UNCHANGED
+    if cmd == "/theme" or cmd.startswith("/theme "):
+        name = cmd[7:].strip()
+        if not name:
+            if not colors_enabled():
+                print("Themes: " + ", ".join(THEMES) + " — switch with /theme <name>")
+                return "handled", _MLX_UNCHANGED
+            print(f"{DIM}Themes — switch with /theme <name>:{RESET}")
+            for n, t in THEMES.items():
+                mark = "▸" if n == THEME else " "
+                # Each row is painted in its own palette so the themes look
+                # different: name in its accent, then keyword/string/number/
+                # diff swatches in that theme's colors.
+                swatch = (
+                    f'{t["magenta"]}kw{RESET} {t["green"]}"str"{RESET} '
+                    f"{t['orange']}42{RESET} {t['red']}-{RESET}{t['green']}+{RESET}"
+                )
+                print(f" {t['accent']}{mark} {n:<11}{RESET}  {swatch}")
+            return "handled", _MLX_UNCHANGED
+        if name not in THEMES:
+            print(f"{RED}Unknown theme '{name}'. Themes: {', '.join(THEMES)}{RESET}")
+            return "handled", _MLX_UNCHANGED
+        apply_theme(name)
+        save_config({**load_config(), "theme": name})
+        print_system(f"✓ Theme → {name}")
+        return "handled", _MLX_UNCHANGED
     if cmd in {"/backend", "/configure"}:
         return "handled", switch_backend_runtime()
     if cmd == "/model" or cmd.startswith("/model "):
         model_id = cmd[7:].strip() if cmd.startswith("/model ") else ""
         return "handled", switch_model_runtime(model_id)
     if cmd == "/help":
+        color = colors_enabled()
         for name, desc in SLASH_COMMANDS.items():
-            print_system(f"{name:<12} {desc}")
-        print_system("Type / for suggestions: ↑↓ pick, Tab completes, Enter runs.")
+            if color:
+                print(f"{BOLD}{BRIGHT_CYAN}{name:<12}{RESET} {desc}")
+            else:
+                print(f"{name:<12} {desc}")
+        hint = "Type / for suggestions: ↑↓ pick, Tab completes, Enter runs."
+        print(f"{DIM}{hint}{RESET}" if color else hint)
         return "handled", _MLX_UNCHANGED
     return None, _MLX_UNCHANGED
 
@@ -4142,6 +4346,7 @@ def _prompt_api_key_if_needed(
         if key:
             _use_entered_key(key_env, key, cfg)
         else:
+            cfg["api_key"] = ""  # clears a stale saved key on persist
             cfg["api_key_overrides_env"] = ""
             print_system(f"✓ Using {key_env} from environment")
         return
@@ -4206,6 +4411,12 @@ def persist_backend_choice(cfg: dict[str, str]) -> None:
     # Drop empty workspace id so a blank configure answer clears a prior value.
     if "anthropic_workspace_id" in cfg and not cfg["anthropic_workspace_id"]:
         merged.pop("anthropic_workspace_id", None)
+    # A blank api_key means the user chose the environment key: drop any
+    # previously saved key so config.json keeps no plaintext credential it
+    # no longer uses (it can leak wherever the config file is copied).
+    if "api_key" in cfg and not cfg["api_key"]:
+        merged.pop("api_key", None)
+        merged.pop("api_key_overrides_env", None)
     save_config(merged)
     apply_backend(
         merged["backend"],
@@ -4383,14 +4594,21 @@ def switch_backend_runtime() -> Any:
         return _MLX_UNCHANGED
 
     backend = names[idx]
+    previous = (BACKEND, MODEL, API_KEY, ANTHROPIC_WORKSPACE_ID)
     cfg: dict[str, str] = {"backend": backend}
-    _prompt_api_key_if_needed(backend, existing, cfg)
-    if backend in ANTHROPIC_KEY_BACKENDS:
-        _prompt_anthropic_workspace_if_needed(existing, cfg)
-    # Credentials first so the model picker can fetch live /models lists.
-    _apply_credentials_for_model_fetch(backend, cfg, existing)
-    model = pick_model_interactive(backend)
+    try:
+        _prompt_api_key_if_needed(backend, existing, cfg)
+        if backend in ANTHROPIC_KEY_BACKENDS:
+            _prompt_anthropic_workspace_if_needed(existing, cfg)
+        # Credentials first so the model picker can fetch live /models lists.
+        _apply_credentials_for_model_fetch(backend, cfg, existing)
+        model = pick_model_interactive(backend)
+    except (KeyboardInterrupt, EOFError):
+        model = None
     if model is None:
+        # The credentials above already switched the globals; put them back
+        # so a cancelled picker leaves the session on the old backend.
+        apply_backend(*previous)
         print_system("Cancelled.")
         return _MLX_UNCHANGED
 
@@ -4475,6 +4693,12 @@ def choose_backend_interactive() -> None:
 
 def resolve_configuration() -> None:
     """Decide which backend to use: env override > saved config > interactive > error."""
+    theme = os.environ.get("WRENCODE_THEME") or load_config().get("theme", "")
+    if theme and theme not in THEMES:
+        print(f"{YELLOW}Unknown theme '{theme}'. Themes: {', '.join(THEMES)}{RESET}")
+    elif theme:
+        apply_theme(theme)
+
     # 1. Explicit BACKEND env var — power users / CI. Unchanged from prior behaviour.
     env_backend = os.environ.get("BACKEND")
     if env_backend:
@@ -4649,7 +4873,6 @@ def load_model() -> Optional[tuple[Any, Any]]:
             f"{DIM}Set {key_env}, or run `wrencode` in a terminal to enter a key.{RESET}"
         )
         raise SystemExit(1)
-    print_system(f"{BACKEND} ({MODEL})")
     return None
 
 
@@ -5503,7 +5726,7 @@ def main() -> None:
             )
     elif messages:
         chats = sum(1 for m in messages if m.get("role") == "user")
-        print(f"{DIM}Restored {chats} chats{RESET}")
+        print(f"{DIM}Restored {chats} chats from history (/clear starts fresh){RESET}")
 
     while True:
         try:
@@ -5522,7 +5745,17 @@ def main() -> None:
                 agent_sdk_session().run(user_input)
                 continue
             messages.append({"role": "user", "content": user_input})
-            run_agent_turn(messages, system_prompt, mlx_state)
+            depth = len(messages)
+            try:
+                reason = run_agent_turn(messages, system_prompt, mlx_state)
+            except Exception:
+                # The turn died before any reply landed: drop the prompt so a
+                # later request doesn't silently re-answer it.
+                if len(messages) == depth:
+                    messages.pop()
+                raise
+            if reason == "cancelled" and len(messages) == depth:
+                messages.pop()  # cancelled before any reply; don't re-answer it
             save_history(messages)
         except KeyboardInterrupt:
             save_history(messages)
