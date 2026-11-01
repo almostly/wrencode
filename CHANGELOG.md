@@ -1,3 +1,9 @@
+## 0.3.4 (2026-11-01)
+
+### Fix
+
+- correctness fixes from code review
+
 ## 0.3.3 (2026-10-09)
 
 ### Fix
