@@ -618,6 +618,12 @@ def _is_slash_command(token: str) -> bool:
     return token in SLASH_COMMANDS or token in SLASH_ALIASES
 
 
+def _default_slash_sel(text: str, matches: list[str]) -> int:
+    """Initial menu highlight: an alias highlights its target (/c -> /clear)."""
+    target = SLASH_ALIASES.get(text, "")
+    return matches.index(target) if target in matches else 0
+
+
 def format_input_line(text: str) -> str:
     """Render the ❯ prompt line; a known /command (or its prefix) is bold cyan."""
     if not colors_enabled():
@@ -835,7 +841,7 @@ class LineEditor:
     def _insert(self, text: str) -> None:
         self.buf[self.cur : self.cur] = list(text)
         self.cur += len(text)
-        self.sel = 0
+        self.sel = _default_slash_sel(self.text, self.matches())
 
     def _line_bounds(self) -> tuple[int, int]:
         """Start and end offsets of the line the cursor is on."""
@@ -850,7 +856,7 @@ class LineEditor:
                 self.buf[-1] = "\n"  # a backslash before Enter continues the line
                 return None
             text = self.text.strip()
-            if matches and not _is_slash_command(text):
+            if matches:  # the menu is honest: Enter runs the highlighted one
                 text = matches[min(self.sel, len(matches) - 1)]
             return text
         if key == "alt_enter":
@@ -871,7 +877,7 @@ class LineEditor:
             if self.cur:
                 del self.buf[self.cur - 1]
                 self.cur -= 1
-                self.sel = 0
+                self.sel = _default_slash_sel(self.text, self.matches())
             return None
         if key == "delete":
             if self.cur < len(self.buf):

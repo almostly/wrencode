@@ -1806,9 +1806,14 @@ def run_agent_turn(
                 continue
             results: list[tuple[backends.ToolCall, str]] = []
             stop = False
-            parallel = _run_parallel_tasks(tool_calls)
+            parallel: dict[int, str] = {}
             for i, tc in enumerate(tool_calls):
                 ui.check_cancelled()
+                if i not in parallel and (group := _parallel_task_group(tool_calls, i)):
+                    for g in group:
+                        print_tool_action("task", tool_calls[g].input)
+                    batch = [tool_calls[g] for g in group]
+                    parallel.update(zip(group, _run_tasks_concurrently(batch)))
                 if i in parallel:
                     result = parallel[i]
                 else:
@@ -1870,23 +1875,26 @@ def _parallel_subagents_enabled() -> bool:
     )
 
 
-def _run_parallel_tasks(tool_calls: list[backends.ToolCall]) -> dict[int, str]:
-    """Run a reply's task calls at once; return results by position in tool_calls.
+def _parallel_task_group(tool_calls: list[backends.ToolCall], start: int) -> list[int]:
+    """Positions of the consecutive task calls starting at start, if they should
+    run as one parallel batch; [] means run the call at start normally.
 
-    Returns {} (run everything in order) for fewer than two task calls, when
-    parallelism is off, or at the depth limit, where task() reports the error.
+    Tool calls execute in the order the model listed them, so only an unbroken
+    run of task calls may run concurrently — a task may depend on an earlier
+    edit or shell call in the same reply.
     """
-    positions = [i for i, tc in enumerate(tool_calls) if tc.name == "task"]
+    group: list[int] = []
+    for j in range(start, len(tool_calls)):
+        if tool_calls[j].name != "task":
+            break
+        group.append(j)
     if (
-        len(positions) < 2
+        len(group) < 2
         or not _parallel_subagents_enabled()
         or ui._subagent_depth() >= MAX_SUBAGENT_DEPTH
     ):
-        return {}
-    for i in positions:
-        print_tool_action("task", tool_calls[i].input)
-    calls = [tool_calls[i] for i in positions]
-    return dict(zip(positions, _run_tasks_concurrently(calls)))
+        return []
+    return group
 
 
 def _run_tasks_concurrently(calls: list[backends.ToolCall]) -> list[str]:
@@ -1997,6 +2005,7 @@ def handle_slash_command(
     if backends.BACKEND == backends.AGENT_SDK_BACKEND and cmd in {"/clear", "/compact"}:
         session = agent_sdk_session()
         if cmd == "/clear":
+            ui.SESSION_AUTO_APPROVE = False  # "allow all" ends with the conversation
             session.reset()
             ui.print_system("Cleared")
         else:
