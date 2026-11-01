@@ -156,6 +156,16 @@ class TestMessageBlocks(unittest.TestCase):
         self.assertIn(wrencode.RED, out)  # - marker
         self.assertIn("return", strip_ansi(out))
 
+    def test_diff_lines_drop_trailing_newline(self):
+        # A trailing newline must not add a phantom blank -/+ line.
+        lines = wrencode._diff_lines("a\n", "a\nb\n")
+        self.assertEqual(lines, ["- a", "+ a", "+ b"])
+
+    def test_empty_write_reports_zero_lines(self):
+        text = wrencode.format_tool_action("write", {"path": "x", "content": ""})
+        self.assertIn("0 lines", text)
+        self.assertNotIn("\n", text)  # no blank body line
+
     def test_read_result_highlights_code(self):
         import io
 
@@ -1597,6 +1607,25 @@ class TestAgentLoopSmoke(unittest.TestCase):
             reason = wrencode.run_agent_turn(messages, "sys", None, max_iters=5)
         self.assertEqual(reason, "cancelled")
         self.assertFalse(wrencode._CANCEL_REQUESTED.is_set())
+        # The cancelled batch must still leave a valid history: the assistant
+        # tool_use message is followed by matching tool_result blocks, so the
+        # next request isn't rejected for an unanswered tool call.
+        use_ids = {
+            b["id"]
+            for m in messages
+            if m["role"] == "assistant" and isinstance(m["content"], list)
+            for b in m["content"]
+            if b.get("type") == "tool_use"
+        }
+        result_ids = {
+            b["tool_use_id"]
+            for m in messages
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for b in m["content"]
+            if b.get("type") == "tool_result"
+        }
+        self.assertTrue(use_ids)
+        self.assertTrue(use_ids <= result_ids, "cancelled tool calls left unanswered")
 
     def test_subagent_depth_is_per_thread(self):
         import threading

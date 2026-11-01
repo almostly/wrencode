@@ -1652,7 +1652,9 @@ def _diff_lines(old: str, new: str, limit: int = 8) -> list[str]:
     """Real multi-line -/+ lines for an edit preview, capped per side."""
     out: list[str] = []
     for sign, text in (("-", old), ("+", new)):
-        lines = str(text).split("\n")
+        # Drop trailing newlines so an ordinary "...\n" edit doesn't show a
+        # phantom blank line after its last real line.
+        lines = str(text).rstrip("\n").split("\n") if text else []
         out += [f"{sign} {line}" for line in lines[:limit]]
         if len(lines) > limit:
             out.append(f"{sign} ... +{len(lines) - limit} more lines")
@@ -1676,6 +1678,8 @@ def format_tool_action(name: str, args: dict[str, Any]) -> str:
     if name == "write":
         path = args.get("path", "?")
         content = str(args.get("content", ""))
+        if not content:
+            return f"write {path}  (0 lines)"
         lines = content.split("\n")
         shown = lines[:8]
         if len(lines) > 8:
@@ -2806,12 +2810,16 @@ def load_history() -> list[dict[str, Any]]:
 
 
 def save_history(messages: list[dict[str, Any]]) -> None:
-    """Persist conversation history to the JSON history file."""
+    """Persist conversation history to the JSON history file (owner-only)."""
     with contextlib.suppress(Exception):
         p = history_file_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
+        # Chat contents can be sensitive: write them 0600 so another local
+        # user with access to the config dir can't read them.
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(messages, f)
+        os.chmod(p, 0o600)
 
 
 def _summarize(
@@ -3185,6 +3193,10 @@ def run_agent_turn(
     respond_nudges = 0
     garbled_nudges = 0
     failed_calls: dict[str, int] = {}
+    # Tool calls whose assistant message is appended but whose results aren't
+    # yet flushed; used to keep history valid if the turn is cancelled midway.
+    pending_calls: list[ToolCall] = []
+    results: list[tuple[ToolCall, str]] = []
     try:
         while True:
             if max_iters and iters >= max_iters:
@@ -3257,7 +3269,8 @@ def run_agent_turn(
                     return "no_structured_output"
                 messages.append({"role": "user", "content": RESPOND_NUDGE})
                 continue
-            results: list[tuple[ToolCall, str]] = []
+            results = []
+            pending_calls = tool_calls  # unmatched until _append_tool_results below
             stop = False
             parallel: dict[int, str] = {}
             for i, tc in enumerate(tool_calls):
@@ -3299,11 +3312,24 @@ def run_agent_turn(
                 for tc in tool_calls[len(results) :]
             ]
             _append_tool_results(messages, results)
+            pending_calls = []
             if stop:
                 return "tool_errors"
             if _STRUCTURED_RESULT and _respond_schema() is not None:
                 return "done"
     except (UserCancelled, KeyboardInterrupt):
+        # An assistant tool-call message with no matching results makes the next
+        # request invalid (a tool_use with no tool_result). Close the pending
+        # calls with a cancelled result so the saved history stays coherent.
+        if pending_calls:
+            done = {id(tc) for tc, _ in results}
+            closed = results + [
+                (tc, "cancelled: interrupted by the user")
+                for tc in pending_calls
+                if id(tc) not in done
+            ]
+            _append_tool_results(messages, closed)
+            pending_calls = []
         if _agent_tag():
             # Once the batch has restored stdout, an orphaned worker winding
             # down must not print over the user's prompt.
@@ -3733,7 +3759,14 @@ class AgentSDKSession:
             print(f"{YELLOW}?{RESET} {first}")
             for line in rest.split("\n"):
                 if line.strip():
-                    print(f"{DIM}  {line}{RESET}")
+                    # Edit previews carry -/+ diff lines; color them like the
+                    # native backend instead of flat grey.
+                    shown = (
+                        _color_diff_line(line)
+                        if name == "Edit"
+                        else f"{DIM}{line}{RESET}"
+                    )
+                    print(f"  {shown}")
             verdict = await asyncio.to_thread(confirm, first)
         finally:
             self._esc.start()
@@ -4561,11 +4594,18 @@ def _apply_credentials_for_model_fetch(
     backend: str, cfg: dict[str, str], existing: dict[str, str]
 ) -> None:
     """Apply key/workspace so live /models fetches can authenticate."""
+    # When the user kept the environment key, cfg["api_key"] is "" — fall back
+    # to the env key (not the stale saved key) so the fetch uses what they chose.
+    key_env = BACKEND_SPECS[backend].get("key_env", "")
+    env_key = os.environ.get(key_env, "") if key_env else ""
+    saved_key = (
+        existing.get("api_key", "") if existing.get("backend") == backend else ""
+    )
+    key = (cfg["api_key"] or env_key) if "api_key" in cfg else (saved_key or env_key)
     apply_backend(
         backend,
         existing.get("model", "") if existing.get("backend") == backend else "",
-        cfg.get("api_key")
-        or (existing.get("api_key", "") if existing.get("backend") == backend else ""),
+        key,
         anthropic_workspace_id=cfg.get(
             "anthropic_workspace_id",
             existing.get("anthropic_workspace_id", "")
@@ -4595,6 +4635,10 @@ def switch_backend_runtime() -> Any:
 
     backend = names[idx]
     previous = (BACKEND, MODEL, API_KEY, ANTHROPIC_WORKSPACE_ID)
+    # _prompt_api_key_if_needed may put a typed key in the environment so the
+    # model fetch can authenticate; snapshot it to undo on cancel.
+    key_env = BACKEND_SPECS[backend].get("key_env", "")
+    prev_env = os.environ.get(key_env) if key_env else None
     cfg: dict[str, str] = {"backend": backend}
     try:
         _prompt_api_key_if_needed(backend, existing, cfg)
@@ -4606,8 +4650,13 @@ def switch_backend_runtime() -> Any:
     except (KeyboardInterrupt, EOFError):
         model = None
     if model is None:
-        # The credentials above already switched the globals; put them back
-        # so a cancelled picker leaves the session on the old backend.
+        # Put the environment and globals back so a cancelled picker leaves the
+        # session exactly on the old backend, key included.
+        if key_env:
+            if prev_env is None:
+                os.environ.pop(key_env, None)
+            else:
+                os.environ[key_env] = prev_env
         apply_backend(*previous)
         print_system("Cancelled.")
         return _MLX_UNCHANGED
@@ -4694,7 +4743,7 @@ def choose_backend_interactive() -> None:
 def resolve_configuration() -> None:
     """Decide which backend to use: env override > saved config > interactive > error."""
     theme = os.environ.get("WRENCODE_THEME") or load_config().get("theme", "")
-    if theme and theme not in THEMES:
+    if theme and (not isinstance(theme, str) or theme not in THEMES):
         print(f"{YELLOW}Unknown theme '{theme}'. Themes: {', '.join(THEMES)}{RESET}")
     elif theme:
         apply_theme(theme)
