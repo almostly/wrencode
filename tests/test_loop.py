@@ -180,9 +180,66 @@ class TestAgentLoopSmoke(unittest.TestCase):
     def test_local_weights_run_subagents_in_order(self):
         calls = [backends.ToolCall(str(i), "task", {"prompt": "x"}) for i in range(2)]
         with mock.patch.object(backends, "BACKEND", "mlx"):
-            self.assertEqual(app._run_parallel_tasks(calls), {})
+            self.assertEqual(app._parallel_task_group(calls, 0), [])
         with mock.patch.object(app, "MAX_PARALLEL_SUBAGENTS", 1):
-            self.assertEqual(app._run_parallel_tasks(calls), {})
+            self.assertEqual(app._parallel_task_group(calls, 0), [])
+
+    def test_tasks_after_other_tool_calls_run_in_listed_order(self):
+        calls = [
+            backends.ToolCall("0", "edit", {"path": "x"}),
+            backends.ToolCall("1", "task", {"prompt": "a"}),
+            backends.ToolCall("2", "task", {"prompt": "b"}),
+        ]
+        # The edit at 0 runs on its own; the consecutive tasks batch at 1.
+        self.assertEqual(app._parallel_task_group(calls, 0), [])
+        self.assertEqual(app._parallel_task_group(calls, 1), [1, 2])
+        # A task separated by a non-task call is not batched with a later one.
+        split = [
+            backends.ToolCall("0", "task", {"prompt": "a"}),
+            backends.ToolCall("1", "edit", {"path": "x"}),
+            backends.ToolCall("2", "task", {"prompt": "b"}),
+        ]
+        self.assertEqual(app._parallel_task_group(split, 0), [])
+        self.assertEqual(app._parallel_task_group(split, 2), [])
+
+    def test_edit_runs_before_parallel_tasks_in_the_loop(self):
+        """Driving the real loop: an edit before two tasks executes first."""
+        order: list[str] = []
+
+        def fake_run_tool(name, args):
+            order.append(name)
+            return "ok"
+
+        def fake_batch(calls):
+            order.append("task-batch")
+            return ["ok"] * len(calls)
+
+        reply = (
+            "<tool_call>"
+            + json.dumps(
+                {"tool": "edit", "args": {"path": "m.py", "old": "a", "new": "b"}}
+            )
+            + "</tool_call>"
+            + self._task_reply("one", "two")
+        )
+        seen = [0]
+
+        def mock_get_response(messages, system_prompt, mlx_state, tools=None):
+            seen[0] += 1
+            return reply if seen[0] == 1 else "done"
+
+        self._mock_get_response(mock_get_response)
+        with (
+            mock.patch.object(app, "MAX_PARALLEL_SUBAGENTS", 2),
+            mock.patch.object(app, "run_tool", fake_run_tool),
+            mock.patch.object(app, "_run_tasks_concurrently", fake_batch),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            app.run_agent_turn(
+                [{"role": "user", "content": "go"}], "sys", None, max_iters=5
+            )
+        # The edit must execute before the task batch forms, not after it.
+        self.assertEqual(order, ["edit", "task-batch"])
 
     def test_cancel_stops_the_batch(self):
         def mock_get_response(messages, system_prompt, mlx_state, tools=None):

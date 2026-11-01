@@ -531,10 +531,13 @@ def _warn_if_truncated(data: dict[str, Any]) -> None:
         "outputTokens", u.get("output_tokens", u.get("completion_tokens"))
     )
     if _is_truncated(data):
+        # Claude backends send CLAUDE_MAX_TOKENS, not MAX_TOKENS; report the
+        # cap this request actually used.
+        cap = CLAUDE_MAX_TOKENS if BACKEND in ANTHROPIC_FORMAT_BACKENDS else MAX_TOKENS
         print(
-            f"{YELLOW}Warning: response truncated at MAX_TOKENS={MAX_TOKENS} "
+            f"{YELLOW}Warning: response truncated at max_tokens={cap} "
             f"(output_tokens={out_tokens}). Tool calls may be incomplete — "
-            f"raise MAX_TOKENS and retry.{RESET}",
+            f"raise the MAX_TOKENS env var and retry.{RESET}",
             file=sys.stderr,
         )
 

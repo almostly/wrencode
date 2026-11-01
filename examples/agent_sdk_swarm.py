@@ -52,6 +52,8 @@ def run_task(prompt: str, args: argparse.Namespace) -> dict:
         result = json.loads(proc.stdout.strip().splitlines()[-1])
     except (IndexError, ValueError):
         result = {"result": "", "is_error": True, "error": "no JSON output"}
+    if not isinstance(result, dict):  # a bare JSON value is not an agent result
+        result = {"result": "", "is_error": True, "error": "no JSON output"}
     result["prompt"] = prompt
     result["seconds"] = round(time.monotonic() - started, 1)
     if result.get("is_error"):

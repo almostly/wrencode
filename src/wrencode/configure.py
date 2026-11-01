@@ -599,11 +599,18 @@ def _apply_credentials_for_model_fetch(
     backend: str, cfg: dict[str, str], existing: dict[str, str]
 ) -> None:
     """Apply key/workspace so live /models fetches can authenticate."""
+    # When the user kept the environment key, cfg["api_key"] is "" — fall back
+    # to the env key (not the stale saved key) so the fetch uses what they chose.
+    key_env = backends.BACKEND_SPECS[backend].get("key_env", "")
+    env_key = os.environ.get(key_env, "") if key_env else ""
+    saved_key = (
+        existing.get("api_key", "") if existing.get("backend") == backend else ""
+    )
+    key = (cfg["api_key"] or env_key) if "api_key" in cfg else (saved_key or env_key)
     backends.apply_backend(
         backend,
         existing.get("model", "") if existing.get("backend") == backend else "",
-        cfg.get("api_key")
-        or (existing.get("api_key", "") if existing.get("backend") == backend else ""),
+        key,
         anthropic_workspace_id=cfg.get(
             "anthropic_workspace_id",
             existing.get("anthropic_workspace_id", "")
@@ -634,14 +641,35 @@ def switch_backend_runtime() -> Any:
         return _MLX_UNCHANGED
 
     backend = names[idx]
+    # _apply_credentials_for_model_fetch switches the globals so the model
+    # picker can fetch live /models; snapshot the old backend and the env key
+    # (which _prompt_api_key_if_needed may overwrite) to undo on cancel.
+    previous = (
+        backends.BACKEND,
+        backends.MODEL,
+        backends.API_KEY,
+        backends.ANTHROPIC_WORKSPACE_ID,
+    )
+    key_env = backends.BACKEND_SPECS[backend].get("key_env", "")
+    prev_env = os.environ.get(key_env) if key_env else None
     cfg: dict[str, str] = {"backend": backend}
-    _prompt_api_key_if_needed(backend, existing, cfg)
-    if backend in backends.ANTHROPIC_KEY_BACKENDS:
-        _prompt_anthropic_workspace_if_needed(existing, cfg)
-    # Credentials first so the model picker can fetch live /models lists.
-    _apply_credentials_for_model_fetch(backend, cfg, existing)
-    model = pick_model_interactive(backend)
+    try:
+        _prompt_api_key_if_needed(backend, existing, cfg)
+        if backend in backends.ANTHROPIC_KEY_BACKENDS:
+            _prompt_anthropic_workspace_if_needed(existing, cfg)
+        # Credentials first so the model picker can fetch live /models lists.
+        _apply_credentials_for_model_fetch(backend, cfg, existing)
+        model = pick_model_interactive(backend)
+    except (KeyboardInterrupt, EOFError):
+        model = None
     if model is None:
+        # Leave the session exactly on the old backend, key included.
+        if key_env:
+            if prev_env is None:
+                os.environ.pop(key_env, None)
+            else:
+                os.environ[key_env] = prev_env
+        backends.apply_backend(*previous)
         ui.print_system("Cancelled.")
         return _MLX_UNCHANGED
 
